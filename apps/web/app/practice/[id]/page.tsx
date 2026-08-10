@@ -143,8 +143,8 @@ export default function SessionDetailPage() {
         <StatCard label="Solves" value={String(solves.length)} />
         <StatCard label="Best" value={best !== null ? formatTime(best) : "—"} />
         <StatCard label="Avg" value={avgMs !== null ? formatTime(Math.round(avgMs)) : "—"} />
-        <StatCard label="ao5" value={currentAo5 !== null ? formatTime(currentAo5) : "—"} />
-        <StatCard label="ao12" value={currentAo12 !== null ? formatTime(currentAo12) : "—"} />
+        <StatCard label="ao5" value={currentAo5 !== null ? formatTime(currentAo5) : solves.length >= 5 ? "DNF" : "—"} />
+        <StatCard label="ao12" value={currentAo12 !== null ? formatTime(currentAo12) : solves.length >= 12 ? "DNF" : "—"} />
       </div>
 
       {/* Solve Table */}

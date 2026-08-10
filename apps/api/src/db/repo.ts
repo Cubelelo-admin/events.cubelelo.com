@@ -125,6 +125,8 @@ export interface Repository {
     findById(id: string): Promise<Payment | null>;
     findByOrderId(orderId: string): Promise<Payment | null>;
     findByRegistration(registrationId: string): Promise<Payment | null>;
+    /** Latest payment for each registration, keyed by registration id. */
+    findByRegistrationIds(registrationIds: string[]): Promise<Map<string, Payment>>;
     create(payment: Payment): Promise<void>;
     update(id: string, fields: Partial<Payment>): Promise<void>;
   };
@@ -132,6 +134,8 @@ export interface Repository {
   auditLog: {
     findAll(limit?: number, offset?: number): Promise<AuditLogEntry[]>;
     findByAdmin(adminId: string): Promise<AuditLogEntry[]>;
+    /** Full verification history for a single result (§10 audit trail). */
+    findByTarget(target: string): Promise<AuditLogEntry[]>;
     create(entry: AuditLogEntry): Promise<void>;
   };
 
@@ -188,6 +192,7 @@ export interface Repository {
     addSolve(solve: PracticeSolve): Promise<void>;
     findSolve(id: string): Promise<PracticeSolve | null>;
     findSolvesBySession(sessionId: string): Promise<PracticeSolve[]>;
+    findSolvesBySessionIds(sessionIds: string[]): Promise<PracticeSolve[]>;
     deleteSolve(id: string): Promise<void>;
   };
 

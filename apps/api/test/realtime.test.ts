@@ -4,17 +4,20 @@ import type { FastifyInstance } from "fastify";
 import { io as ioClient, type Socket } from "socket.io-client";
 import { buildApp } from "../src/app";
 import { createMemRepo } from "../src/db/mem-repo";
+import type { Repository } from "../src/db/repo";
 import { seed, SEED_DEMO_COMP_ID } from "../src/db/seed";
 import { createRealtime, type AttachableRealtime } from "../src/sockets/realtime";
 import { loginAndSync } from "./helpers";
 
 let app: FastifyInstance;
+let repo: Repository;
 let realtime: AttachableRealtime;
 let baseUrl: string;
 let roundId: string;
+let eventId: string;
 
 beforeAll(async () => {
-  const repo = createMemRepo();
+  repo = createMemRepo();
   await seed(repo);
   realtime = createRealtime();
   app = await buildApp(repo, realtime);
@@ -27,8 +30,10 @@ beforeAll(async () => {
 
   const detail = (await (
     await fetch(`${baseUrl}/api/v1/competitions/${SEED_DEMO_COMP_ID}`)
-  ).json()) as { events: { eventType: string; rounds: { id: string }[] }[] };
-  roundId = detail.events.find((e) => e.eventType === "333")!.rounds[0]!.id;
+  ).json()) as { events: { id: string; eventType: string; rounds: { id: string }[] }[] };
+  const ev = detail.events.find((e) => e.eventType === "333")!;
+  eventId = ev.id;
+  roundId = ev.rounds[0]!.id;
 });
 
 afterAll(async () => {
@@ -58,12 +63,22 @@ describe("live leaderboard over Socket.io", () => {
     const updates = Promise.all([nextLeaderboard(a), nextLeaderboard(b)]);
 
     const { token, id: userId } = await loginAndSync(baseUrl, "socket@x.com");
+    // Mark user email+mobile verified and register for the event
+    const user = await repo.users.findById(userId);
+    if (user) await repo.users.update(userId, { emailVerified: true, mobileVerified: true });
+    await fetch(`${baseUrl}/api/v1/competitions/${SEED_DEMO_COMP_ID}/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ eventIds: [eventId] }),
+    });
+
     const res = await fetch(`${baseUrl}/api/v1/rounds/${roundId}/results`, {
       method: "POST",
       headers: { "Content-Type": "application/json", authorization: `Bearer ${token}` },
       body: JSON.stringify({
         solves: [8000, 9000, 7000, 10000, 8500].map((t) => ({
           time_ms: t,
+          inspectionPenalty: "none",
           penalty: "none",
         })),
       }),

@@ -31,7 +31,7 @@ interface CompetitionTerminalProps {
 type LoadState =
   | { kind: "loading" }
   | { kind: "error"; message: string }
-  | { kind: "ready"; roundId: string; eventType: EventId; scrambles: string[]; cutoffMs?: number; timeLimitMs?: number };
+  | { kind: "ready"; roundId: string; eventType: EventId; scrambles: string[]; cutoffMs?: number; timeLimitMs?: number; closesAt?: string | null };
 
 export function CompetitionTerminal({
   competitionId,
@@ -105,6 +105,7 @@ export function CompetitionTerminal({
           scrambles: sc.scrambles,
           cutoffMs: ev.cutoffMs,
           timeLimitMs: ev.timeLimitMs,
+          closesAt: rnd.closesAt ?? null,
         });
       } catch (e) {
         if (active) {
@@ -181,7 +182,27 @@ export function CompetitionTerminal({
   }, [snapshot.phase, snapshot.timeMs, load, timeLimitHit, down]);
 
 
-  const roundComplete = cutoffFailed || solves.length >= SOLVES_PER_ROUND;
+  // Track round close time — warn user and block new solves once closesAt passes
+  const closesAtMs = load.kind === "ready" && load.closesAt ? new Date(load.closesAt).getTime() : null;
+  const [roundTimeLeft, setRoundTimeLeft] = useState<number | null>(null);
+  const [roundExpired, setRoundExpired] = useState(false);
+
+  useEffect(() => {
+    if (!closesAtMs) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      const now = Date.now();
+      const left = closesAtMs - now;
+      setRoundTimeLeft(Math.max(0, left));
+      if (left <= 0) { setRoundExpired(true); return; }
+      // Align to second boundary so the display flips crisply
+      timer = setTimeout(tick, 1000 - (now % 1000) || 1000);
+    };
+    tick();
+    return () => clearTimeout(timer);
+  }, [closesAtMs]);
+
+  const roundComplete = cutoffFailed || solves.length >= SOLVES_PER_ROUND || roundExpired;
 
   const currentScramble = load.kind === "ready" ? (load.scrambles[index] ?? "") : "";
   const scrambleMoves = useMemo(() => currentScramble.trim().split(/\s+/).filter(Boolean), [currentScramble]);
@@ -272,6 +293,16 @@ export function CompetitionTerminal({
     }
   }, [load, solves]);
 
+  // Auto-submit when round expires and user has completed all solves
+  const autoSubmitDone = useRef(false);
+  useEffect(() => {
+    if (!roundExpired || autoSubmitDone.current) return;
+    if (solves.length >= SOLVES_PER_ROUND && submit.kind === "idle") {
+      autoSubmitDone.current = true;
+      handleSubmit();
+    }
+  }, [roundExpired, solves.length, submit.kind, handleSubmit]);
+
   // Auto-redirect to competition page after successful submission
   useEffect(() => {
     if (submit.kind === "done") {
@@ -336,6 +367,14 @@ export function CompetitionTerminal({
             <span className="text-xs text-red-600 dark:text-red-400">
               Limit: {formatTime(load.timeLimitMs)}
             </span>
+          )}
+          {roundTimeLeft !== null && !roundExpired && (
+            <span className={`font-mono text-xs font-semibold ${roundTimeLeft < 60_000 ? "text-red-500 animate-pulse" : roundTimeLeft < 300_000 ? "text-amber-500" : "text-zinc-500"}`}>
+              ⏱ {Math.floor(roundTimeLeft / 60_000)}:{String(Math.floor((roundTimeLeft % 60_000) / 1000)).padStart(2, "0")}
+            </span>
+          )}
+          {roundExpired && (
+            <span className="text-xs font-semibold text-red-500">⏱ Round closed</span>
           )}
           <span className="text-zinc-500">Solve</span>
           <span className="font-mono font-semibold">

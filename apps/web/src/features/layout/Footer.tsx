@@ -23,7 +23,7 @@ export function Footer() {
       <p className="font-mono text-sm font-semibold text-accent-primary">🧊 Built for the cubing community</p>
       <div className="mt-4 flex flex-wrap justify-center gap-6">
         {DETAIL_LINKS.map((link) => (
-          <Link key={link.href} href={link.href} className="transition hover:text-[var(--text-primary)]">
+          <Link key={link.href} href={link.href} className="py-2 transition hover:text-[var(--text-primary)]">
             {link.label}
           </Link>
         ))}

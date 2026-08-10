@@ -26,10 +26,14 @@ export function Countdown({ target, className = "" }: { target: string; classNam
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>;
     const tick = () => {
-      const diff = new Date(target).getTime() - Date.now();
+      const now = Date.now();
+      const diff = new Date(target).getTime() - now;
       setLabel(formatRemaining(diff));
       if (diff > 0) {
-        timer = setTimeout(tick, tickInterval(diff));
+        const interval = tickInterval(diff);
+        // Align to second boundary when ticking every second
+        const delay = interval <= 1000 ? (1000 - (now % 1000) || 1000) : interval;
+        timer = setTimeout(tick, delay);
       }
     };
     tick();
@@ -39,14 +43,29 @@ export function Countdown({ target, className = "" }: { target: string; classNam
   return <span className={className}>{label}</span>;
 }
 
-/** Hook returning remaining ms that ticks every second. */
+/** Hook returning remaining ms that ticks aligned to second boundaries. */
 export function useCountdownMs(target: string | null): number | null {
-  const [now, setNow] = useState(Date.now);
+  const [remaining, setRemaining] = useState<number | null>(() => {
+    if (!target) return null;
+    return Math.max(0, new Date(target).getTime() - Date.now());
+  });
+
   useEffect(() => {
-    if (!target) return;
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
+    if (!target) { setRemaining(null); return; }
+    const targetMs = new Date(target).getTime();
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      const now = Date.now();
+      const left = Math.max(0, targetMs - now);
+      setRemaining(left);
+      if (left > 0) {
+        // Align next tick to the next second boundary so display flips crisply
+        timer = setTimeout(tick, 1000 - (now % 1000) || 1000);
+      }
+    };
+    tick();
+    return () => clearTimeout(timer);
   }, [target]);
-  if (!target) return null;
-  return Math.max(0, new Date(target).getTime() - now);
+
+  return remaining;
 }

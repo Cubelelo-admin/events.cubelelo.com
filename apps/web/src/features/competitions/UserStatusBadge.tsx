@@ -88,8 +88,15 @@ export function UserStatusBadge({
 
   useEffect(() => {
     if (!hasCountdown) return;
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      const now = Date.now();
+      setNow(now);
+      // Align to second boundary for crisp second transitions
+      timer = setTimeout(tick, 1000 - (now % 1000) || 1000);
+    };
+    tick();
+    return () => clearTimeout(timer);
   }, [hasCountdown]);
 
   const { label, tone } = computeUserStatus(comp, now, isRegistered);

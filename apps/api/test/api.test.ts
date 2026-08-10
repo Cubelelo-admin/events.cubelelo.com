@@ -2,18 +2,38 @@ import { describe, it, expect, beforeAll } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app";
 import { createMemRepo } from "../src/db/mem-repo";
+import type { Repository } from "../src/db/repo";
 import { seed, SEED_DEMO_COMP_ID } from "../src/db/seed";
-import { adminToken, bearer, devToken } from "./helpers";
+import { adminToken, bearer, devToken, syncVerifiedUser } from "./helpers";
 
 let app: FastifyInstance;
+let repo: Repository;
 let roundId: string;
+let eventId: string;
 let admin: string;
 
 beforeAll(async () => {
-  const repo = createMemRepo();
+  repo = createMemRepo();
   await seed(repo);
   app = await buildApp(repo);
   admin = await adminToken(app);
+
+  // Sync admin user so auth plugin can resolve the token
+  await app.inject({ method: "POST", url: "/api/v1/auth/sync", headers: bearer(admin) });
+
+  // Resolve event + round IDs
+  const detail = await app.inject({ method: "GET", url: `/api/v1/competitions/${SEED_DEMO_COMP_ID}` });
+  const comp = detail.json();
+  eventId = comp.events[0].id;
+  roundId = comp.events[0].rounds[0].id;
+
+  // Register admin for the event so scramble tests pass
+  await app.inject({
+    method: "POST",
+    url: `/api/v1/competitions/${SEED_DEMO_COMP_ID}/register`,
+    payload: { eventIds: [eventId] },
+    headers: bearer(admin),
+  });
 });
 
 async function getJson(url: string) {
@@ -33,20 +53,23 @@ async function patchJson(url: string, payload: object, headers?: Record<string, 
   return { status: res.statusCode, body: res.json() };
 }
 
-async function loginSync(email: string): Promise<{ token: string; id: string; clId: string }> {
+/** Sync a user and register them for the seeded demo event so they can submit. */
+async function loginAndRegister(email: string): Promise<{ token: string; id: string; clId: string }> {
   const token = await devToken(app, email);
-  const res = await app.inject({
+  const { id, clId } = await syncVerifiedUser(app, repo, token);
+  await app.inject({
     method: "POST",
-    url: "/api/v1/auth/sync",
+    url: `/api/v1/competitions/${SEED_DEMO_COMP_ID}/register`,
+    payload: { eventIds: [eventId] },
     headers: bearer(token),
   });
-  const user = res.json() as { id: string; clId: string };
-  return { token, id: user.id, clId: user.clId };
+  return { token, id, clId };
 }
 
 describe("health + competitions", () => {
   it("GET /health", async () => {
-    expect((await getJson("/health")).body).toMatchObject({ status: "ok" });
+    // /health redirects to /api/v1/health; app.inject doesn't follow redirects
+    expect((await getJson("/api/v1/health")).body).toMatchObject({ status: "ok" });
   });
 
   it("lists the seeded demo competition", async () => {
@@ -104,8 +127,8 @@ describe("result submission + ranking", () => {
   });
 
   it("ranks the faster competitor first", async () => {
-    const slow = await loginSync("slow@x.com");
-    const fast = await loginSync("fast@x.com");
+    const slow = await loginAndRegister("slow@x.com");
+    const fast = await loginAndRegister("fast@x.com");
 
     await postJson(
       `/api/v1/rounds/${roundId}/results`,
@@ -141,7 +164,7 @@ describe("result submission + ranking", () => {
   });
 
   it("rejects malformed solves", async () => {
-    const { token } = await loginSync("bad@x.com");
+    const { token } = await loginAndRegister("bad@x.com");
     const res = await postJson(
       `/api/v1/rounds/${roundId}/results`,
       { solves: [{ time_ms: "oops", penalty: "none" }] },

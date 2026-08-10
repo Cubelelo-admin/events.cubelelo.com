@@ -774,19 +774,23 @@ export default function CreateCompetitionPage() {
                                       onChange={(e) => {
                                         const m = e.target.value;
                                         if (m === "none") updateRoundCriteriaFor(ri, undefined);
-                                        else updateRoundCriteriaFor(ri, { method: m as "rank" | "time" });
+                                        else updateRoundCriteriaFor(ri, { method: m as "rank" | "time" | "best_single" });
                                       }}
                                       className={SMALL_INPUT}
                                     >
                                       <option value="none">No shortlist</option>
                                       <option value="rank">Top N</option>
                                       <option value="time">ao5 ≤ X</option>
+                                      <option value="best_single">Best Single ≤ X</option>
                                     </select>
                                     {criteria?.method === "rank" && (
                                       <input type="number" min={1} value={criteria.rankLimit ?? ""} onChange={(e) => updateRoundCriteriaFor(ri, { method: "rank", rankLimit: Number(e.target.value) })} placeholder="N" className={`w-14 ${SMALL_INPUT}`} />
                                     )}
                                     {criteria?.method === "time" && (
                                       <input type="number" min={1} value={criteria.timeLimitMs ? criteria.timeLimitMs / 1000 : ""} onChange={(e) => updateRoundCriteriaFor(ri, { method: "time", timeLimitMs: Number(e.target.value) * 1000 })} placeholder="sec" className={`w-16 ${SMALL_INPUT}`} />
+                                    )}
+                                    {criteria?.method === "best_single" && (
+                                      <input type="number" min={1} value={criteria.bestSingleMs ? criteria.bestSingleMs / 1000 : ""} onChange={(e) => updateRoundCriteriaFor(ri, { method: "best_single", bestSingleMs: Number(e.target.value) * 1000 })} placeholder="sec" className={`w-16 ${SMALL_INPUT}`} />
                                     )}
                                   </>
                                 )}

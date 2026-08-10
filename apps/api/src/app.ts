@@ -53,12 +53,18 @@ export async function buildApp(
   });
   registerAuth(app, repo, verifier);
 
-  app.setErrorHandler((error: { statusCode?: number; message?: string }, _req, reply) => {
+  app.setErrorHandler((error: { statusCode?: number; code?: string; message?: string; validation?: unknown }, _req, reply) => {
     const status = error.statusCode ?? 500;
+    // Fastify validation errors (malformed JSON, schema violations)
+    if (error.validation) {
+      return reply.code(400).send({ error: "invalid_request" });
+    }
     if (status >= 500) {
       app.log.error(error);
-      return reply.code(status).send({ error: "Something went wrong. Please try again." });
+      return reply.code(status).send({ error: "internal_error" });
     }
+    // For 4xx thrown via Object.assign(new Error("code"), { statusCode: N }),
+    // use the message as the error code (it's already a snake_case code).
     return reply.code(status).send({ error: error.message });
   });
 

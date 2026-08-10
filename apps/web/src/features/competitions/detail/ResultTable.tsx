@@ -64,7 +64,7 @@ export function ResultTable({
                 </Link>
               </td>
               <td className="px-4 py-3 font-mono text-zinc-700 dark:text-zinc-300">
-                {r.ao5Ms !== null ? formatTime(r.ao5Ms) : "—"}
+                {r.ao5Ms !== null ? formatTime(r.ao5Ms) : "DNF"}
               </td>
               <td className="px-4 py-3 font-mono text-zinc-700 dark:text-zinc-300">
                 {r.bestSingleMs !== null ? formatTime(r.bestSingleMs) : "—"}

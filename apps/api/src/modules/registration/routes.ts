@@ -4,7 +4,6 @@ import type { Repository } from "../../db/repo";
 import type { Registration } from "../../db/types";
 import { requireAuth } from "../../auth/plugin";
 import { effectiveCompStatus } from "../../lib/statusUtils";
-import { withTransaction } from "../../db/pool";
 
 export async function registerRegistrationRoutes(
   app: FastifyInstance,
@@ -37,15 +36,22 @@ export async function registerRegistrationRoutes(
         return reply.code(403).send({ error: "email_not_verified" });
       }
 
+      // Check registration capacity
+      if (comp.registrationLimit != null && comp.registrationLimit > 0) {
+        const currentRegs = await repo.registrations.findByCompetition(comp.id);
+        const activeCount = currentRegs.filter((r) => r.paymentStatus !== "failed").length;
+        if (activeCount >= comp.registrationLimit) {
+          return reply.code(409).send({ error: "registration_full" });
+        }
+      }
+
       const existing = await repo.registrations.findByUserAndComp(user.id, comp.id);
       if (existing && existing.paymentStatus !== "failed") {
         return reply.code(409).send({ error: "already_registered" });
       }
       if (existing && existing.paymentStatus === "failed") {
-        await withTransaction(async (client) => {
-          await client.query("DELETE FROM registration_events WHERE registration_id = $1", [existing.id]);
-          await client.query("DELETE FROM registrations WHERE id = $1", [existing.id]);
-        });
+        await repo.registrations.removeEvents(existing.id);
+        await repo.registrations.delete(existing.id);
       }
 
       // Validate event IDs belong to this competition and have at least one non-cancelled round
@@ -79,18 +85,10 @@ export async function registerRegistrationRoutes(
         paymentStatus: isFree ? "paid" : "pending",
         createdAt: new Date().toISOString(),
       };
-      await withTransaction(async (client) => {
-        await client.query(
-          "INSERT INTO registrations (id, user_id, competition_id, payment_status, created_at) VALUES ($1,$2,$3,$4,$5)",
-          [registration.id, registration.userId, registration.competitionId, registration.paymentStatus, registration.createdAt],
-        );
-        for (const eid of eventIds) {
-          await client.query(
-            "INSERT INTO registration_events (registration_id, competition_event_id) VALUES ($1,$2)",
-            [registration.id, eid],
-          );
-        }
-      });
+      await repo.registrations.create(registration);
+      for (const eid of eventIds) {
+        await repo.registrations.addEvent(registration.id, eid);
+      }
 
       return reply.code(201).send({
         registrationId: registration.id,
@@ -123,10 +121,8 @@ export async function registerRegistrationRoutes(
         return reply.code(409).send({ error: "paid_registration_contact_admin" });
       }
 
-      await withTransaction(async (client) => {
-        await client.query("DELETE FROM registration_events WHERE registration_id = $1", [reg.id]);
-        await client.query("DELETE FROM registrations WHERE id = $1", [reg.id]);
-      });
+      await repo.registrations.removeEvents(reg.id);
+      await repo.registrations.delete(reg.id);
 
       return { ok: true };
     },

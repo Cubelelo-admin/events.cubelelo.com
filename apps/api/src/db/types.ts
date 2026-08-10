@@ -84,9 +84,10 @@ export interface CompetitionEvent {
 }
 
 export interface AdvancementCriteria {
-  method: "rank" | "time";
+  method: "rank" | "time" | "best_single";
   rankLimit?: number;
   timeLimitMs?: number;
+  bestSingleMs?: number;
 }
 
 export interface Round {
@@ -100,6 +101,8 @@ export interface Round {
   closesAt?: string;
   durationMinutes?: number;
   resultsPublishedAt?: string;
+  /** When true, results without a valid video link are auto-flagged. */
+  videoRequired?: boolean;
 }
 
 export interface ScrambleSet {
@@ -109,6 +112,15 @@ export interface ScrambleSet {
   generatedAt: string;
   lockedAt?: string;
   lockedBy?: string;
+}
+
+/** A single machine- or human-generated flag reason attached to a result. */
+export interface FlagReason {
+  type: "near_record" | "personal_deviation" | "missing_video" | "invalid_video" | "borderline_cutoff" | "manual";
+  /** Human-readable explanation, e.g. "5.67 is within 5% of the National Record". */
+  message: string;
+  /** Severity hint for sort order: higher = more important. */
+  severity: number;
 }
 
 export interface Result {
@@ -124,6 +136,8 @@ export interface Result {
   rank: number | null;
   videoUrl: string | null;
   flagStatus: FlagStatus;
+  /** Structured reasons why this result was flagged (empty when clean/verified). */
+  flagReasons: FlagReason[];
   verifiedBy?: string;
   verifiedAt?: string;
   verificationComment?: string;
@@ -171,6 +185,10 @@ export interface AuditLogEntry {
   action: string;
   target?: string;
   reason?: string;
+  /** JSON-serialised previous value (for verification edits). */
+  oldValue?: string;
+  /** JSON-serialised new value (for verification edits). */
+  newValue?: string;
   createdAt: string;
 }
 
@@ -322,12 +340,36 @@ export interface PromoCode {
   createdAt: string;
 }
 
+/** Global flag-rule thresholds used by the verification engine. */
+export interface FlagRuleDefaults {
+  /** Flag results within this % of the platform record. 0 = off. */
+  nearRecordPct: number;
+  /** Flag if result deviates from PB by more than this %. 0 = off. */
+  personalDeviationPct: number;
+  /** Flag results missing a valid video link (YouTube/Drive). */
+  missingVideo: boolean;
+  /** Flag results within ±N ranks of the advancement cutoff line. 0 = off. */
+  borderlineCutoffMargin: number;
+}
+
+/** Per-event record reference times (set by admin in system settings). */
+export interface RecordReference {
+  /** Best single time in ms for the event (platform or external). */
+  singleMs?: number;
+  /** Best ao5 time in ms for the event (platform or external). */
+  ao5Ms?: number;
+}
+
 export interface SystemSettings {
   eventDurations: Record<string, number>;
   registrationDurationDays: number;
   gapBetweenEventsMinutes: number;
   defaultRoundDurationMinutes: number;
   videoDeadlineMinutes: number;
+  /** Global flag-rule thresholds for verification. */
+  flagRuleDefaults: FlagRuleDefaults;
+  /** Reference record times per event type (e.g. "333": { singleMs: 3470 }). */
+  recordReferences: Record<string, RecordReference>;
 }
 
 export interface RuleSet {

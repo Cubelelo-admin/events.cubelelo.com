@@ -16,6 +16,7 @@ import {
 import { ConfirmModal } from "@/components/ui/Modal";
 import { useToast } from "@/components/ui/Toast";
 import { EmptyState } from "@/components/EmptyState";
+import { eventDisplayName } from "@/lib/eventNames";
 
 const INPUT = "w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-600";
 const SELECT = "w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100";
@@ -187,7 +188,7 @@ export default function AdminPromoCodesPage() {
           <select
             value={filterCompId}
             onChange={(e) => setFilterCompId(e.target.value)}
-            className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+            className="w-[220px] flex-shrink-0 truncate rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
           >
             <option value="">All competitions</option>
             {comps.map((c) => (
@@ -308,7 +309,7 @@ export default function AdminPromoCodesPage() {
                       <option value="">All events</option>
                       {compEvents.map((ev) => (
                         <option key={ev.id} value={ev.id}>
-                          {ev.eventType}{ev.fee != null ? ` (₹${(ev.fee / 100).toFixed(2)})` : ""}
+                          {eventDisplayName(ev.eventType)}{ev.fee != null ? ` (₹${(ev.fee / 100).toFixed(2)})` : ""}
                         </option>
                       ))}
                     </select>
@@ -368,7 +369,7 @@ export default function AdminPromoCodesPage() {
                       <option value="">All events</option>
                       {compEvents.map((ev) => (
                         <option key={ev.id} value={ev.id}>
-                          {ev.eventType}{ev.fee != null ? ` (₹${(ev.fee / 100).toFixed(2)})` : ""}
+                          {eventDisplayName(ev.eventType)}{ev.fee != null ? ` (₹${(ev.fee / 100).toFixed(2)})` : ""}
                         </option>
                       ))}
                     </select>

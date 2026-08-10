@@ -6,7 +6,6 @@ import { requireAuth } from "../../auth/plugin";
 import { env } from "../../config/env";
 import { generateInvoicePDF, type InvoiceData } from "../../lib/invoice";
 import { submitLimiter } from "../../lib/rateLimiter";
-import { withTransaction } from "../../db/pool";
 
 async function getRazorpay() {
   if (!env.RAZORPAY_KEY_ID || !env.RAZORPAY_KEY_SECRET) return null;
@@ -42,6 +41,7 @@ export async function registerPaymentRoutes(
           amount: pendingPayment.amount,
           currency: pendingPayment.currency,
           paymentId: pendingPayment.id,
+          keyId: env.RAZORPAY_KEY_ID || null,
         });
       }
 
@@ -118,40 +118,30 @@ export async function registerPaymentRoutes(
           status: "paid",
           createdAt: new Date().toISOString(),
         };
-        await withTransaction(async (client) => {
-          if (appliedPromoId) {
-            const { rowCount } = await client.query(
-              "UPDATE promo_codes SET used_count = used_count + 1 WHERE id = $1 AND (max_uses = 0 OR used_count < max_uses)",
-              [appliedPromoId],
-            );
-            if ((rowCount ?? 0) === 0) throw Object.assign(new Error("promo_fully_redeemed"), { statusCode: 409 });
-            await client.query(
-              "INSERT INTO promo_code_usages (id, promo_code_id, user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-              [randomUUID(), appliedPromoId, user.id],
-            );
-          }
-          await client.query(
-            `INSERT INTO payments (id, user_id, registration_id, amount, currency, promo_code_id, status, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-            [payment.id, payment.userId, payment.registrationId, payment.amount, payment.currency, payment.promoCodeId ?? null, payment.status, payment.createdAt],
-          );
-          await client.query(
-            "UPDATE registrations SET payment_status = $1 WHERE id = $2",
-            ["paid", registration.id],
-          );
-        });
+        if (appliedPromoId) {
+          const redeemed = await repo.promoCodes.incrementUsed(appliedPromoId);
+          if (!redeemed) throw Object.assign(new Error("promo_fully_redeemed"), { statusCode: 409 });
+          await repo.promoCodes.recordUsage(appliedPromoId, user.id);
+        }
+        await repo.payments.create(payment);
+        await repo.registrations.update(registration.id, { paymentStatus: "paid" });
         return reply.code(201).send({ orderId: null, amount: 0, currency: "INR", paymentId: payment.id, status: "paid" });
       }
 
       let orderId: string;
       const rzp = await getRazorpay();
       if (rzp) {
-        const order = await rzp.orders.create({
-          amount,
-          currency: "INR",
-          receipt: registration.id,
-        });
-        orderId = order.id as string;
+        try {
+          const order = await rzp.orders.create({
+            amount,
+            currency: "INR",
+            receipt: registration.id,
+          });
+          orderId = order.id as string;
+        } catch (err) {
+          req.log.error({ err, registrationId: registration.id }, "Razorpay order creation failed");
+          return reply.code(502).send({ error: "payment_gateway_unavailable" });
+        }
       } else {
         orderId = `order_${randomUUID().slice(0, 12)}`;
       }
@@ -167,25 +157,12 @@ export async function registerPaymentRoutes(
         status: "pending",
         createdAt: new Date().toISOString(),
       };
-      await withTransaction(async (client) => {
-        if (appliedPromoId) {
-          const { rowCount } = await client.query(
-            "UPDATE promo_codes SET used_count = used_count + 1 WHERE id = $1 AND (max_uses = 0 OR used_count < max_uses)",
-            [appliedPromoId],
-          );
-          if ((rowCount ?? 0) === 0) throw Object.assign(new Error("promo_fully_redeemed"), { statusCode: 409 });
-          await client.query(
-            "INSERT INTO promo_code_usages (id, promo_code_id, user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-            [randomUUID(), appliedPromoId, user.id],
-          );
-        }
-        await client.query(
-          `INSERT INTO payments (id, user_id, registration_id, amount, currency, promo_code_id, status, razorpay_order_id, created_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-          [payment.id, payment.userId, payment.registrationId, payment.amount, payment.currency,
-           payment.promoCodeId ?? null, payment.status, payment.razorpayOrderId, payment.createdAt],
-        );
-      });
+      if (appliedPromoId) {
+        const redeemed = await repo.promoCodes.incrementUsed(appliedPromoId);
+        if (!redeemed) throw Object.assign(new Error("promo_fully_redeemed"), { statusCode: 409 });
+        await repo.promoCodes.recordUsage(appliedPromoId, user.id);
+      }
+      await repo.payments.create(payment);
 
       return reply.code(201).send({
         orderId,
@@ -218,7 +195,9 @@ export async function registerPaymentRoutes(
       const expected = createHmac("sha256", env.RAZORPAY_KEY_SECRET)
         .update(`${razorpay_order_id}|${razorpay_payment_id}`)
         .digest("hex");
-      if (!timingSafeEqual(Buffer.from(expected), Buffer.from(razorpay_signature)))
+      const sigBuf = Buffer.from(razorpay_signature);
+      const expBuf = Buffer.from(expected);
+      if (sigBuf.length !== expBuf.length || !timingSafeEqual(expBuf, sigBuf))
         return reply.code(400).send({ error: "invalid_signature" });
 
       const payment = await repo.payments.findByOrderId(razorpay_order_id);
@@ -230,21 +209,13 @@ export async function registerPaymentRoutes(
       if (payment.status === "paid")
         return reply.send({ status: "already_confirmed" });
 
-      const auditId = randomUUID();
       const now = new Date().toISOString();
-      await withTransaction(async (client) => {
-        await client.query(
-          "UPDATE payments SET razorpay_payment_id = $1, status = $2 WHERE id = $3",
-          [razorpay_payment_id, "paid", payment.id],
-        );
-        await client.query(
-          "UPDATE registrations SET payment_status = $1 WHERE id = $2",
-          ["paid", payment.registrationId],
-        );
-        await client.query(
-          "INSERT INTO audit_log (id, admin_id, action, target, reason, created_at) VALUES ($1,$2,$3,$4,$5,$6)",
-          [auditId, null, "payment_confirmed", payment.id, `checkout verified: order=${razorpay_order_id} payment=${razorpay_payment_id}`, now],
-        );
+      await repo.payments.update(payment.id, { razorpayPaymentId: razorpay_payment_id, status: "paid" });
+      await repo.registrations.update(payment.registrationId, { paymentStatus: "paid" });
+      await repo.auditLog.create({
+        id: randomUUID(), adminId: null as unknown as string, action: "payment_confirmed",
+        target: payment.id, reason: `checkout verified: order=${razorpay_order_id} payment=${razorpay_payment_id}`,
+        createdAt: now,
       });
 
       return { status: "confirmed" };
@@ -281,7 +252,9 @@ export async function registerPaymentRoutes(
     const expected = createHmac("sha256", env.RAZORPAY_WEBHOOK_SECRET)
       .update(rawBody ?? "")
       .digest("hex");
-    if (!timingSafeEqual(Buffer.from(expected), Buffer.from(headerSig)))
+    const whSigBuf = Buffer.from(headerSig);
+    const whExpBuf = Buffer.from(expected);
+    if (whSigBuf.length !== whExpBuf.length || !timingSafeEqual(whExpBuf, whSigBuf))
       return reply.code(400).send({ error: "invalid_signature" });
 
     const event = body.event as string | undefined;
@@ -302,37 +275,21 @@ export async function registerPaymentRoutes(
     if (event === "payment.captured" || event === "order.paid") {
       if (payment.status === "paid") return { status: "already_confirmed" };
 
-      const auditId = randomUUID();
       const now = new Date().toISOString();
-      await withTransaction(async (client) => {
-        await client.query(
-          "UPDATE payments SET razorpay_payment_id = $1, status = $2 WHERE id = $3",
-          [rzpPaymentId, "paid", payment.id],
-        );
-        await client.query(
-          "UPDATE registrations SET payment_status = $1 WHERE id = $2",
-          ["paid", payment.registrationId],
-        );
-        await client.query(
-          "INSERT INTO audit_log (id, admin_id, action, target, reason, created_at) VALUES ($1,$2,$3,$4,$5,$6)",
-          [auditId, null, "payment_confirmed", payment.id, `webhook ${event}: order=${rzpOrderId} payment=${rzpPaymentId}`, now],
-        );
+      await repo.payments.update(payment.id, { razorpayPaymentId: rzpPaymentId, status: "paid" });
+      await repo.registrations.update(payment.registrationId, { paymentStatus: "paid" });
+      await repo.auditLog.create({
+        id: randomUUID(), adminId: null as unknown as string, action: "payment_confirmed",
+        target: payment.id, reason: `webhook ${event}: order=${rzpOrderId} payment=${rzpPaymentId}`,
+        createdAt: now,
       });
       return { status: "confirmed" };
     }
 
     if (event === "payment.failed") {
       if (payment.status === "paid") return { status: "already_paid_ignoring_failure" };
-      await withTransaction(async (client) => {
-        await client.query(
-          "UPDATE payments SET razorpay_payment_id = $1, status = $2 WHERE id = $3",
-          [rzpPaymentId, "failed", payment.id],
-        );
-        await client.query(
-          "UPDATE registrations SET payment_status = $1 WHERE id = $2",
-          ["failed", payment.registrationId],
-        );
-      });
+      await repo.payments.update(payment.id, { razorpayPaymentId: rzpPaymentId, status: "failed" });
+      await repo.registrations.update(payment.registrationId, { paymentStatus: "failed" });
       return { status: "marked_failed" };
     }
 

@@ -11,6 +11,7 @@ import {
 import { useAuth } from "@/features/auth/AuthProvider";
 import { useRoundStatus } from "@/features/realtime/useRoundStatus";
 import { StatusBadge } from "@/features/competitions/StatusBadge";
+import { useCountdownMs } from "@/components/Countdown";
 import { Skeleton } from "@/components/Skeleton";
 import { VideoUploadSection } from "./VideoUploadSection";
 import { LiveRankingsPanel } from "./LiveRankingsPanel";
@@ -18,17 +19,6 @@ import { VerifiedResultsPanel } from "./VerifiedResultsPanel";
 import { RoundParticipantsPanel } from "./RoundParticipantsPanel";
 
 type RoundTab = "live" | "verified" | "participants";
-
-function useCountdown(target: string | null): number | null {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!target) return;
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, [target]);
-  if (!target) return null;
-  return Math.max(0, new Date(target).getTime() - now);
-}
 
 function fmtCountdown(ms: number): string {
   const total = Math.ceil(ms / 1000);
@@ -194,8 +184,13 @@ function SelectedRoundView({
 }) {
   const { status: liveStatus } = useRoundStatus(round.id, round.status);
 
+  // Client-side close check: hide "Enter Round" once closesAt passes per local clock
+  const closeRemaining = useCountdownMs(liveStatus === "open" && round.closesAt ? round.closesAt : null);
+  const closedLocally = closeRemaining !== null && closeRemaining <= 0;
+
   const canEnter =
     liveStatus === "open" &&
+    !closedLocally &&
     userStatus?.registered &&
     userRound?.userStatus !== "submitted" &&
     (round.roundNumber === 1 ||
@@ -213,7 +208,7 @@ function SelectedRoundView({
       : liveStatus === "closed" && nextRound?.opensAt
         ? nextRound.opensAt
         : null;
-  const remaining = useCountdown(countdownTarget);
+  const remaining = useCountdownMs(countdownTarget);
 
   // Video deadline
   const videoDeadlineTarget = round.closesAt
@@ -276,8 +271,19 @@ function SelectedRoundView({
             </div>
           )}
 
-          {liveStatus === "open" && (
-            <span className="text-sm font-medium text-emerald-400">Round is live</span>
+          {liveStatus === "open" && !closedLocally && (
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium text-emerald-400">Round is live</span>
+              {closeRemaining !== null && closeRemaining > 0 && (
+                <span className={`font-mono text-xs font-semibold ${closeRemaining < 60_000 ? "text-red-500 animate-pulse" : closeRemaining < 300_000 ? "text-amber-500" : "text-zinc-500"}`}>
+                  · {fmtCountdown(closeRemaining)}
+                </span>
+              )}
+            </div>
+          )}
+
+          {liveStatus === "open" && closedLocally && (
+            <span className="text-sm font-medium text-red-500">Round closing…</span>
           )}
 
           {liveStatus === "closed" && !nextRound && (

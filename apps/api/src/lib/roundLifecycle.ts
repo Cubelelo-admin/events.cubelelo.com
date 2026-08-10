@@ -157,7 +157,7 @@ async function checkCompetitionCompletion(
   console.log(`⏱ Competition ${comp.id} auto-completed (all final rounds resolved)`);
 }
 
-function applyMethod<T extends { ao5Ms: number | null }>(
+function applyMethod<T extends { ao5Ms: number | null; bestSingleMs: number | null }>(
   criteria: AdvancementCriteria,
   sorted: T[],
 ): T[] {
@@ -167,6 +167,10 @@ function applyMethod<T extends { ao5Ms: number | null }>(
   if (criteria.method === "time" && criteria.timeLimitMs) {
     const limit = criteria.timeLimitMs;
     return sorted.filter((r) => r.ao5Ms !== null && r.ao5Ms <= limit);
+  }
+  if (criteria.method === "best_single" && criteria.bestSingleMs) {
+    const limit = criteria.bestSingleMs;
+    return sorted.filter((r) => r.bestSingleMs !== null && r.bestSingleMs <= limit);
   }
   return [];
 }

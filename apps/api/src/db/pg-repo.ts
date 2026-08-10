@@ -159,6 +159,7 @@ function toRound(r: Row): Round {
     closesAt: r.closes_at ? ts(r.closes_at) : undefined,
     durationMinutes: (r.duration_minutes as number) ?? undefined,
     resultsPublishedAt: r.results_published_at ? ts(r.results_published_at) : undefined,
+    videoRequired: (r.video_required as boolean) ?? false,
   };
 }
 
@@ -174,6 +175,7 @@ function toScrambleSet(r: Row): ScrambleSet {
 }
 
 function toResult(r: Row): Result {
+  const rawReasons = r.flag_reasons;
   return {
     id: r.id as string,
     roundId: r.round_id as string,
@@ -187,6 +189,9 @@ function toResult(r: Row): Result {
     rank: (r.rank as number) ?? null,
     videoUrl: (r.video_url as string) ?? null,
     flagStatus: r.flag_status as Result["flagStatus"],
+    flagReasons: (rawReasons
+      ? (typeof rawReasons === "string" ? JSON.parse(rawReasons) : rawReasons)
+      : []) as Result["flagReasons"],
     verifiedBy: (r.verified_by as string) ?? undefined,
     verifiedAt: r.verified_at ? ts(r.verified_at) : undefined,
     verificationComment: (r.verification_comment as string) ?? undefined,
@@ -225,6 +230,19 @@ function toPayment(r: Row): Payment {
     razorpayPaymentId: (r.razorpay_payment_id as string) ?? undefined,
     promoCodeId: (r.promo_code_id as string) ?? undefined,
     status: r.status as Payment["status"],
+    createdAt: ts(r.created_at),
+  };
+}
+
+function toAuditEntry(r: Row): AuditLogEntry {
+  return {
+    id: r.id as string,
+    adminId: r.admin_id as string,
+    action: r.action as string,
+    target: (r.target as string) ?? undefined,
+    reason: (r.reason as string) ?? undefined,
+    oldValue: (r.old_value as string) ?? undefined,
+    newValue: (r.new_value as string) ?? undefined,
     createdAt: ts(r.created_at),
   };
 }
@@ -600,14 +618,15 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
       async create(round) {
         await pool.query(
           `INSERT INTO rounds
-             (id, competition_event_id, round_number, advancement_count, status, opens_at, closes_at, duration_minutes, advancement_criteria)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+             (id, competition_event_id, round_number, advancement_count, status, opens_at, closes_at, duration_minutes, advancement_criteria, video_required)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
           [
             round.id, round.competitionEventId, round.roundNumber,
             round.advancementCount ?? null, round.status,
             round.opensAt ?? null, round.closesAt ?? null,
             round.durationMinutes ?? null,
             round.advancementCriteria ? JSON.stringify(round.advancementCriteria) : null,
+            round.videoRequired ?? false,
           ],
         );
       },
@@ -616,6 +635,7 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
           status: "status", opensAt: "opens_at", closesAt: "closes_at",
           advancementCount: "advancement_count", durationMinutes: "duration_minutes",
           advancementCriteria: "advancement_criteria", resultsPublishedAt: "results_published_at",
+          videoRequired: "video_required",
         };
         const raw = fields as Record<string, unknown>;
         if (raw.advancementCriteria !== undefined) {
@@ -738,15 +758,16 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
         await pool.query(
           `INSERT INTO results
              (id, round_id, user_id, solves_json, best_single_ms, ao5_ms, mean_ms,
-              median_ms, std_ms, rank, video_url, flag_status, verified_by, verified_at,
-              submitted_at)
-           VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+              median_ms, std_ms, rank, video_url, flag_status, flag_reasons,
+              verified_by, verified_at, submitted_at)
+           VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16)`,
           [
             result.id, result.roundId, result.userId,
             JSON.stringify(result.solves),
             result.bestSingleMs, result.ao5Ms, result.meanMs,
             result.medianMs, result.stdMs, result.rank,
             result.videoUrl, result.flagStatus,
+            JSON.stringify(result.flagReasons ?? []),
             result.verifiedBy ?? null, result.verifiedAt ?? null,
             result.submittedAt,
           ],
@@ -759,7 +780,12 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
           rank: "rank", videoUrl: "video_url", userId: "user_id",
           bestSingleMs: "best_single_ms", ao5Ms: "ao5_ms",
           meanMs: "mean_ms", medianMs: "median_ms", stdMs: "std_ms",
+          flagReasons: "flag_reasons",
         };
+        // Serialise flagReasons to JSON before passing to buildSet
+        if (fields.flagReasons !== undefined) {
+          (fields as Record<string, unknown>).flagReasons = JSON.stringify(fields.flagReasons);
+        }
         const { sets, vals, next } = buildSet(COL, fields as Record<string, unknown>);
         if (sets.length === 0) return this.findById(id);
         vals.push(id);
@@ -926,6 +952,22 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
         );
         return rows[0] ? toPayment(rows[0]) : null;
       },
+      async findByRegistrationIds(registrationIds) {
+        const map = new Map<string, Payment>();
+        if (registrationIds.length === 0) return map;
+        const { rows } = await pool.query(
+          `SELECT DISTINCT ON (registration_id) *
+           FROM payments
+           WHERE registration_id = ANY($1::uuid[])
+           ORDER BY registration_id, created_at DESC`,
+          [registrationIds],
+        );
+        for (const r of rows) {
+          const p = toPayment(r);
+          map.set(p.registrationId, p);
+        }
+        return map;
+      },
       async create(payment) {
         await pool.query(
           `INSERT INTO payments
@@ -965,30 +1007,31 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
           "SELECT * FROM audit_log ORDER BY created_at DESC LIMIT $1 OFFSET $2",
           [limit, offset],
         );
-        return rows.map((r: Row): AuditLogEntry => ({
-          id: r.id as string, adminId: r.admin_id as string,
-          action: r.action as string, target: (r.target as string) ?? undefined,
-          reason: (r.reason as string) ?? undefined, createdAt: ts(r.created_at),
-        }));
+        return rows.map(toAuditEntry);
       },
       async findByAdmin(adminId: string) {
         const { rows } = await pool.query(
           "SELECT * FROM audit_log WHERE admin_id = $1 ORDER BY created_at DESC LIMIT 200",
           [adminId],
         );
-        return rows.map((r: Row): AuditLogEntry => ({
-          id: r.id as string, adminId: r.admin_id as string,
-          action: r.action as string, target: (r.target as string) ?? undefined,
-          reason: (r.reason as string) ?? undefined, createdAt: ts(r.created_at),
-        }));
+        return rows.map(toAuditEntry);
+      },
+      async findByTarget(target: string) {
+        const { rows } = await pool.query(
+          "SELECT * FROM audit_log WHERE target = $1 ORDER BY created_at DESC",
+          [target],
+        );
+        return rows.map(toAuditEntry);
       },
       async create(entry: AuditLogEntry) {
         await pool.query(
-          `INSERT INTO audit_log (id, admin_id, action, target, reason, created_at)
-           VALUES ($1,$2,$3,$4,$5,$6)`,
+          `INSERT INTO audit_log (id, admin_id, action, target, reason, old_value, new_value, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
           [
             entry.id, entry.adminId ?? null, entry.action,
-            entry.target ?? null, entry.reason ?? null, entry.createdAt,
+            entry.target ?? null, entry.reason ?? null,
+            entry.oldValue ?? null, entry.newValue ?? null,
+            entry.createdAt,
           ],
         );
       },
@@ -1318,6 +1361,20 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
         const { rows } = await pool.query(
           "SELECT * FROM practice_solves WHERE session_id = $1 ORDER BY created_at",
           [sessionId],
+        );
+        return rows.map((r: Row): PracticeSolve => ({
+          id: r.id as string, sessionId: r.session_id as string,
+          timeMs: r.time_ms as number, scramble: r.scramble as string,
+          penalty: r.penalty as PracticeSolve["penalty"],
+          note: (r.note as string) ?? undefined, createdAt: ts(r.created_at),
+        }));
+      },
+      async findSolvesBySessionIds(sessionIds) {
+        if (sessionIds.length === 0) return [];
+        const placeholders = sessionIds.map((_, i) => `$${i + 1}`).join(", ");
+        const { rows } = await pool.query(
+          `SELECT * FROM practice_solves WHERE session_id IN (${placeholders}) ORDER BY created_at`,
+          sessionIds,
         );
         return rows.map((r: Row): PracticeSolve => ({
           id: r.id as string, sessionId: r.session_id as string,
@@ -1780,22 +1837,42 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
         const { rows } = await pool.query(
           "SELECT data FROM system_settings WHERE id = 'default'",
         );
-        if (rows.length === 0) {
-          return {
-            eventDurations: {},
-            registrationDurationDays: 5,
-            gapBetweenEventsMinutes: 0,
-            defaultRoundDurationMinutes: 20,
-            videoDeadlineMinutes: 1440,
-          };
-        }
-        return rows[0].data as SystemSettings;
+        const defaults: SystemSettings = {
+          eventDurations: {},
+          registrationDurationDays: 5,
+          gapBetweenEventsMinutes: 0,
+          defaultRoundDurationMinutes: 20,
+          videoDeadlineMinutes: 1440,
+          flagRuleDefaults: {
+            nearRecordPct: 5,
+            personalDeviationPct: 30,
+            missingVideo: true,
+            borderlineCutoffMargin: 3,
+          },
+          recordReferences: {},
+        };
+        if (rows.length === 0) return defaults;
+        // Merge stored data over defaults so new fields get populated
+        const stored = rows[0].data as Partial<SystemSettings>;
+        return {
+          ...defaults,
+          ...stored,
+          flagRuleDefaults: { ...defaults.flagRuleDefaults, ...stored.flagRuleDefaults },
+          recordReferences: { ...defaults.recordReferences, ...stored.recordReferences },
+        };
       },
       async update(fields: Partial<SystemSettings>): Promise<SystemSettings> {
         const current = await this.get();
         const merged = { ...current, ...fields };
+        // Deep-merge nested objects
         if (fields.eventDurations) {
           merged.eventDurations = { ...current.eventDurations, ...fields.eventDurations };
+        }
+        if (fields.flagRuleDefaults) {
+          merged.flagRuleDefaults = { ...current.flagRuleDefaults, ...fields.flagRuleDefaults };
+        }
+        if (fields.recordReferences) {
+          merged.recordReferences = { ...current.recordReferences, ...fields.recordReferences };
         }
         await pool.query(
           `INSERT INTO system_settings (id, data, updated_at)

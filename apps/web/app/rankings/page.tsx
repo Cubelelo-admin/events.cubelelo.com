@@ -199,12 +199,12 @@ export default function RankingsPage() {
                       <td className="px-4 py-3 text-right font-mono text-zinc-800 dark:text-zinc-200">
                         {r.bestAo5Ms !== null && r.bestAo5Ms !== Infinity
                           ? formatTime(r.bestAo5Ms)
-                          : "—"}
+                          : "DNF"}
                       </td>
                       <td className="px-4 py-3 text-right font-mono text-zinc-800 dark:text-zinc-200">
                         {r.bestSingleMs !== null && r.bestSingleMs !== Infinity
                           ? formatTime(r.bestSingleMs)
-                          : "—"}
+                          : "DNF"}
                       </td>
                     </tr>
                   );

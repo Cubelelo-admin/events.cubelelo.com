@@ -464,7 +464,7 @@ function PracticeTerminalPage() {
               reset();
               setEventId(e.target.value as EventId);
             }}
-            className="rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium dark:border-zinc-700 dark:bg-zinc-900"
+            className="w-[160px] rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium dark:border-zinc-700 dark:bg-zinc-900"
           >
             {EVENT_IDS.map((id) => (
               <option key={id} value={id}>
@@ -486,8 +486,8 @@ function PracticeTerminalPage() {
       <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
         <StatCard label="Solves" value={String(solves.length)} />
         <StatCard label="Best" value={best !== null ? formatTime(best) : "—"} highlight={isNewPb} />
-        <StatCard label="ao5" value={currentAo5 !== null ? formatTime(currentAo5) : "—"} />
-        <StatCard label="ao12" value={currentAo12 !== null ? formatTime(currentAo12) : "—"} />
+        <StatCard label="ao5" value={currentAo5 !== null ? formatTime(currentAo5) : solves.length >= 5 ? "DNF" : "—"} />
+        <StatCard label="ao12" value={currentAo12 !== null ? formatTime(currentAo12) : solves.length >= 12 ? "DNF" : "—"} />
       </div>
 
       {/* Target time */}

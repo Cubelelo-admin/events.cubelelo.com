@@ -4,13 +4,16 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import {
   fetchAdminUsers,
+  fetchCompetitions,
   updateAdminUser,
   deleteAdminUser,
   type AdminUserDto,
+  type CompetitionSummary,
 } from "@/lib/api";
 import { ConfirmModal } from "@/components/ui/Modal";
 import { useToast } from "@/components/ui/Toast";
 import { EmptyState } from "@/components/EmptyState";
+import { DateRangeFilter, useDateRange } from "@/components/ui/DateRangeFilter";
 
 
 const STAGES = ["active", "migrated_stub", "suspended", "banned"];
@@ -22,27 +25,93 @@ const STAGE_COLOR: Record<string, string> = {
   banned: "text-red-400",
 };
 
+const inputClass = "rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100";
+
 export default function AdminUsersPage() {
   const toast = useToast();
   const [users, setUsers] = useState<AdminUserDto[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState("");
+  const dateRange = useDateRange();
+  const [compFilter, setCompFilter] = useState("");
+  const [competitions, setCompetitions] = useState<CompetitionSummary[]>([]);
+  const [allCompetitions, setAllCompetitions] = useState<CompetitionSummary[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
   const [pendingStage, setPendingStage] = useState<{ user: AdminUserDto; stage: string } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<AdminUserDto | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
 
   const load = useCallback(() => {
     setLoading(true);
-    fetchAdminUsers({ search: search || undefined, stage: stageFilter || undefined, role: "user" })
+    fetchAdminUsers({
+      search: search || undefined,
+      stage: stageFilter || undefined,
+      competitionId: compFilter || undefined,
+      limit: 500,
+    })
       .then(setUsers)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
-  }, [search, stageFilter]);
+  }, [search, stageFilter, compFilter]);
 
   useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    fetchCompetitions().then((c) => { setAllCompetitions(c); setCompetitions(c); }).catch(() => {});
+  }, []);
+
+  // Filter competitions by date range
+  useEffect(() => {
+    const { from, to } = dateRange.getRange();
+    if (!from && !to) {
+      setCompetitions(allCompetitions);
+      return;
+    }
+    const fromMs = from ? new Date(from).getTime() : 0;
+    const toMs = to ? new Date(to).getTime() : Infinity;
+    setCompetitions(allCompetitions.filter((c) => {
+      const t = new Date(c.startsAt ?? c.createdAt ?? "").getTime();
+      return t >= fromMs && t <= toMs;
+    }));
+    setCompFilter((prev) => {
+      if (!prev) return prev;
+      const still = allCompetitions.find((c) => c.id === prev);
+      if (!still) return "";
+      const t = new Date(still.startsAt ?? still.createdAt ?? "").getTime();
+      return (t >= fromMs && t <= toMs) ? prev : "";
+    });
+  }, [dateRange.getRange, allCompetitions]);
+
+  const handleExport = async () => {
+    setExporting(true);
+    try {
+      const allUsers = await fetchAdminUsers({
+        search: search || undefined,
+        stage: stageFilter || undefined,
+        competitionId: compFilter || undefined,
+        limit: 5000,
+      });
+      const header = "CL ID,Name,Email,Joined";
+      const rows = allUsers.map((u) =>
+        [u.clId, `"${u.name}"`, u.email, new Date(u.createdAt).toLocaleDateString()].join(",")
+      );
+      const csv = [header, ...rows].join("\n");
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `users-export-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExporting(false);
+    }
+  };
 
   const requestStageChange = (user: AdminUserDto, stage: string) => {
     if (stage === user.accountStage) return;
@@ -82,30 +151,47 @@ export default function AdminUsersPage() {
 
   return (
     <div className="mx-auto max-w-[1400px] px-8 py-10">
-      {/* Sub-nav */}
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-xl font-bold text-zinc-900 dark:text-zinc-100">Users</h1>
         <span className="text-sm text-zinc-500">{users.length} result{users.length !== 1 ? "s" : ""}</span>
       </div>
 
       {/* Filters */}
-      <div className="mb-5 flex flex-wrap gap-3">
+      <div className="mb-5 flex flex-wrap items-center gap-3">
         <input
           type="text"
           placeholder="Search name, email, CL ID…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && load()}
-          className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-600"
+          className={`${inputClass} w-[220px] flex-shrink-0 placeholder:text-zinc-400 focus:border-zinc-500 focus:outline-none dark:placeholder:text-zinc-600`}
         />
-        <select value={stageFilter} onChange={(e) => setStageFilter(e.target.value)}
-          className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100">
+        <select value={stageFilter} onChange={(e) => setStageFilter(e.target.value)} className={`${inputClass} w-[150px] flex-shrink-0`}>
           <option value="">All stages</option>
           {STAGES.map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <DateRangeFilter
+          preset={dateRange.preset}
+          setPreset={dateRange.setPreset}
+          customFrom={dateRange.customFrom}
+          setCustomFrom={dateRange.setCustomFrom}
+          customTo={dateRange.customTo}
+          setCustomTo={dateRange.setCustomTo}
+        />
+        <select value={compFilter} onChange={(e) => setCompFilter(e.target.value)} className={`${inputClass} w-[220px] flex-shrink-0 truncate`}>
+          <option value="">All competitions</option>
+          {competitions.map((c) => <option key={c.id} value={c.id}>{c.title}</option>)}
         </select>
         <button onClick={load}
           className="rounded-lg bg-zinc-800 px-4 py-2 text-sm font-semibold text-white hover:bg-zinc-700 dark:bg-zinc-700 dark:hover:bg-zinc-600">
           Search
+        </button>
+        <button
+          onClick={handleExport}
+          disabled={exporting || users.length === 0}
+          className="flex-shrink-0 rounded-lg border border-zinc-300 px-4 py-2 text-sm font-semibold text-zinc-700 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+        >
+          {exporting ? "Exporting…" : "↓ Export CSV"}
         </button>
       </div>
 
@@ -114,7 +200,7 @@ export default function AdminUsersPage() {
       {loading ? (
         <p className="text-zinc-500">Loading…</p>
       ) : users.length === 0 ? (
-        <EmptyState icon="🔍" title="No users found" description="Try adjusting your search or stage filter." />
+        <EmptyState icon="🔍" title="No users found" description="Try adjusting your search or filters." />
       ) : (
         <div className="overflow-x-auto rounded-xl border border-zinc-200 dark:border-zinc-800">
           <table className="w-full text-sm">
@@ -141,7 +227,7 @@ export default function AdminUsersPage() {
                       value={u.accountStage}
                       disabled={busy === u.id}
                       onChange={(e) => requestStageChange(u, e.target.value)}
-                      className={`rounded border border-zinc-300 bg-white px-2 py-1 text-xs font-semibold dark:border-zinc-700 dark:bg-zinc-900 ${STAGE_COLOR[u.accountStage] ?? "text-zinc-400"} disabled:opacity-50`}
+                      className={`w-[130px] rounded border border-zinc-300 bg-white px-2 py-1 text-xs font-semibold dark:border-zinc-700 dark:bg-zinc-900 ${STAGE_COLOR[u.accountStage] ?? "text-zinc-400"} disabled:opacity-50`}
                     >
                       {STAGES.map((s) => <option key={s} value={s}>{s}</option>)}
                     </select>

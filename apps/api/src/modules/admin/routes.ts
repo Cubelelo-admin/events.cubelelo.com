@@ -3,7 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { isEventId } from "@cubers/scramble-core";
 import type { CompStatus, CompType, FlagStatus } from "@cubers/types";
 import type { Repository } from "../../db/repo";
-import { type Competition, type CompetitionEvent, type Round, type AuditLogEntry, type Announcement, type PromoCode, type Appeal, type RankTier, type Banner, type FaqEntry, type ContentPage, sanitizeUser } from "../../db/types";
+import { type Competition, type CompetitionEvent, type Round, type AuditLogEntry, type Announcement, type PromoCode, type Appeal, type RankTier, type Banner, type FaqEntry, type ContentPage, type PersonalBest, sanitizeUser } from "../../db/types";
 import type { Realtime } from "../../sockets/realtime";
 import { requireRole } from "../../auth/plugin";
 import { effectiveCompStatus, effectiveRoundStatus } from "../../lib/statusUtils";
@@ -16,6 +16,7 @@ import { scheduleRoundJobs } from "../../lib/roundScheduler";
 import { transferUserData } from "../../lib/accountTransfer";
 import { ZipArchive } from "archiver";
 import { ANTICHEAT_THRESHOLDS, DEFAULT_ANTICHEAT_THRESHOLD } from "../../lib/eventConfig";
+import { computeFlags, computePriority } from "../../lib/flagEngine";
 import { getQueue } from "../../lib/jobQueue";
 
 const COMP_TYPES: CompType[] = ["paid", "free", "practice"];
@@ -32,6 +33,65 @@ export async function registerAdminRoutes(
 ): Promise<void> {
   const adminOnly = { preHandler: requireRole(repo, "admin") };
   const adminOrMod = { preHandler: requireRole(repo, "admin", "moderator") };
+
+  // ── Helpers: moderator ownership checks ──────────────────────────────────
+
+  /** Returns the competition if the caller is admin OR moderator who created it. */
+  async function ownedComp(
+    req: import("fastify").FastifyRequest,
+    reply: import("fastify").FastifyReply,
+    compId: string,
+  ): Promise<Competition | null> {
+    const comp = await repo.competitions.findById(compId);
+    if (!comp) { reply.code(404).send({ error: "competition_not_found" }); return null; }
+    const user = await repo.users.findById(req.authClaims!.sub);
+    if (!user) { reply.code(403).send({ error: "forbidden" }); return null; }
+    if (user.role === "admin" || user.role === "super_admin") return comp;
+    if (user.role === "moderator" && comp.createdBy === user.id) return comp;
+    reply.code(403).send({ error: "forbidden" });
+    return null;
+  }
+
+  /** Ownership check via round → competition event → competition. */
+  async function ownedCompByRound(
+    req: import("fastify").FastifyRequest,
+    reply: import("fastify").FastifyReply,
+    roundId: string,
+  ): Promise<Competition | null> {
+    const round = await repo.rounds.findById(roundId);
+    if (!round) { reply.code(404).send({ error: "round_not_found" }); return null; }
+    const ev = await repo.competitionEvents.findById(round.competitionEventId);
+    if (!ev) { reply.code(404).send({ error: "event_not_found" }); return null; }
+    return ownedComp(req, reply, ev.competitionId);
+  }
+
+  /** Ownership check via competition event → competition. */
+  async function ownedCompByEvent(
+    req: import("fastify").FastifyRequest,
+    reply: import("fastify").FastifyReply,
+    eventId: string,
+  ): Promise<Competition | null> {
+    const ev = await repo.competitionEvents.findById(eventId);
+    if (!ev) { reply.code(404).send({ error: "event_not_found" }); return null; }
+    return ownedComp(req, reply, ev.competitionId);
+  }
+
+  /** Ownership check via result → round → event → competition. */
+  async function ownedCompByResult(
+    req: import("fastify").FastifyRequest,
+    reply: import("fastify").FastifyReply,
+    resultId: string,
+  ): Promise<Competition | null> {
+    const result = await repo.results.findById(resultId);
+    if (!result) { reply.code(404).send({ error: "result_not_found" }); return null; }
+    return ownedCompByRound(req, reply, result.roundId);
+  }
+
+  /** Check if the caller is admin (not just moderator). */
+  async function isAdmin(req: import("fastify").FastifyRequest): Promise<boolean> {
+    const user = await repo.users.findById(req.authClaims!.sub);
+    return user?.role === "admin" || user?.role === "super_admin";
+  }
 
   // ── Competitions ──────────────────────────────────────────────────────────
 
@@ -59,13 +119,13 @@ export async function registerAdminRoutes(
         timeLimitMs?: number;
         fee?: number;
         advancementCount?: number;
-        advancementCriteria?: { method: string; rankLimit?: number; timeLimitMs?: number };
-        roundCriteria?: Array<{ method: string; rankLimit?: number; timeLimitMs?: number } | null>;
+        advancementCriteria?: { method: string; rankLimit?: number; timeLimitMs?: number; bestSingleMs?: number };
+        roundCriteria?: Array<{ method: string; rankLimit?: number; timeLimitMs?: number; bestSingleMs?: number } | null>;
         roundSchedule?: Array<{ startTime?: string; durationMinutes?: number } | null>;
         durationMinutes?: number;
       }>;
     };
-  }>("/api/v1/admin/competitions", adminOnly, async (req, reply) => {
+  }>("/api/v1/admin/competitions", adminOrMod, async (req, reply) => {
     const { title, type, description, rulesMd, ruleSetId, baseFee, perEventFee,
             registrationOpensAt, registrationDeadline, startsAt, endsAt, saveAsDraft,
             registrationLimit } =
@@ -146,9 +206,10 @@ export async function registerAdminRoutes(
           status: "pending",
           advancementCount: i < rounds ? (spec.advancementCount ?? undefined) : undefined,
           advancementCriteria: criteria
-            ? { method: criteria.method as "rank" | "time",
+            ? { method: criteria.method as "rank" | "time" | "best_single",
                 rankLimit: criteria.rankLimit,
-                timeLimitMs: criteria.timeLimitMs }
+                timeLimitMs: criteria.timeLimitMs,
+                bestSingleMs: criteria.bestSingleMs }
             : undefined,
           opensAt,
           closesAt,
@@ -201,12 +262,13 @@ export async function registerAdminRoutes(
         fee?: number;
         durationMinutes?: number;
         advancementCount?: number;
-        advancementCriteria?: { method: string; rankLimit?: number; timeLimitMs?: number };
-        roundCriteria?: Array<{ method: string; rankLimit?: number; timeLimitMs?: number } | undefined>;
+        advancementCriteria?: { method: string; rankLimit?: number; timeLimitMs?: number; bestSingleMs?: number };
+        roundCriteria?: Array<{ method: string; rankLimit?: number; timeLimitMs?: number; bestSingleMs?: number } | undefined>;
         roundSchedule?: Array<{ startTime?: string; durationMinutes?: number } | undefined>;
       }>;
     };
-  }>("/api/v1/admin/competitions/:id", adminOnly, async (req, reply) => {
+  }>("/api/v1/admin/competitions/:id", adminOrMod, async (req, reply) => {
+    if (!(await ownedComp(req, reply, req.params.id))) return;
     const {
       title, status, description, rulesMd, baseFee, perEventFee,
       registrationOpensAt, registrationDeadline, startsAt, endsAt,
@@ -230,7 +292,10 @@ export async function registerAdminRoutes(
     if (typeof startsAt === "string") fields.startsAt = startsAt;
     if (typeof endsAt === "string") fields.endsAt = endsAt;
     if (status && COMP_STATUSES.includes(status)) fields.status = status;
-    if (typeof featured === "boolean") fields.featured = featured;
+    if (typeof featured === "boolean") {
+      if (!(await isAdmin(req))) return reply.code(403).send({ error: "featured_admin_only" });
+      fields.featured = featured;
+    }
     if (typeof featuredOrder === "number") fields.featuredOrder = featuredOrder;
     if (typeof coverCaption === "string") fields.coverCaption = coverCaption;
     if (typeof coverUrl === "string") fields.coverUrl = coverUrl;
@@ -320,7 +385,7 @@ export async function registerAdminRoutes(
                 }
               }
               if (rc) {
-                rFields.advancementCriteria = { method: rc.method as "rank" | "time", rankLimit: rc.rankLimit, timeLimitMs: rc.timeLimitMs };
+                rFields.advancementCriteria = { method: rc.method as "rank" | "time" | "best_single", rankLimit: rc.rankLimit, timeLimitMs: rc.timeLimitMs, bestSingleMs: rc.bestSingleMs };
               }
               if (Object.keys(rFields).length > 0) await repo.rounds.update(er.id, rFields);
               continue;
@@ -342,7 +407,7 @@ export async function registerAdminRoutes(
               status: "pending",
               advancementCount: i < rounds ? (spec.advancementCount ?? undefined) : undefined,
               advancementCriteria: criteria
-                ? { method: criteria.method as "rank" | "time", rankLimit: criteria.rankLimit, timeLimitMs: criteria.timeLimitMs }
+                ? { method: criteria.method as "rank" | "time" | "best_single", rankLimit: criteria.rankLimit, timeLimitMs: criteria.timeLimitMs, bestSingleMs: criteria.bestSingleMs }
                 : undefined,
               opensAt,
               closesAt,
@@ -391,7 +456,7 @@ export async function registerAdminRoutes(
               roundNumber: i,
               status: "pending",
               advancementCriteria: criteria
-                ? { method: criteria.method as "rank" | "time", rankLimit: criteria.rankLimit, timeLimitMs: criteria.timeLimitMs }
+                ? { method: criteria.method as "rank" | "time" | "best_single", rankLimit: criteria.rankLimit, timeLimitMs: criteria.timeLimitMs, bestSingleMs: criteria.bestSingleMs }
                 : undefined,
               opensAt,
               closesAt,
@@ -428,10 +493,10 @@ export async function registerAdminRoutes(
   // Upload competition desktop banner
   app.post<{ Params: { id: string } }>(
     "/api/v1/admin/competitions/:id/upload-banner",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
-      const comp = await repo.competitions.findById(req.params.id);
-      if (!comp) return reply.code(404).send({ error: "competition_not_found" });
+      const comp = await ownedComp(req, reply, req.params.id);
+      if (!comp) return;
 
       const data = await req.file();
       if (!data) return reply.code(400).send({ error: "no_file" });
@@ -460,10 +525,10 @@ export async function registerAdminRoutes(
   // Upload competition mobile banner
   app.post<{ Params: { id: string } }>(
     "/api/v1/admin/competitions/:id/upload-mobile-banner",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
-      const comp = await repo.competitions.findById(req.params.id);
-      if (!comp) return reply.code(404).send({ error: "competition_not_found" });
+      const comp = await ownedComp(req, reply, req.params.id);
+      if (!comp) return;
 
       const data = await req.file();
       if (!data) return reply.code(400).send({ error: "no_file" });
@@ -493,9 +558,9 @@ export async function registerAdminRoutes(
   app.post<{
     Params: { id: string };
     Body: { reuseScrambles?: boolean; type?: CompType; copySchedule?: boolean };
-  }>("/api/v1/admin/competitions/:id/duplicate", adminOnly, async (req, reply) => {
-    const source = await repo.competitions.findById(req.params.id);
-    if (!source) return reply.code(404).send({ error: "competition_not_found" });
+  }>("/api/v1/admin/competitions/:id/duplicate", adminOrMod, async (req, reply) => {
+    const source = await ownedComp(req, reply, req.params.id);
+    if (!source) return;
 
     const user = await repo.users.findById(req.authClaims!.sub);
     const now = new Date().toISOString();
@@ -587,9 +652,9 @@ export async function registerAdminRoutes(
   app.post<{
     Params: { id: string };
     Body: { startsAt?: string; endsAt?: string };
-  }>("/api/v1/admin/competitions/:id/practice", adminOnly, async (req, reply) => {
-    const source = await repo.competitions.findById(req.params.id);
-    if (!source) return reply.code(404).send({ error: "competition_not_found" });
+  }>("/api/v1/admin/competitions/:id/practice", adminOrMod, async (req, reply) => {
+    const source = await ownedComp(req, reply, req.params.id);
+    if (!source) return;
 
     const user = await repo.users.findById(req.authClaims!.sub);
     const now = new Date().toISOString();
@@ -762,8 +827,8 @@ export async function registerAdminRoutes(
     "/api/v1/admin/competitions/:id/queue",
     adminOrMod,
     async (req, reply) => {
-      const comp = await repo.competitions.findById(req.params.id);
-      if (!comp) return reply.code(404).send({ error: "competition_not_found" });
+      const comp = await ownedComp(req, reply, req.params.id);
+      if (!comp) return;
 
       const rounds = await repo.rounds.findByCompetition(comp.id);
       const flagged = (await repo.results.findByRounds(rounds.map((r) => r.id)))
@@ -822,6 +887,7 @@ export async function registerAdminRoutes(
     Params: { id: string };
     Body: { action?: FlagStatus; reason?: string; comment?: string };
   }>("/api/v1/admin/results/:id/verify", adminOrMod, async (req, reply) => {
+    if (!(await ownedCompByResult(req, reply, req.params.id))) return;
     const result = await repo.results.findById(req.params.id);
     if (!result) return reply.code(404).send({ error: "result_not_found" });
 
@@ -844,12 +910,15 @@ export async function registerAdminRoutes(
       verificationComment: req.body?.comment || undefined,
     });
 
+    // §10 — Audit log with old/new values
     const entry: AuditLogEntry = {
       id: randomUUID(),
       adminId: admin?.id ?? req.authClaims!.sub,
       action: `result_${action}`,
       target: result.id,
       reason: req.body?.reason,
+      oldValue: JSON.stringify({ flagStatus: result.flagStatus, flagReasons: result.flagReasons }),
+      newValue: JSON.stringify({ flagStatus: action, comment: req.body?.comment || null }),
       createdAt: now,
     };
     await repo.auditLog.create(entry);
@@ -877,6 +946,401 @@ export async function registerAdminRoutes(
     return { id: result.id, flagStatus: action };
   });
 
+  // §8 — Bulk verify multiple results at once
+  app.post<{
+    Body: {
+      resultIds?: string[];
+      action?: FlagStatus;
+      reason?: string;
+      comment?: string;
+    };
+  }>("/api/v1/admin/verification/bulk-verify", adminOrMod, async (req, reply) => {
+    const { resultIds, action, reason, comment } = req.body ?? {};
+    if (!resultIds || !Array.isArray(resultIds) || resultIds.length === 0)
+      return reply.code(400).send({ error: "resultIds required" });
+    if (!action || !FLAG_ACTIONS.includes(action))
+      return reply.code(400).send({ error: "invalid_action" });
+    if (resultIds.length > 200)
+      return reply.code(400).send({ error: "max 200 results per bulk action" });
+    if (["plus2", "dnf", "disqualified"].includes(action) && !reason)
+      return reply.code(400).send({ error: "reason_required" });
+    // Ownership check on first result (bulk ops are within a single competition)
+    if (!(await ownedCompByResult(req, reply, resultIds[0]))) return;
+
+    const adminId = req.authClaims!.sub;
+    const now = new Date().toISOString();
+    const previousStates: { id: string; flagStatus: string }[] = [];
+
+    for (const rid of resultIds) {
+      const result = await repo.results.findById(rid);
+      if (!result) continue;
+
+      previousStates.push({ id: result.id, flagStatus: result.flagStatus });
+
+      await repo.results.update(result.id, {
+        flagStatus: action,
+        verifiedBy: adminId,
+        verifiedAt: now,
+        verificationComment: comment || undefined,
+      });
+
+      // §10 — Audit with old/new
+      await repo.auditLog.create({
+        id: randomUUID(),
+        adminId,
+        action: `bulk_result_${action}`,
+        target: result.id,
+        reason: reason || undefined,
+        oldValue: JSON.stringify({ flagStatus: result.flagStatus }),
+        newValue: JSON.stringify({ flagStatus: action }),
+        createdAt: now,
+      });
+
+      await applyResultOverride(repo, realtime, result, action);
+    }
+
+    return { updated: previousStates.length, previousStates };
+  });
+
+  // §8 — Undo a bulk action (restore previous flag statuses)
+  app.post<{
+    Body: { restorations?: { id: string; flagStatus: string }[] };
+  }>("/api/v1/admin/verification/bulk-undo", adminOrMod, async (req, reply) => {
+    const { restorations } = req.body ?? {};
+    if (!restorations || !Array.isArray(restorations) || restorations.length === 0)
+      return reply.code(400).send({ error: "restorations required" });
+    // Ownership check on first result
+    if (!(await ownedCompByResult(req, reply, restorations[0].id))) return;
+
+    const adminId = req.authClaims!.sub;
+    const now = new Date().toISOString();
+    let restored = 0;
+
+    for (const r of restorations) {
+      const result = await repo.results.findById(r.id);
+      if (!result) continue;
+
+      await repo.results.update(result.id, {
+        flagStatus: r.flagStatus as FlagStatus,
+        verifiedBy: undefined,
+        verifiedAt: undefined,
+        verificationComment: undefined,
+      });
+
+      await repo.auditLog.create({
+        id: randomUUID(),
+        adminId,
+        action: "bulk_undo",
+        target: result.id,
+        oldValue: JSON.stringify({ flagStatus: result.flagStatus }),
+        newValue: JSON.stringify({ flagStatus: r.flagStatus }),
+        createdAt: now,
+      });
+
+      await applyResultOverride(repo, realtime, result, r.flagStatus as FlagStatus);
+      restored++;
+    }
+
+    return { restored };
+  });
+
+  // ── Verification Hub (§1) ─────────────────────────────────────────────────
+
+  // Overview: all competitions with aggregate verification stats (no compId required)
+  app.get(
+    "/api/v1/admin/verification/hub/overview",
+    adminOrMod,
+    async (req) => {
+      const user = await repo.users.findById(req.authClaims!.sub);
+      if (!user) return { competitions: [] };
+
+      // Get all competitions — admins see all, moderators see only their own
+      let allComps = await repo.competitions.findAll();
+      if (user.role === "moderator") {
+        allComps = allComps.filter((c) => c.createdBy === user.id);
+      }
+
+      // Filter to competitions that have at least results_pending or completed status,
+      // or are live (rounds may already have results)
+      const relevant = allComps.filter((c) => {
+        const s = effectiveCompStatus(c);
+        return ["live", "results_pending", "completed"].includes(s);
+      });
+
+      if (relevant.length === 0) return { competitions: [] };
+
+      const compIds = relevant.map((c) => c.id);
+
+      // Bulk-fetch events for all competitions (single query)
+      const eventsByComp = await repo.competitionEvents.findByCompetitions(compIds);
+
+      // Build competitionEventId → compId mapping, then fetch all rounds in one go
+      const ceToComp = new Map<string, string>();
+      for (const [compId, events] of eventsByComp) {
+        for (const ev of events) ceToComp.set(ev.id, compId);
+      }
+
+      // Use findAll and filter to the relevant competition event IDs (avoids N queries)
+      const allRounds = (await repo.rounds.findAll()).filter((r) => ceToComp.has(r.competitionEventId));
+
+      // Group rounds by competition
+      const roundsByComp = new Map<string, Round[]>();
+      for (const r of allRounds) {
+        const compId = ceToComp.get(r.competitionEventId)!;
+        const list = roundsByComp.get(compId) ?? [];
+        list.push(r);
+        roundsByComp.set(compId, list);
+      }
+
+      // Bulk-fetch all results (single query)
+      const allRoundIds = allRounds.map((r) => r.id);
+      const allResults = allRoundIds.length > 0
+        ? await repo.results.findByRounds(allRoundIds)
+        : [];
+
+      // Group results by roundId
+      const resultsByRound = new Map<string, typeof allResults>();
+      for (const r of allResults) {
+        const list = resultsByRound.get(r.roundId) ?? [];
+        list.push(r);
+        resultsByRound.set(r.roundId, list);
+      }
+
+      // Bulk-fetch registration counts (single query)
+      const regCounts = await repo.competitions.countRegistrationsBatch(compIds);
+
+      // Build overview
+      const competitions = relevant.map((c) => {
+        const rounds = roundsByComp.get(c.id) ?? [];
+        let totalResults = 0, totalVerified = 0, totalFlagged = 0, totalClean = 0;
+        const roundCount = rounds.length;
+
+        for (const r of rounds) {
+          const results = resultsByRound.get(r.id) ?? [];
+          totalResults += results.length;
+          totalVerified += results.filter((x) =>
+            x.flagStatus === "verified" || x.flagStatus === "plus2" ||
+            x.flagStatus === "dnf" || x.flagStatus === "disqualified",
+          ).length;
+          totalFlagged += results.filter((x) => x.flagStatus === "flagged").length;
+          totalClean += results.filter((x) => x.flagStatus === "clean").length;
+        }
+
+        // Derive verification status
+        let verificationStatus: string;
+        if (totalResults === 0) verificationStatus = "empty";
+        else if (totalVerified === totalResults) verificationStatus = "complete";
+        else if (totalFlagged > 0) verificationStatus = "needs_review";
+        else verificationStatus = "in_progress";
+
+        return {
+          id: c.id,
+          title: c.title,
+          status: effectiveCompStatus(c),
+          startsAt: c.startsAt ?? null,
+          endsAt: c.endsAt ?? null,
+          bannerUrl: c.bannerUrl ?? null,
+          mobileBannerUrl: c.mobileBannerUrl ?? null,
+          registrationCount: regCounts.get(c.id) ?? 0,
+          roundCount,
+          eventCount: (eventsByComp.get(c.id) ?? []).length,
+          stats: { total: totalResults, verified: totalVerified, flagged: totalFlagged, clean: totalClean },
+          verificationStatus,
+        };
+      });
+
+      // Sort: needs_review first, then in_progress, then complete, then empty
+      const statusOrder: Record<string, number> = { needs_review: 0, in_progress: 1, complete: 2, empty: 3 };
+      competitions.sort((a, b) => (statusOrder[a.verificationStatus] ?? 4) - (statusOrder[b.verificationStatus] ?? 4));
+
+      return { competitions };
+    },
+  );
+
+  // Hub summary: per-round verification stats for a competition
+  app.get<{ Querystring: { compId?: string } }>(
+    "/api/v1/admin/verification/hub",
+    adminOrMod,
+    async (req, reply) => {
+      const { compId } = req.query;
+      if (!compId) return reply.code(400).send({ error: "compId is required" });
+
+      const comp = await ownedComp(req, reply, compId);
+      if (!comp) return;
+
+      const events = await repo.competitionEvents.findByCompetition(compId);
+      const allRounds = await repo.rounds.findByCompetition(compId);
+
+      // Group rounds by competition event
+      const roundsByEvent = new Map<string, Round[]>();
+      for (const r of allRounds) {
+        const list = roundsByEvent.get(r.competitionEventId) ?? [];
+        list.push(r);
+        roundsByEvent.set(r.competitionEventId, list);
+      }
+
+      // Fetch all results and judge assignments in bulk
+      const roundIds = allRounds.map((r) => r.id);
+      const allResults = roundIds.length > 0
+        ? await repo.results.findByRounds(roundIds)
+        : [];
+
+      // Group results by roundId
+      const resultsByRound = new Map<string, typeof allResults>();
+      for (const r of allResults) {
+        const list = resultsByRound.get(r.roundId) ?? [];
+        list.push(r);
+        resultsByRound.set(r.roundId, list);
+      }
+
+      // Fetch judge assignments for all rounds
+      const assignmentsByRound = new Map<string, { judgeId: string; judgeName: string; judgeClId: string }[]>();
+      for (const rid of roundIds) {
+        const assignments = await repo.judgeAssignments.findByRound(rid);
+        if (assignments.length > 0) {
+          const judgeIds = assignments.map((a) => a.judgeId);
+          const judgeMap = await repo.users.findByIds(judgeIds);
+          assignmentsByRound.set(
+            rid,
+            assignments.map((a) => {
+              const j = judgeMap.get(a.judgeId);
+              return { judgeId: a.judgeId, judgeName: j?.name ?? "Unknown", judgeClId: j?.clId ?? a.judgeId };
+            }),
+          );
+        }
+      }
+
+      const hubEvents = events.map((ev) => {
+        const rounds = (roundsByEvent.get(ev.id) ?? [])
+          .sort((a, b) => a.roundNumber - b.roundNumber)
+          .map((r) => {
+            const results = resultsByRound.get(r.id) ?? [];
+            const total = results.length;
+            const flagged = results.filter((x) => x.flagStatus === "flagged").length;
+            const verified = results.filter((x) =>
+              x.flagStatus === "verified" || x.flagStatus === "plus2" ||
+              x.flagStatus === "dnf" || x.flagStatus === "disqualified",
+            ).length;
+            const clean = results.filter((x) => x.flagStatus === "clean").length;
+
+            // Derived status: complete | has_flagged | in_progress | empty
+            let verificationStatus: string;
+            if (total === 0) verificationStatus = "empty";
+            else if (verified === total) verificationStatus = "complete";
+            else if (flagged > 0) verificationStatus = "has_flagged";
+            else verificationStatus = "in_progress";
+
+            return {
+              id: r.id,
+              roundNumber: r.roundNumber,
+              status: effectiveRoundStatus(r),
+              videoRequired: r.videoRequired ?? false,
+              resultsPublishedAt: r.resultsPublishedAt ?? null,
+              stats: { total, flagged, verified, clean },
+              verificationStatus,
+              judges: assignmentsByRound.get(r.id) ?? [],
+            };
+          });
+
+        return {
+          eventType: ev.eventType,
+          competitionEventId: ev.id,
+          rounds,
+        };
+      });
+
+      return {
+        competition: { id: comp.id, title: comp.title, status: effectiveCompStatus(comp) },
+        events: hubEvents,
+      };
+    },
+  );
+
+  // §6 — Re-run flag engine on all results in a round
+  app.post<{ Params: { roundId: string } }>(
+    "/api/v1/admin/verification/rounds/:roundId/reflag",
+    adminOrMod,
+    async (req, reply) => {
+      if (!(await ownedCompByRound(req, reply, req.params.roundId))) return;
+      const round = await repo.rounds.findById(req.params.roundId);
+      if (!round) return reply.code(404).send({ error: "round_not_found" });
+
+      const event = await repo.competitionEvents.findByRound(round.id);
+      const eventType = event?.eventType ?? "333";
+      const settings = await repo.systemSettings.get();
+      const record = settings.recordReferences[eventType] ?? null;
+      const results = await repo.results.findByRound(round.id);
+
+      // Fetch all PBs for users in this round
+      const userIds = [...new Set(results.map((r) => r.userId))];
+      const allPbs = await Promise.all(
+        userIds.map((uid) => repo.personalBests.findByUser(uid)),
+      );
+      const pbsByUser = new Map<string, PersonalBest | null>();
+      userIds.forEach((uid, i) => {
+        const pb = (allPbs[i] ?? []).find((p: PersonalBest) => p.eventType === eventType) ?? null;
+        pbsByUser.set(uid, pb);
+      });
+
+      let updated = 0;
+      for (const r of results) {
+        // Skip already-verified results — don't re-flag what a judge has reviewed
+        if (r.flagStatus === "verified" || r.flagStatus === "plus2" ||
+            r.flagStatus === "dnf" || r.flagStatus === "disqualified") continue;
+
+        const flagReasons = computeFlags({
+          bestSingleMs: r.bestSingleMs,
+          ao5Ms: r.ao5Ms,
+          videoUrl: r.videoUrl,
+          videoRequired: round.videoRequired ?? false,
+          advancementCriteria: round.advancementCriteria,
+          advancementCount: round.advancementCount,
+          eventType,
+          rules: settings.flagRuleDefaults,
+          record,
+          personalBest: pbsByUser.get(r.userId) ?? null,
+          roundResultCount: results.length,
+        });
+
+        const newStatus: FlagStatus = flagReasons.length > 0 ? "flagged" : "clean";
+        if (newStatus !== r.flagStatus || JSON.stringify(flagReasons) !== JSON.stringify(r.flagReasons)) {
+          await repo.results.update(r.id, { flagStatus: newStatus, flagReasons });
+          updated++;
+        }
+      }
+
+      return { roundId: round.id, totalResults: results.length, updated };
+    },
+  );
+
+  // §10 — Audit trail for a single result
+  app.get<{ Params: { resultId: string } }>(
+    "/api/v1/admin/verification/results/:resultId/audit",
+    adminOrMod,
+    async (req, reply) => {
+      if (!(await ownedCompByResult(req, reply, req.params.resultId))) return;
+      const result = await repo.results.findById(req.params.resultId);
+      if (!result) return reply.code(404).send({ error: "result_not_found" });
+
+      const entries = await repo.auditLog.findByTarget(req.params.resultId);
+      const adminIds = [...new Set(entries.map((e) => e.adminId).filter(Boolean))];
+      const adminsMap = adminIds.length > 0 ? await repo.users.findByIds(adminIds) : new Map();
+
+      return entries.map((e) => {
+        const admin = adminsMap.get(e.adminId);
+        return {
+          id: e.id,
+          action: e.action,
+          adminName: admin?.name ?? e.adminId,
+          reason: e.reason ?? null,
+          oldValue: e.oldValue ? JSON.parse(e.oldValue) : null,
+          newValue: e.newValue ? JSON.parse(e.newValue) : null,
+          createdAt: e.createdAt,
+        };
+      });
+    },
+  );
+
   // ── Verification management (admin + moderator) ─────────────────────────
 
   // All results for a round with user info + verification status
@@ -884,6 +1348,7 @@ export async function registerAdminRoutes(
     "/api/v1/admin/verification/rounds/:roundId/results",
     adminOrMod,
     async (req, reply) => {
+      if (!(await ownedCompByRound(req, reply, req.params.roundId))) return;
       const round = await repo.rounds.findById(req.params.roundId);
       if (!round) return reply.code(404).send({ error: "round_not_found" });
 
@@ -907,6 +1372,8 @@ export async function registerAdminRoutes(
           ao5Ms: r.ao5Ms,
           videoUrl: r.videoUrl,
           flagStatus: r.flagStatus,
+          flagReasons: r.flagReasons ?? [],
+          priority: computePriority(r.flagReasons ?? []),
           verifiedBy: r.verifiedBy,
           verifiedAt: r.verifiedAt,
           verificationComment: r.verificationComment,
@@ -922,6 +1389,7 @@ export async function registerAdminRoutes(
     "/api/v1/admin/verification/rounds/:roundId/judges",
     adminOrMod,
     async (req, reply) => {
+      if (!(await ownedCompByRound(req, reply, req.params.roundId))) return;
       const round = await repo.rounds.findById(req.params.roundId);
       if (!round) return reply.code(404).send({ error: "round_not_found" });
 
@@ -952,6 +1420,7 @@ export async function registerAdminRoutes(
     const { judgeId, roundId } = req.body ?? {};
     if (!judgeId || !roundId)
       return reply.code(400).send({ error: "judgeId_and_roundId_required" });
+    if (!(await ownedCompByRound(req, reply, roundId))) return;
 
     const judge = await repo.users.findById(judgeId);
     if (!judge || !["judge", "moderator", "admin"].includes(judge.role))
@@ -995,7 +1464,8 @@ export async function registerAdminRoutes(
   app.patch<{
     Params: { id: string };
     Body: { cutoffMs?: number; timeLimitMs?: number; roundCount?: number; fee?: number; archived?: boolean };
-  }>("/api/v1/admin/competition-events/:id", adminOnly, async (req, reply) => {
+  }>("/api/v1/admin/competition-events/:id", adminOrMod, async (req, reply) => {
+    if (!(await ownedCompByEvent(req, reply, req.params.id))) return;
     const { cutoffMs, timeLimitMs, roundCount, fee, archived } = req.body ?? {};
     const fields: Partial<CompetitionEvent> = {};
     if (cutoffMs !== undefined) fields.cutoffMs = cutoffMs;
@@ -1012,8 +1482,9 @@ export async function registerAdminRoutes(
 
   app.delete<{ Params: { id: string } }>(
     "/api/v1/admin/competition-events/:id",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
+      if (!(await ownedCompByEvent(req, reply, req.params.id))) return;
       const ev = await repo.competitionEvents.findById(req.params.id);
       if (!ev) return reply.code(404).send({ error: "event_not_found" });
       const rounds = await repo.rounds.findByCompetition(ev.competitionId);
@@ -1031,16 +1502,24 @@ export async function registerAdminRoutes(
 
   // ── Users (admin) ────────────────────────────────────────────────────────
 
-  app.get<{ Querystring: { search?: string; role?: string; stage?: string; page?: string; limit?: string } }>(
+  app.get<{ Querystring: { search?: string; role?: string; stage?: string; competitionId?: string; page?: string; limit?: string } }>(
     "/api/v1/admin/users",
     adminOnly,
     async (req) => {
       let users = await repo.users.findAll(req.query.search);
       if (req.query.role) users = users.filter((u) => u.role === req.query.role);
       if (req.query.stage) users = users.filter((u) => u.accountStage === req.query.stage);
+
+      // Filter by competition registration
+      if (req.query.competitionId) {
+        const regs = await repo.registrations.findByCompetition(req.query.competitionId);
+        const regUserIds = new Set(regs.map((r) => r.userId));
+        users = users.filter((u) => regUserIds.has(u.id));
+      }
+
       const total = users.length;
       const page = Math.max(1, Number(req.query.page) || 1);
-      const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+      const limit = Math.min(5000, Math.max(1, Number(req.query.limit) || 50));
       const paginated = users.slice((page - 1) * limit, page * limit);
       return { data: paginated.map(sanitizeUser), total, page, limit };
     },
@@ -1048,9 +1527,9 @@ export async function registerAdminRoutes(
 
   app.patch<{
     Params: { id: string };
-    Body: { role?: string; accountStage?: string };
+    Body: { role?: string; accountStage?: string; name?: string; email?: string; mobileNo?: string };
   }>("/api/v1/admin/users/:id", adminOnly, async (req, reply) => {
-    const { role, accountStage } = req.body ?? {};
+    const { role, accountStage, name, email, mobileNo } = req.body ?? {};
     const admin = await repo.users.findById(req.authClaims!.sub);
     const isSuperAdmin = admin?.role === "super_admin";
     const ROLES = isSuperAdmin
@@ -1061,6 +1540,9 @@ export async function registerAdminRoutes(
     const fields: Partial<import("../../db/types").User> = {};
     if (role && ROLES.includes(role)) fields.role = role as import("@cubers/types").UserRole;
     if (accountStage && STAGES.includes(accountStage)) fields.accountStage = accountStage as import("@cubers/types").AccountStage;
+    if (typeof name === "string" && name.trim()) fields.name = name.trim();
+    if (typeof email === "string" && email.trim()) fields.email = email.trim();
+    if (typeof mobileNo === "string") fields.mobileNo = mobileNo.trim() || undefined;
 
     if (Object.keys(fields).length === 0) return reply.code(400).send({ error: "no_valid_fields" });
 
@@ -1124,10 +1606,10 @@ export async function registerAdminRoutes(
   // All scrambles for a competition (admin)
   app.get<{ Params: { id: string } }>(
     "/api/v1/admin/competitions/:id/scrambles",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
-      const comp = await repo.competitions.findById(req.params.id);
-      if (!comp) return reply.code(404).send({ error: "competition_not_found" });
+      const comp = await ownedComp(req, reply, req.params.id);
+      if (!comp) return;
 
       const events = await repo.competitionEvents.findByCompetition(comp.id);
       const rounds = await repo.rounds.findByCompetition(comp.id);
@@ -1165,10 +1647,10 @@ export async function registerAdminRoutes(
   // Delete a competition (admin)
   app.delete<{ Params: { id: string } }>(
     "/api/v1/admin/competitions/:id",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
-      const comp = await repo.competitions.findById(req.params.id);
-      if (!comp) return reply.code(404).send({ error: "competition_not_found" });
+      const comp = await ownedComp(req, reply, req.params.id);
+      if (!comp) return;
 
       if (comp.status !== "draft" && comp.status !== "cancelled") {
         return reply.code(409).send({ error: "cancel_before_deleting" });
@@ -1197,18 +1679,68 @@ export async function registerAdminRoutes(
     },
   );
 
+  // ── Admin: competition participants (enhanced) ──────────────────────────
+  app.get<{ Params: { id: string } }>(
+    "/api/v1/admin/competitions/:id/participants",
+    adminOrMod,
+    async (req, reply) => {
+      const comp = await ownedComp(req, reply, req.params.id);
+      if (!comp) return;
+
+      const regs = await repo.registrations.findByCompetition(comp.id);
+      req.log.info({ compId: comp.id, regCount: regs.length }, "admin participants: fetched registrations");
+      if (regs.length === 0) return { count: 0, participants: [] };
+
+      const regIds = regs.map((r) => r.id);
+      const userIds = [...new Set(regs.map((r) => r.userId))];
+      const [usersMap, eventsByReg, paymentsByReg] = await Promise.all([
+        repo.users.findByIds(userIds),
+        repo.registrations.findEventsForAll(regIds),
+        repo.payments.findByRegistrationIds(regIds),
+      ]);
+
+      const participants = regs.map((reg) => {
+        const u = usersMap.get(reg.userId);
+        const regEvents = (eventsByReg.get(reg.id) ?? []).map((e) => e.eventType);
+        const payment = paymentsByReg.get(reg.id);
+        return {
+          userId: reg.userId,
+          clId: u?.clId ?? reg.userId,
+          name: u?.name ?? "Unknown",
+          email: u?.email ?? "",
+          mobileNo: u?.mobileNo ?? null,
+          city: u?.city ?? null,
+          country: u?.country ?? null,
+          eventTypes: regEvents,
+          paymentStatus: payment?.status ?? reg.paymentStatus,
+          paymentAmount: payment?.amount ?? 0,
+          registeredAt: reg.createdAt,
+        };
+      });
+
+      return { count: participants.length, participants };
+    },
+  );
+
   // ── Payments (admin) ──────────────────────────────────────────────────────
 
-  app.get<{ Querystring: { status?: string; page?: string; limit?: string } }>(
+  app.get<{ Querystring: { status?: string; competitionId?: string; page?: string; limit?: string } }>(
     "/api/v1/admin/payments",
     adminOnly,
     async (req) => {
       let payments = await repo.payments.findAll();
       if (req.query.status) payments = payments.filter((p) => p.status === req.query.status);
 
+      // Filter by competition
+      if (req.query.competitionId) {
+        const compRegs = await repo.registrations.findByCompetition(req.query.competitionId);
+        const compRegIds = new Set(compRegs.map((r) => r.id));
+        payments = payments.filter((p) => compRegIds.has(p.registrationId));
+      }
+
       const total = payments.length;
       const page = Math.max(1, Number(req.query.page) || 1);
-      const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+      const limit = Math.min(5000, Math.max(1, Number(req.query.limit) || 50));
       const paginated = payments.slice((page - 1) * limit, page * limit);
 
       const userIds = [...new Set(paginated.map((p) => p.userId))];
@@ -1270,10 +1802,10 @@ export async function registerAdminRoutes(
 
   app.get<{ Params: { id: string } }>(
     "/api/v1/admin/competitions/:id/export",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
-      const comp = await repo.competitions.findById(req.params.id);
-      if (!comp) return reply.code(404).send({ error: "competition_not_found" });
+      const comp = await ownedComp(req, reply, req.params.id);
+      if (!comp) return;
 
       const events = await repo.competitionEvents.findByCompetition(comp.id);
       const rounds = await repo.rounds.findByCompetition(comp.id);
@@ -1359,14 +1891,14 @@ export async function registerAdminRoutes(
     };
   }>(
     "/api/v1/admin/competitions/:id/email",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
       const { subject, bodyHtml, recipients: csvRecipients } = req.body ?? {};
       if (!subject?.trim() || !bodyHtml?.trim())
         return reply.code(400).send({ error: "subject_and_body_required" });
 
-      const comp = await repo.competitions.findById(req.params.id);
-      if (!comp) return reply.code(404).send({ error: "competition_not_found" });
+      const comp = await ownedComp(req, reply, req.params.id);
+      if (!comp) return;
 
       let recipients: { email: string; name: string }[];
 
@@ -1374,9 +1906,11 @@ export async function registerAdminRoutes(
         recipients = csvRecipients.filter((r) => r.email?.trim());
       } else {
         const regs = await repo.registrations.findByCompetition(comp.id);
+        const regUserIds = [...new Set(regs.map((r) => r.userId))];
+        const regUsersMap = await repo.users.findByIds(regUserIds);
         recipients = [];
         for (const reg of regs) {
-          const user = await repo.users.findById(reg.userId);
+          const user = regUsersMap.get(reg.userId);
           if (user?.email) recipients.push({ email: user.email, name: user.name });
         }
       }
@@ -1408,8 +1942,9 @@ export async function registerAdminRoutes(
 
   app.get<{ Params: { id: string; userId: string } }>(
     "/api/v1/admin/competitions/:id/certificate/:userId",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
+      if (!(await ownedComp(req, reply, req.params.id))) return;
       const data = await collectCertificateData(repo, req.params.id, req.params.userId);
       if (!data) return reply.code(404).send({ error: "not_found" });
 
@@ -1426,10 +1961,10 @@ export async function registerAdminRoutes(
 
   app.get<{ Params: { id: string } }>(
     "/api/v1/admin/competitions/:id/certificates",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
-      const comp = await repo.competitions.findById(req.params.id);
-      if (!comp) return reply.code(404).send({ error: "competition_not_found" });
+      const comp = await ownedComp(req, reply, req.params.id);
+      if (!comp) return;
 
       const regs = await repo.registrations.findByCompetition(comp.id);
       if (regs.length === 0)
@@ -1501,14 +2036,14 @@ export async function registerAdminRoutes(
     };
   }>(
     "/api/v1/admin/competitions/:id/certificates/csv",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
       const { winners } = req.body ?? {};
       if (!Array.isArray(winners) || winners.length === 0)
         return reply.code(400).send({ error: "winners_required" });
 
-      const comp = await repo.competitions.findById(req.params.id);
-      if (!comp) return reply.code(404).send({ error: "competition_not_found" });
+      const comp = await ownedComp(req, reply, req.params.id);
+      if (!comp) return;
 
       const compDate = comp.startsAt
         ? new Date(comp.startsAt).toLocaleDateString("en-IN", { year: "numeric", month: "long", day: "numeric" })
@@ -1793,20 +2328,21 @@ export async function registerAdminRoutes(
 
   // Admin: list all appeals
   app.get<{ Querystring: { page?: string; limit?: string; status?: string } }>("/api/v1/admin/appeals", adminOrMod, async (req) => {
+    const caller = await repo.users.findById(req.authClaims!.sub);
+    const isMod = caller?.role === "moderator";
     let all = await repo.appeals.findAll();
     if (req.query.status) all = all.filter((a) => a.status === req.query.status);
-    const total = all.length;
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
-    const paginated = all.slice((page - 1) * limit, page * limit);
-    const data = await Promise.all(
-      paginated.map(async (a) => {
+
+    // Resolve competition ownership for each appeal (needed for moderator filtering + display)
+    const enriched = await Promise.all(
+      all.map(async (a) => {
         const user = await repo.users.findById(a.userId);
         const result = await repo.results.findById(a.resultId);
         let competitionName: string | undefined;
         let eventType: string | undefined;
         let roundNumber: number | undefined;
         let competitionId: string | undefined;
+        let compCreatedBy: string | undefined;
         if (result) {
           const round = await repo.rounds.findById(result.roundId);
           if (round) {
@@ -1816,6 +2352,7 @@ export async function registerAdminRoutes(
               competitionId = compEvent.competitionId;
               const comp = await repo.competitions.findById(compEvent.competitionId);
               competitionName = comp?.title;
+              compCreatedBy = comp?.createdBy;
             }
             roundNumber = round.roundNumber;
           }
@@ -1835,9 +2372,22 @@ export async function registerAdminRoutes(
           bestSingleMs: result?.bestSingleMs,
           videoUrl: result?.videoUrl,
           resolvedByName: resolverName,
+          _compCreatedBy: compCreatedBy,
         };
       }),
     );
+
+    // Moderators only see appeals for their own competitions
+    const filtered = isMod
+      ? enriched.filter((a) => a._compCreatedBy === caller!.id)
+      : enriched;
+
+    const total = filtered.length;
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+    const paginated = filtered.slice((page - 1) * limit, page * limit);
+    // Strip internal field
+    const data = paginated.map(({ _compCreatedBy, ...rest }) => rest);
     return { data, total, page, limit };
   });
 
@@ -1849,6 +2399,11 @@ export async function registerAdminRoutes(
     const { action, adminResponse } = req.body ?? {};
     if (!action || !["accepted", "rejected"].includes(action))
       return reply.code(400).send({ error: "action_required" });
+
+    // Moderator ownership check
+    const appeal = await repo.appeals.findById(req.params.id);
+    if (!appeal) return reply.code(404).send({ error: "appeal_not_found" });
+    if (!(await ownedCompByResult(req, reply, appeal.resultId))) return;
 
     const updated = await repo.appeals.update(req.params.id, {
       status: action,
@@ -2032,8 +2587,9 @@ export async function registerAdminRoutes(
 
   app.post<{ Params: { id: string } }>(
     "/api/v1/admin/rounds/:id/notify",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
+      if (!(await ownedCompByRound(req, reply, req.params.id))) return;
       const round = await repo.rounds.findById(req.params.id);
       if (!round) return reply.code(404).send({ error: "round_not_found" });
 
@@ -2042,10 +2598,11 @@ export async function registerAdminRoutes(
 
       const comp = await repo.competitions.findById(event.competitionId);
       const regs = await repo.registrations.findByCompetition(event.competitionId);
+      const userIds = [...new Set(regs.map((r) => r.userId))];
+      const usersMap = await repo.users.findByIds(userIds);
       const recipients: { email: string; name: string }[] = [];
-
       for (const reg of regs) {
-        const user = await repo.users.findById(reg.userId);
+        const user = usersMap.get(reg.userId);
         if (user?.email) recipients.push({ email: user.email, name: user.name });
       }
 
@@ -2070,8 +2627,9 @@ export async function registerAdminRoutes(
 
   app.post<{ Params: { id: string } }>(
     "/api/v1/admin/rounds/:id/publish",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
+      if (!(await ownedCompByRound(req, reply, req.params.id))) return;
       const round = await repo.rounds.findById(req.params.id);
       if (!round) return reply.code(404).send({ error: "round_not_found" });
       if (round.resultsPublishedAt) return reply.code(409).send({ error: "already_published" });
@@ -2081,10 +2639,11 @@ export async function registerAdminRoutes(
 
       const comp = await repo.competitions.findById(event.competitionId);
       const regs = await repo.registrations.findByCompetition(event.competitionId);
+      const userIds = [...new Set(regs.map((r) => r.userId))];
+      const usersMap = await repo.users.findByIds(userIds);
       const recipients: { email: string; name: string }[] = [];
-
       for (const reg of regs) {
-        const user = await repo.users.findById(reg.userId);
+        const user = usersMap.get(reg.userId);
         if (user?.email) recipients.push({ email: user.email, name: user.name });
       }
 
@@ -2450,6 +3009,12 @@ export async function registerAdminRoutes(
     }
     if (typeof body.videoDeadlineMinutes === "number" && body.videoDeadlineMinutes > 0) {
       patch.videoDeadlineMinutes = body.videoDeadlineMinutes;
+    }
+    if (body.flagRuleDefaults && typeof body.flagRuleDefaults === "object") {
+      patch.flagRuleDefaults = body.flagRuleDefaults;
+    }
+    if (body.recordReferences && typeof body.recordReferences === "object") {
+      patch.recordReferences = body.recordReferences;
     }
     const updated = await repo.systemSettings.update(patch);
     return reply.send(updated);

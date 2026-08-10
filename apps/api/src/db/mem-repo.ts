@@ -372,6 +372,17 @@ export function createMemRepo(): Repository {
       async findByRegistration(registrationId) {
         return [...payments.values()].find((p) => p.registrationId === registrationId && p.status === "pending") ?? null;
       },
+      async findByRegistrationIds(registrationIds) {
+        const set = new Set(registrationIds);
+        const map = new Map<string, import("./types").Payment>();
+        for (const p of payments.values()) {
+          if (set.has(p.registrationId)) {
+            const existing = map.get(p.registrationId);
+            if (!existing || p.createdAt > existing.createdAt) map.set(p.registrationId, p);
+          }
+        }
+        return map;
+      },
       async create(payment) { payments.set(payment.id, payment); },
       async update(id, fields) {
         const payment = payments.get(id);
@@ -385,6 +396,9 @@ export function createMemRepo(): Repository {
       },
       async findByAdmin(adminId) {
         return auditLogEntries.filter((e) => e.adminId === adminId).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      },
+      async findByTarget(target) {
+        return auditLogEntries.filter((e) => e.target === target).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       },
       async create(entry) { auditLogEntries.push(entry); },
     },
@@ -523,6 +537,10 @@ export function createMemRepo(): Repository {
       },
       async findSolvesBySession(sessionId) {
         return practiceSolves.filter((s) => s.sessionId === sessionId);
+      },
+      async findSolvesBySessionIds(sessionIds) {
+        const idSet = new Set(sessionIds);
+        return practiceSolves.filter((s) => idSet.has(s.sessionId));
       },
       async deleteSolve(id) {
         const idx = practiceSolves.findIndex((s) => s.id === id);
@@ -713,6 +731,13 @@ export function createMemRepo(): Repository {
         gapBetweenEventsMinutes: 0,
         defaultRoundDurationMinutes: 20,
         videoDeadlineMinutes: 1440,
+        flagRuleDefaults: {
+          nearRecordPct: 5,
+          personalDeviationPct: 30,
+          missingVideo: true,
+          borderlineCutoffMargin: 3,
+        },
+        recordReferences: {},
       };
       return {
         async get() { return settings; },
@@ -720,6 +745,12 @@ export function createMemRepo(): Repository {
           settings = { ...settings, ...fields };
           if (fields.eventDurations) {
             settings.eventDurations = { ...settings.eventDurations, ...fields.eventDurations };
+          }
+          if (fields.flagRuleDefaults) {
+            settings.flagRuleDefaults = { ...settings.flagRuleDefaults, ...fields.flagRuleDefaults };
+          }
+          if (fields.recordReferences) {
+            settings.recordReferences = { ...settings.recordReferences, ...fields.recordReferences };
           }
           return settings;
         },

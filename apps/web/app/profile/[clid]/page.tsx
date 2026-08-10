@@ -11,6 +11,7 @@ import { GradientAvatar } from "@/components/GradientAvatar";
 import { CountUp } from "@/components/CountUp";
 import { Skeleton } from "@/components/Skeleton";
 import { EventIcon } from "@/components/EventIcon";
+import { eventDisplayName } from "@/lib/eventNames";
 
 export default function ProfilePage() {
   const params = useParams<{ clid: string }>();
@@ -201,7 +202,7 @@ export default function ProfilePage() {
                         <td className="py-3 pr-4 font-mono font-semibold text-zinc-800 dark:text-zinc-200">
                           <span className="inline-flex items-center gap-1.5">
                             <EventIcon eventId={event} size={16} />
-                            {event}
+                            {eventDisplayName(event)}
                           </span>
                         </td>
                         <td className="py-3 px-4 text-right font-mono text-zinc-700 dark:text-zinc-300">
@@ -320,7 +321,7 @@ function SolveTimelineGraph({
                 : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200 hover:text-zinc-900 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200"
             }`}
           >
-            {et}
+            {eventDisplayName(et)}
           </button>
         ))}
       </div>
@@ -506,7 +507,7 @@ function CompetitionHistoryCard({
   entry: UserProfile["competitionHistory"][number];
 }) {
   const [open, setOpen] = useState(false);
-  const eventTypes = entry.events.map((e) => e.eventType).join(", ");
+  const eventTypes = entry.events.map((e) => eventDisplayName(e.eventType)).join(", ");
 
   return (
     <div className="rounded-xl border border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950/40">
@@ -545,7 +546,7 @@ function CompetitionHistoryCard({
               {entry.events.map((ev) => (
                 <div key={ev.eventType}>
                   <div className="mb-2 font-mono text-sm font-semibold text-zinc-700 dark:text-zinc-300">
-                    {ev.eventType}
+                    {eventDisplayName(ev.eventType)}
                   </div>
                   <div className="overflow-x-auto">
                     <table className="w-full text-xs">

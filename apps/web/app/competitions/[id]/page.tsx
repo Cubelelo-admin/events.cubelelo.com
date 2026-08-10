@@ -28,7 +28,6 @@ import { formatTime } from "@cubers/timer-core";
 import { Button } from "@/components/ui/Button";
 import { ErrorCard } from "@/components/ui/ErrorCard";
 import { Modal } from "@/components/ui/Modal";
-import { useToast } from "@/components/ui/Toast";
 import { Skeleton } from "@/components/Skeleton";
 import { Countdown } from "@/components/Countdown";
 import { Markdown } from "@/components/Markdown";
@@ -85,20 +84,13 @@ function getNavItems(
 export default function CompetitionDetailPage() {
   const params = useParams<{ id: string }>();
   const { user } = useAuth();
-  const toast = useToast();
+
   const [comp, setComp] = useState<CompetitionDetail | null>(null);
   const [myReg, setMyReg] = useState<RegistrationDto | null>(null);
   const [myProgress, setMyProgress] = useState<RoundProgress[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState("overview");
-
-  const refreshComp = useCallback(() => {
-    if (!params.id) return;
-    fetchCompetition(params.id)
-      .then(setComp)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  }, [params.id]);
 
   useEffect(() => {
     if (!params.id) return;
@@ -121,35 +113,6 @@ export default function CompetitionDetailPage() {
       .then((p) => setMyProgress(p.rounds))
       .catch(() => { });
   }, [user, params.id]);
-
-  const allRoundIds = useMemo(() => {
-    if (!comp) return [];
-    return comp.events.flatMap((ev) => ev.rounds.map((r) => r.id));
-  }, [comp?.id, comp?.events.length]);
-
-  useEffect(() => {
-    if (allRoundIds.length === 0) return;
-
-    const socket = acquireSocket();
-    for (const rid of allRoundIds) {
-      socket.emit("join", { roundId: rid });
-    }
-
-    const handler = (p: { roundId: string; status: string }) => {
-      if (allRoundIds.includes(p.roundId)) {
-        refreshComp();
-        if (p.status === "open") {
-          toast.show("A round is now open — you can enter!", "success");
-        }
-      }
-    };
-    socket.on("round:status", handler);
-
-    return () => {
-      socket.off("round:status", handler);
-      releaseSocket();
-    };
-  }, [allRoundIds, refreshComp, toast]);
 
   const navItems = useMemo(
     () => (comp ? getNavItems(comp, !!myReg, user) : []),
@@ -1234,7 +1197,7 @@ function EventRoundDropdowns({
       <select
         value={selectedEvent}
         onChange={(e) => { onEventChange(e.target.value); onRoundChange(1); }}
-        className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900/40 dark:text-zinc-300"
+        className="w-[160px] rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900/40 dark:text-zinc-300"
       >
         {comp.events.map((ev) => (
           <option key={ev.eventType} value={ev.eventType}>
@@ -1245,7 +1208,7 @@ function EventRoundDropdowns({
       <select
         value={selectedRound}
         onChange={(e) => onRoundChange(Number(e.target.value))}
-        className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900/40 dark:text-zinc-300"
+        className="w-[220px] rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900/40 dark:text-zinc-300"
       >
         {rounds.map((r) => (
           <option key={r.id} value={r.roundNumber}>
@@ -1371,6 +1334,9 @@ function RankingsTab({ comp, showResultsLink, userId }: { comp: CompetitionDetai
   const [selectedRound, setSelectedRound] = useState(1);
   const [ranking, setRanking] = useState<LiveRankingEntry[]>([]);
   const [roundInfo, setRoundInfo] = useState<{ roundNumber: number | null }>({ roundNumber: null });
+  const [activeRoundId, setActiveRoundId] = useState<string | null>(null);
+  const [visible, setVisible] = useState(false);
+  const sectionRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(1);
 
@@ -1378,6 +1344,18 @@ function RankingsTab({ comp, showResultsLink, userId }: { comp: CompetitionDetai
   const [appealReason, setAppealReason] = useState("");
   const [appealStatus, setAppealStatus] = useState<"idle" | "sending" | "sent" | "error">("idle");
   const [appealError, setAppealError] = useState("");
+
+  // Track visibility — only connect socket when section is on screen
+  useEffect(() => {
+    const el = sectionRef.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => setVisible(entry.isIntersecting),
+      { threshold: 0 },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     if (!selectedEvent) return;
@@ -1387,10 +1365,45 @@ function RankingsTab({ comp, showResultsLink, userId }: { comp: CompetitionDetai
       .then((d) => {
         setRanking(d.ranking);
         setRoundInfo({ roundNumber: d.roundNumber });
+        setActiveRoundId(d.roundId);
       })
       .catch(() => setRanking([]))
       .finally(() => setLoading(false));
   }, [comp.id, selectedEvent]);
+
+  // Subscribe to real-time leaderboard updates only when visible
+  useEffect(() => {
+    if (!activeRoundId || !visible) return;
+
+    const socket = acquireSocket();
+    socket.emit("join", { roundId: activeRoundId });
+
+    const handler = (data: { roundId: string; board: Array<{
+      id: string; userId: string; userName?: string; userClId?: string;
+      ao5Ms: number | null; bestSingleMs: number | null; rank: number | null; flagStatus: string;
+    }> }) => {
+      if (data.roundId !== activeRoundId) return;
+      const updated: LiveRankingEntry[] = data.board.map((r) => ({
+        resultId: r.id,
+        userId: r.userId,
+        clId: r.userClId ?? r.userId,
+        name: r.userName ?? "Unknown",
+        rank: r.rank,
+        ao5Ms: r.ao5Ms,
+        bestSingleMs: r.bestSingleMs,
+        flagStatus: r.flagStatus,
+      }));
+      updated.sort((a, b) => (a.rank ?? Infinity) - (b.rank ?? Infinity));
+      setRanking(updated);
+    };
+
+    socket.on("leaderboard:update", handler);
+
+    return () => {
+      socket.off("leaderboard:update", handler);
+      releaseSocket();
+    };
+  }, [activeRoundId, visible]);
 
   const totalPages = Math.ceil(ranking.length / ROWS_PER_PAGE);
   const visibleRanking = ranking.slice((page - 1) * ROWS_PER_PAGE, page * ROWS_PER_PAGE);
@@ -1399,7 +1412,7 @@ function RankingsTab({ comp, showResultsLink, userId }: { comp: CompetitionDetai
   const myEntry = userId ? ranking.find((r) => r.userId === userId) : null;
 
   return (
-    <div>
+    <div ref={sectionRef}>
       <div className="mb-4 flex flex-wrap items-center gap-3">
         <EventRoundDropdowns
           comp={comp}
@@ -1409,6 +1422,15 @@ function RankingsTab({ comp, showResultsLink, userId }: { comp: CompetitionDetai
           onRoundChange={setSelectedRound}
         />
         <div className="ml-auto flex items-center gap-2">
+          {activeRoundId && visible && (
+            <span className="flex items-center gap-1.5 text-xs font-medium text-emerald-500">
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+              </span>
+              LIVE
+            </span>
+          )}
           {showResultsLink && (
             <Link
               href={`/competitions/${comp.id}/results`}
@@ -1456,10 +1478,10 @@ function RankingsTab({ comp, showResultsLink, userId }: { comp: CompetitionDetai
                     {isMe && <span className="ml-2 rounded bg-accent-primary/10 px-1.5 py-0.5 text-[10px] font-bold text-accent-primary">YOU</span>}
                   </td>
                   <td className="px-4 py-3 font-mono text-zinc-700 dark:text-zinc-300">
-                    {r.ao5Ms !== null ? formatTime(r.ao5Ms) : "—"}
+                    {r.ao5Ms !== null ? formatTime(r.ao5Ms) : "DNF"}
                   </td>
                   <td className="px-4 py-3 font-mono text-zinc-700 dark:text-zinc-300">
-                    {r.bestSingleMs !== null ? formatTime(r.bestSingleMs) : "—"}
+                    {r.bestSingleMs !== null ? formatTime(r.bestSingleMs) : "DNF"}
                   </td>
                 </tr>
               );
@@ -1710,10 +1732,10 @@ function GlanceTab({ comp, myProgress }: { comp: CompetitionDetail; myProgress: 
                     )}
                   </td>
                   <td className="px-4 py-3 font-mono text-zinc-700 dark:text-zinc-300">
-                    {rp.result?.ao5Ms != null ? formatTime(rp.result.ao5Ms) : "—"}
+                    {rp.result ? (rp.result.ao5Ms != null ? formatTime(rp.result.ao5Ms) : "DNF") : "—"}
                   </td>
                   <td className="px-4 py-3 font-mono text-zinc-700 dark:text-zinc-300">
-                    {rp.result?.bestSingleMs != null ? formatTime(rp.result.bestSingleMs) : "—"}
+                    {rp.result ? (rp.result.bestSingleMs != null ? formatTime(rp.result.bestSingleMs) : "DNF") : "—"}
                   </td>
                   <td className="px-4 py-3">
                     {rp.result?.rank != null ? (

@@ -12,6 +12,7 @@ import {
   sendRoundNotification,
   fetchCompetition,
   fetchSchedulingDefaults,
+  fetchRuleSets,
   updateCompetition,
   updateCompetitionEvent,
   deleteCompetitionEvent,
@@ -23,8 +24,14 @@ import {
   type EventDetail,
   type RoundRef,
   type SchedulingDefaults,
+  type RuleSetDto,
+  fetchAdminParticipants,
+  type AdminParticipantEntry,
 } from "@/lib/api";
+import { EVENT_IDS } from "@cubers/scramble-core";
 import { formatTime } from "@cubers/timer-core";
+import { eventDisplayName } from "@/lib/eventNames";
+import { EventIcon } from "@/components/EventIcon";
 import { StatusBadge } from "./StatusBadge";
 import { ConfirmModal, Modal } from "@/components/ui/Modal";
 import { Button } from "@/components/ui/Button";
@@ -116,6 +123,26 @@ function cascadeSchedule(
     vals.compStart = vals.regClose;
   }
 
+  // compStart → compEnd: shift end by same delta, or default to compStart + 1 day
+  if (
+    (changedField === "regOpens" || changedField === "regClose" || changedField === "compStart") &&
+    vals.compStart &&
+    !pinned.has("compEnd")
+  ) {
+    if (vals.compEnd) {
+      // Preserve the original duration between compStart and compEnd
+      const oldStart = pinned.has("compStart") ? new Date(vals.compStart) : null;
+      if (!oldStart) {
+        // compStart was auto-cascaded — default compEnd to compStart + 1 day
+        const d = new Date(new Date(vals.compStart).getTime() + 86400000);
+        vals.compEnd = toLocal(d.toISOString());
+      }
+    } else {
+      const d = new Date(new Date(vals.compStart).getTime() + 86400000);
+      vals.compEnd = toLocal(d.toISOString());
+    }
+  }
+
   // ── Backward cascade (upstream adjustments) ──
 
   if (changedField === "compStart" && vals.compStart && vals.regClose && !pinned.has("regClose")) {
@@ -166,6 +193,20 @@ export function AdminCompetition({ id }: { id: string }) {
   const [showEmailModal, setShowEmailModal] = useState(false);
   const [showPracticeModal, setShowPracticeModal] = useState(false);
   const csvCertRef = useRef<HTMLInputElement>(null);
+  const [ruleSets, setRuleSets] = useState<RuleSetDto[]>([]);
+  const [selectedRuleSetIds, setSelectedRuleSetIds] = useState<string[]>([]);
+  const [showRuleDropdown, setShowRuleDropdown] = useState(false);
+  const schedSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [adminParticipants, setAdminParticipants] = useState<AdminParticipantEntry[]>([]);
+  const [participantsLoading, setParticipantsLoading] = useState(false);
+  const [showParticipants, setShowParticipants] = useState(false);
+  const [participantsError, setParticipantsError] = useState<string | null>(null);
+  const [showAddEvent, setShowAddEvent] = useState(false);
+  const [newEventType, setNewEventType] = useState("333");
+  const [newRoundCount, setNewRoundCount] = useState(1);
+  const [newCutoffMs, setNewCutoffMs] = useState("");
+  const [newTimeLimitMs, setNewTimeLimitMs] = useState("");
+  const [newEventFee, setNewEventFee] = useState("");
 
   const load = useCallback(() => {
     fetchCompetition(id)
@@ -184,7 +225,25 @@ export function AdminCompetition({ id }: { id: string }) {
         setGapMinutes(s.gapBetweenEventsMinutes);
       })
       .catch(() => {});
+    fetchRuleSets().then(setRuleSets).catch(() => {});
   }, []);
+
+  // Restore selectedRuleSetIds from saved rulesMd by matching content
+  useEffect(() => {
+    if (!detail?.rulesMd || ruleSets.length === 0) return;
+    const saved = detail.rulesMd.trim();
+    if (!saved) return;
+    // Split by --- separator and match each chunk to a rule set
+    const chunks = saved.split(/\n\n---\n\n/).map((c) => c.trim());
+    const matched: string[] = [];
+    for (const rs of ruleSets) {
+      const rsTrimmed = rs.content.trim();
+      if (chunks.some((ch) => ch === rsTrimmed)) {
+        matched.push(rs.id);
+      }
+    }
+    if (matched.length > 0) setSelectedRuleSetIds(matched);
+  }, [detail?.rulesMd, ruleSets]);
 
   // Sync inputs whenever detail refreshes — schedule fields only on first load
   useEffect(() => {
@@ -240,7 +299,22 @@ export function AdminCompetition({ id }: { id: string }) {
       // Auto-recompute round times when compStart changes (directly or via cascade)
       const newCompStart = vals.compStart;
       const prevCompStart = compStarts;
-      if (newCompStart && newCompStart !== prevCompStart && detail) {
+      const compStartChanged = !!(newCompStart && newCompStart !== prevCompStart);
+
+      // Debounced auto-save schedule to server (skip when recompute handles it)
+      if (schedSaveTimer.current) clearTimeout(schedSaveTimer.current);
+      if (!compStartChanged && detail) {
+        schedSaveTimer.current = setTimeout(() => {
+          updateCompetition(detail.id, {
+            registrationOpensAt: toISO(vals.regOpens),
+            registrationDeadline: toISO(vals.regClose),
+            startsAt: toISO(vals.compStart),
+            endsAt: toISO(vals.compEnd),
+          }).catch(() => {});
+        }, 800);
+      }
+
+      if (compStartChanged && detail) {
         const times = computeRoundTimes(
           new Date(newCompStart),
           detail.events,
@@ -248,10 +322,9 @@ export function AdminCompetition({ id }: { id: string }) {
           schedDefaults?.eventDurations ?? DEFAULT_EVENT_DURATION,
           schedDefaults?.defaultRoundDurationMinutes ?? DEFAULT_DURATION,
         );
-        // Update competition startsAt/endsAt FIRST, then rounds (validation needs updated window)
+        // Update competition + rounds on server, then patch local detail to avoid load() race
         (async () => {
           try {
-            // Compute new endsAt from the last round
             let newEnd: string | undefined;
             if (times.length > 0) {
               const last = times[times.length - 1]!;
@@ -259,7 +332,6 @@ export function AdminCompetition({ id }: { id: string }) {
                 new Date(last.opensAt).getTime() + last.durationMinutes * 60000,
               ).toISOString();
             }
-            // Save ALL cascaded schedule fields + round window so load() won't revert them
             await updateCompetition(detail.id, {
               registrationOpensAt: toISO(vals.regOpens),
               registrationDeadline: toISO(vals.regClose),
@@ -268,18 +340,30 @@ export function AdminCompetition({ id }: { id: string }) {
             });
             if (newEnd) setCompEnds(toLocal(newEnd));
 
-            // Now update each round's schedule
             for (const t of times) {
               const closesAt = new Date(
                 new Date(t.opensAt).getTime() + t.durationMinutes * 60000,
               ).toISOString();
               await updateRound(t.roundId, { opensAt: t.opensAt, closesAt, durationMinutes: t.durationMinutes });
             }
-            load();
+            // Patch local detail instead of load() to avoid state race with user edits
+            setDetail((prev) => {
+              if (!prev) return prev;
+              const updated = { ...prev, startsAt: toISO(newCompStart)!, endsAt: newEnd ?? toISO(newCompStart)! };
+              updated.events = updated.events.map((ev) => ({
+                ...ev,
+                rounds: ev.rounds.map((r) => {
+                  const match = times.find((t) => t.roundId === r.id);
+                  if (!match) return r;
+                  const closesAt = new Date(new Date(match.opensAt).getTime() + match.durationMinutes * 60000).toISOString();
+                  return { ...r, opensAt: match.opensAt, closesAt, durationMinutes: match.durationMinutes };
+                }),
+              }));
+              return updated;
+            });
           } catch (e) {
             console.error("Auto-recompute round schedule failed:", e);
             setError(e instanceof Error ? e.message : String(e));
-            load();
           }
         })();
       }
@@ -516,12 +600,82 @@ export function AdminCompetition({ id }: { id: string }) {
               />
             </div>
             <div className="sm:col-span-2">
-              <label className="mb-1 block text-xs text-zinc-500">Rules (Markdown)</label>
+              <label className="mb-1 block text-xs text-zinc-500">Rules</label>
+              {/* Rule sets container — chips + add more */}
+              {ruleSets.length > 0 && (
+                <div className="mb-2 rounded-lg border border-zinc-300 bg-white px-3 py-2.5 dark:border-zinc-700 dark:bg-zinc-900">
+                  {selectedRuleSetIds.length > 0 ? (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {selectedRuleSetIds.map((rsId) => {
+                        const rs = ruleSets.find((r) => r.id === rsId);
+                        return (
+                          <span key={rsId} className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-medium text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300">
+                            {rs?.name ?? rsId}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const remaining = selectedRuleSetIds.filter((id) => id !== rsId);
+                                setSelectedRuleSetIds(remaining);
+                                setEditRules(remaining.map((id) => ruleSets.find((r) => r.id === id)?.content ?? "").join("\n\n---\n\n"));
+                              }}
+                              className="ml-0.5 rounded-full p-0.5 text-emerald-600 transition hover:bg-emerald-200 hover:text-emerald-900 dark:text-emerald-400 dark:hover:bg-emerald-800 dark:hover:text-emerald-200"
+                              aria-label={`Remove ${rs?.name}`}
+                            >
+                              ✕
+                            </button>
+                          </span>
+                        );
+                      })}
+                      {/* Show "Add More" only if there are remaining rule sets */}
+                      {ruleSets.filter((rs) => !selectedRuleSetIds.includes(rs.id)).length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => setShowRuleDropdown((v) => !v)}
+                          className="inline-flex items-center gap-0.5 rounded-full border border-dashed border-zinc-400 px-2.5 py-1 text-xs font-medium text-zinc-600 transition hover:border-emerald-500 hover:text-emerald-600 dark:border-zinc-600 dark:text-zinc-400 dark:hover:border-emerald-500 dark:hover:text-emerald-400"
+                        >
+                          + Add More
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setShowRuleDropdown((v) => !v)}
+                      className="text-sm text-zinc-500 transition hover:text-emerald-600 dark:text-zinc-400 dark:hover:text-emerald-400"
+                    >
+                      + Select rule sets
+                    </button>
+                  )}
+                  {/* Dropdown shown only when toggled */}
+                  {showRuleDropdown && (
+                    <select
+                      value=""
+                      onChange={(e) => {
+                        const rsId = e.target.value;
+                        if (!rsId || selectedRuleSetIds.includes(rsId)) return;
+                        const next = [...selectedRuleSetIds, rsId];
+                        setSelectedRuleSetIds(next);
+                        setEditRules(next.map((id) => ruleSets.find((r) => r.id === id)?.content ?? "").join("\n\n---\n\n"));
+                        // Auto-hide if no more remaining
+                        if (ruleSets.filter((rs) => !next.includes(rs.id)).length === 0) {
+                          setShowRuleDropdown(false);
+                        }
+                      }}
+                      className="mt-2 w-full rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-900 focus:border-emerald-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
+                    >
+                      <option value="">— Select a rule set —</option>
+                      {ruleSets.filter((rs) => !selectedRuleSetIds.includes(rs.id)).map((rs) => (
+                        <option key={rs.id} value={rs.id}>{rs.name}</option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+              )}
               <textarea
                 value={editRules}
                 onChange={(e) => setEditRules(e.target.value)}
                 rows={6}
-                placeholder="Competition rules — supports Markdown formatting"
+                placeholder={selectedRuleSetIds.length > 0 ? "Rules loaded from selected sets. Edit below to customize." : "Write custom rules (Markdown)..."}
                 className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 font-mono text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-600"
               />
             </div>
@@ -557,11 +711,15 @@ export function AdminCompetition({ id }: { id: string }) {
                   <p className="mt-1 text-xs text-zinc-500">Current — upload a new one to replace</p>
                 </div>
               )}
-              {bannerFile && <p className="mb-1 text-xs text-emerald-500">Selected: {bannerFile.name}</p>}
+              {busy === "banner" && <p className="mb-1 text-xs text-amber-500">Uploading…</p>}
+              {bannerFile && <p className="mb-1 text-xs text-emerald-500">Uploaded: {bannerFile.name}</p>}
               <input
                 type="file"
                 accept="image/png,image/jpeg,image/gif,image/webp"
-                onChange={(e) => setBannerFile(e.target.files?.[0] ?? null)}
+                onChange={(e) => {
+                  const file = e.target.files?.[0] ?? null;
+                  if (file) run("banner", async () => { await uploadCompetitionBanner(id, file); setBannerFile(file); });
+                }}
                 className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 file:mr-3 file:rounded file:border-0 file:bg-emerald-600 file:px-3 file:py-1 file:text-xs file:font-semibold file:text-white"
               />
             </div>
@@ -573,11 +731,15 @@ export function AdminCompetition({ id }: { id: string }) {
                   <p className="mt-1 text-xs text-zinc-500">Current — upload a new one to replace</p>
                 </div>
               )}
-              {mobileBannerFile && <p className="mb-1 text-xs text-emerald-500">Selected: {mobileBannerFile.name}</p>}
+              {busy === "mobileBanner" && <p className="mb-1 text-xs text-amber-500">Uploading…</p>}
+              {mobileBannerFile && <p className="mb-1 text-xs text-emerald-500">Uploaded: {mobileBannerFile.name}</p>}
               <input
                 type="file"
                 accept="image/png,image/jpeg,image/gif,image/webp"
-                onChange={(e) => setMobileBannerFile(e.target.files?.[0] ?? null)}
+                onChange={(e) => {
+                  const file = e.target.files?.[0] ?? null;
+                  if (file) run("mobileBanner", async () => { await uploadCompetitionMobileBanner(id, file); setMobileBannerFile(file); });
+                }}
                 className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 file:mr-3 file:rounded file:border-0 file:bg-zinc-600 file:px-3 file:py-1 file:text-xs file:font-semibold file:text-white"
               />
             </div>
@@ -689,8 +851,18 @@ export function AdminCompetition({ id }: { id: string }) {
         </div>
 
         {/* ── Events table ── */}
+        <div className="mt-5">
+          <div className="mb-2 flex items-center justify-between">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">Events</h3>
+            <button
+              onClick={() => setShowAddEvent(true)}
+              className="rounded border border-zinc-300 px-2.5 py-1 text-xs font-medium text-zinc-600 transition hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+            >
+              + Add Event
+            </button>
+          </div>
         {detail.events.filter((e) => !e.archived).length > 0 && (
-          <div className="mt-5 rounded-lg border border-zinc-200 dark:border-zinc-800 overflow-hidden">
+          <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 overflow-hidden">
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm">
                 <thead>
@@ -722,6 +894,7 @@ export function AdminCompetition({ id }: { id: string }) {
             </div>
           </div>
         )}
+        </div>
 
         {/* ── Archived events ── */}
         {detail.events.filter((e) => e.archived).length > 0 && (
@@ -774,6 +947,129 @@ export function AdminCompetition({ id }: { id: string }) {
         )}
       </section>
 
+      {/* ── Participants section ── */}
+      <section className="mb-6">
+        <div className="mb-3 flex items-center justify-between">
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">Participants</h3>
+          <div className="flex gap-2">
+            {showParticipants && adminParticipants.length > 0 && (
+              <button
+                onClick={() => {
+                  const header = "CL ID,Name,Email,Phone,Events,Payment Status,Amount,Registered";
+                  const rows = adminParticipants.map((p) =>
+                    [
+                      p.clId,
+                      `"${p.name}"`,
+                      p.email,
+                      p.mobileNo ?? "",
+                      `"${p.eventTypes.join(", ")}"`,
+                      p.paymentStatus,
+                      `₹${(p.paymentAmount / 100).toFixed(2)}`,
+                      new Date(p.registeredAt).toLocaleDateString(),
+                    ].join(",")
+                  );
+                  const csv = [header, ...rows].join("\n");
+                  const blob = new Blob([csv], { type: "text/csv" });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a");
+                  a.href = url;
+                  a.download = `participants-${detail.title.replace(/\s+/g, "-")}-${new Date().toISOString().slice(0, 10)}.csv`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                }}
+                className="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              >
+                ↓ Export CSV
+              </button>
+            )}
+            <button
+              onClick={async () => {
+                if (!showParticipants) {
+                  setParticipantsLoading(true);
+                  setParticipantsError(null);
+                  try {
+                    const res = await fetchAdminParticipants(id);
+                    setAdminParticipants(res.participants);
+                  } catch (e) {
+                    console.error("Failed to fetch participants:", e);
+                    setParticipantsError(e instanceof Error ? e.message : String(e));
+                  }
+                  setParticipantsLoading(false);
+                }
+                setShowParticipants((v) => !v);
+              }}
+              className="w-[90px] text-xs font-medium text-emerald-600 hover:text-emerald-500 dark:text-emerald-400 dark:hover:text-emerald-300"
+            >
+              {showParticipants ? "▲ Hide" : "▼ Show"} ({detail.registrationCount ?? 0})
+            </button>
+          </div>
+        </div>
+        {showParticipants && (
+          participantsLoading ? (
+            <p className="text-sm text-zinc-500">Loading participants…</p>
+          ) : participantsError ? (
+            <p className="rounded-lg border border-red-200 bg-red-50 px-4 py-6 text-center text-sm text-red-600 dark:border-red-800 dark:bg-red-900/30 dark:text-red-400">
+              Error loading participants: {participantsError}
+            </p>
+          ) : adminParticipants.length === 0 ? (
+            <p className="rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-6 text-center text-sm text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900/30">
+              No participants registered yet.
+            </p>
+          ) : (
+            <div className="overflow-x-auto rounded-xl border border-zinc-200 dark:border-zinc-800">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900/60 text-left text-[11px] uppercase tracking-wider text-zinc-500">
+                    <th className="px-4 py-3">Name</th>
+                    <th className="px-4 py-3">CL ID</th>
+                    <th className="px-4 py-3">Email</th>
+                    <th className="px-4 py-3">Phone</th>
+                    <th className="px-4 py-3">Events</th>
+                    <th className="px-4 py-3">Payment</th>
+                    <th className="px-4 py-3 text-right">Amount</th>
+                    <th className="px-4 py-3">Registered</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {adminParticipants.map((p) => (
+                    <tr key={p.userId} className="border-b border-zinc-100 hover:bg-zinc-50 dark:border-zinc-800/50 dark:hover:bg-zinc-900/40">
+                      <td className="px-4 py-2.5 font-medium text-zinc-800 dark:text-zinc-200">{p.name}</td>
+                      <td className="px-4 py-2.5 font-mono text-xs text-emerald-500">{p.clId}</td>
+                      <td className="px-4 py-2.5 text-zinc-500">{p.email}</td>
+                      <td className="px-4 py-2.5 text-zinc-500">{p.mobileNo ?? "—"}</td>
+                      <td className="px-4 py-2.5">
+                        <div className="flex flex-wrap gap-1">
+                          {p.eventTypes.map((et) => (
+                            <span key={et} className="rounded bg-zinc-200 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">{et}</span>
+                          ))}
+                        </div>
+                      </td>
+                      <td className="px-4 py-2.5">
+                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                          p.paymentStatus === "paid"
+                            ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400"
+                            : p.paymentStatus === "pending"
+                              ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+                              : "bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
+                        }`}>
+                          {p.paymentStatus.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())}
+                        </span>
+                      </td>
+                      <td className="px-4 py-2.5 text-right font-mono text-zinc-700 dark:text-zinc-300">
+                        {p.paymentAmount ? `₹${(p.paymentAmount / 100).toFixed(0)}` : "—"}
+                      </td>
+                      <td className="px-4 py-2.5 text-xs text-zinc-500">
+                        {new Date(p.registeredAt).toLocaleDateString()}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        )}
+      </section>
+
       {/* ── Bottom action bar ── */}
       <div className="sticky bottom-0 z-20 -mx-8 mt-6 border-t border-zinc-200 bg-white/90 px-8 py-3 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/90">
         <div className="mx-auto flex max-w-[1400px] items-center justify-end gap-3">
@@ -795,8 +1091,7 @@ export function AdminCompetition({ id }: { id: string }) {
                   startsAt: toISO(compStarts),
                   endsAt: toISO(compEnds),
                 });
-                if (bannerFile) await uploadCompetitionBanner(id, bannerFile);
-                if (mobileBannerFile) await uploadCompetitionMobileBanner(id, mobileBannerFile);
+                // Banners auto-upload on file selection — no need to re-upload here
               })
             }
             className="rounded-lg bg-emerald-700 px-5 py-2 text-sm font-semibold text-white transition hover:bg-emerald-600 disabled:opacity-50"
@@ -823,6 +1118,105 @@ export function AdminCompetition({ id }: { id: string }) {
           )}
         </div>
       </div>
+
+      {/* ── Add Event Modal ── */}
+      <Modal open={showAddEvent} onClose={() => setShowAddEvent(false)} title="Add Event" size="md">
+        <div className="space-y-3">
+          <div>
+            <label className="mb-1 block text-xs text-zinc-500">Event Type</label>
+            <div className="flex items-center gap-2">
+              <EventIcon eventId={newEventType} size={20} />
+              <select
+                value={newEventType}
+                onChange={(e) => setNewEventType(e.target.value)}
+                className="flex-1 rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+              >
+                {EVENT_IDS
+                  .filter((eid) => !detail.events.some((ev) => ev.eventType === eid && !ev.archived))
+                  .map((eid) => (
+                    <option key={eid} value={eid}>{eventDisplayName(eid)}</option>
+                  ))}
+              </select>
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-3">
+            <div>
+              <label className="mb-1 block text-xs text-zinc-500">Rounds</label>
+              <input
+                type="number"
+                min={1}
+                max={10}
+                value={newRoundCount}
+                onChange={(e) => setNewRoundCount(Number(e.target.value))}
+                className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-zinc-500">Cutoff (sec)</label>
+              <input
+                type="number"
+                min={0}
+                value={newCutoffMs}
+                onChange={(e) => setNewCutoffMs(e.target.value)}
+                placeholder="—"
+                className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-zinc-500">Time Limit (sec)</label>
+              <input
+                type="number"
+                min={0}
+                value={newTimeLimitMs}
+                onChange={(e) => setNewTimeLimitMs(e.target.value)}
+                placeholder="—"
+                className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+              />
+            </div>
+          </div>
+          {detail.type !== "free" && (
+            <div>
+              <label className="mb-1 block text-xs text-zinc-500">Event Fee (₹)</label>
+              <input
+                type="number"
+                min={0}
+                value={newEventFee}
+                onChange={(e) => setNewEventFee(e.target.value)}
+                placeholder="Use default per-event fee"
+                className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+              />
+            </div>
+          )}
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <Button variant="secondary" onClick={() => setShowAddEvent(false)}>Cancel</Button>
+          <Button
+            loading={busy === "addEvent"}
+            onClick={() => {
+              setShowAddEvent(false);
+              run("addEvent", async () => {
+                await updateCompetition(id, {
+                  events: [{
+                    eventType: newEventType,
+                    roundCount: newRoundCount,
+                    cutoffMs: newCutoffMs ? Number(newCutoffMs) * 1000 : undefined,
+                    timeLimitMs: newTimeLimitMs ? Number(newTimeLimitMs) * 1000 : undefined,
+                    fee: newEventFee ? Math.round(Number(newEventFee) * 100) : undefined,
+                  }],
+                });
+                // Reset form
+                setNewEventType("333");
+                setNewRoundCount(1);
+                setNewCutoffMs("");
+                setNewTimeLimitMs("");
+                setNewEventFee("");
+              });
+            }}
+          >
+            Add Event
+          </Button>
+        </div>
+      </Modal>
 
       {/* ── Bulk Email Modal ── */}
       {showEmailModal && (
@@ -1269,7 +1663,7 @@ function RoundRow({
   const [opensAt, setOpensAt] = useState(toLocal(round.opensAt));
   const [closesAt, setClosesAt] = useState(toLocal(round.closesAt));
   const [duration, setDuration] = useState<string>("");
-  const [criteriaMethod, setCriteriaMethod] = useState<"none" | "rank" | "time">(
+  const [criteriaMethod, setCriteriaMethod] = useState<"none" | "rank" | "time" | "best_single">(
     round.advancementCriteria?.method ?? "none",
   );
   const [criteriaLimit, setCriteriaLimit] = useState<string>(
@@ -1277,7 +1671,9 @@ function RoundRow({
       ? String(round.advancementCriteria.rankLimit ?? "")
       : round.advancementCriteria?.method === "time"
         ? String((round.advancementCriteria.timeLimitMs ?? 0) / 1000)
-        : "",
+        : round.advancementCriteria?.method === "best_single"
+          ? String((round.advancementCriteria.bestSingleMs ?? 0) / 1000)
+          : "",
   );
 
   // Keep local inputs in sync when parent refreshes
@@ -1300,6 +1696,8 @@ function RoundRow({
       return { method: "rank", rankLimit: Number(criteriaLimit) };
     if (criteriaMethod === "time" && Number(criteriaLimit) > 0)
       return { method: "time", timeLimitMs: Number(criteriaLimit) * 1000 };
+    if (criteriaMethod === "best_single" && Number(criteriaLimit) > 0)
+      return { method: "best_single", bestSingleMs: Number(criteriaLimit) * 1000 };
     return null;
   };
 
@@ -1450,18 +1848,19 @@ function RoundRow({
               <label className="mb-1 block text-xs text-zinc-500">Shortlist Method</label>
               <select
                 value={criteriaMethod}
-                onChange={(e) => { setCriteriaMethod(e.target.value as "none" | "rank" | "time"); setCriteriaLimit(""); }}
+                onChange={(e) => { setCriteriaMethod(e.target.value as "none" | "rank" | "time" | "best_single"); setCriteriaLimit(""); }}
                 className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
               >
                 <option value="none">None</option>
                 <option value="rank">Rank Based (Top N)</option>
                 <option value="time">Time Based (ao5 ≤ X)</option>
+                <option value="best_single">Best Single (≤ X)</option>
               </select>
             </div>
             {criteriaMethod !== "none" && (
               <div>
                 <label className="mb-1 block text-xs text-zinc-500">
-                  {criteriaMethod === "rank" ? "Top N" : "Time limit (seconds)"}
+                  {criteriaMethod === "rank" ? "Top N" : criteriaMethod === "best_single" ? "Best single ≤ (seconds)" : "ao5 ≤ (seconds)"}
                 </label>
                 <input
                   type="number"

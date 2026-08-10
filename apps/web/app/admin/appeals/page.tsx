@@ -5,6 +5,7 @@ import Link from "next/link";
 import { fetchAllAppeals, resolveAppeal, type AppealDto } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
 import { formatTime } from "@cubers/timer-core";
+import { eventDisplayName } from "@/lib/eventNames";
 
 const STATUS_COLOR: Record<string, string> = {
   pending: "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400",
@@ -105,7 +106,7 @@ export default function AdminAppealsPage() {
                     )}
                     {a.eventType && (
                       <span className="rounded bg-zinc-100 px-2 py-0.5 text-xs font-medium dark:bg-zinc-800">
-                        {a.eventType}
+                        {eventDisplayName(a.eventType)}
                       </span>
                     )}
                     {a.roundNumber != null && <span>Round {a.roundNumber}</span>}

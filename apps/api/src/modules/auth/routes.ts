@@ -169,7 +169,7 @@ export async function registerAuthRoutes(
       };
       await repo.users.create(user);
 
-      // Send OTP to the identifier used for signup
+      // Send OTP to the identifier used for signup (best-effort — user can resend)
       const otp = generateOtp();
       const otpType = usingEmail ? "otp_email" : "otp_mobile";
       const otpIdentifier = usingEmail ? email! : mobileNo!;
@@ -178,11 +178,16 @@ export async function registerAuthRoutes(
         token: otp, identifier: otpIdentifier,
         expiresAt: Date.now() + 10 * 60 * 1000,
       });
-      if (usingEmail) {
-        const oe = otpEmail(user.name, otp);
-        await emailService.send({ to: email!, subject: oe.subject, html: oe.html });
-      } else {
-        await smsService.sendOtp(mobileNo!, otp);
+      try {
+        if (usingEmail) {
+          const oe = otpEmail(user.name, otp);
+          await emailService.send({ to: email!, subject: oe.subject, html: oe.html });
+        } else {
+          await smsService.sendOtp(mobileNo!, otp);
+        }
+      } catch (err) {
+        req.log.error({ err, identifier }, "OTP delivery failed during registration");
+        // Don't block registration — user can resend via /send-otp
       }
 
       const secret = new TextEncoder().encode(env.DEV_AUTH_SECRET);
@@ -268,8 +273,13 @@ export async function registerAuthRoutes(
           token: otp, identifier: email,
           expiresAt: Date.now() + 10 * 60 * 1000,
         });
-        const oe = otpEmail(user.name, otp);
-        await emailService.send({ to: email, subject: oe.subject, html: oe.html });
+        try {
+          const oe = otpEmail(user.name, otp);
+          await emailService.send({ to: email, subject: oe.subject, html: oe.html });
+        } catch (err) {
+          req.log.error({ err, email }, "OTP email delivery failed");
+          return reply.code(502).send({ error: "otp_delivery_failed" });
+        }
       } else {
         const mobile = normalizeMobile(value.trim());
         if (!user.mobileNo || user.mobileNo !== mobile) {
@@ -287,7 +297,12 @@ export async function registerAuthRoutes(
           token: otp, identifier: mobile,
           expiresAt: Date.now() + 10 * 60 * 1000,
         });
-        await smsService.sendOtp(mobile, otp);
+        try {
+          await smsService.sendOtp(mobile, otp);
+        } catch (err) {
+          req.log.error({ err, mobile }, "OTP SMS delivery failed");
+          return reply.code(502).send({ error: "otp_delivery_failed" });
+        }
       }
 
       return { ok: true };
@@ -371,8 +386,13 @@ export async function registerAuthRoutes(
         token: otp, identifier: user.email,
         expiresAt: Date.now() + 10 * 60 * 1000,
       });
-      const oe = otpEmail(user.name, otp);
-      await emailService.send({ to: user.email, subject: oe.subject, html: oe.html });
+      try {
+        const oe = otpEmail(user.name, otp);
+        await emailService.send({ to: user.email, subject: oe.subject, html: oe.html });
+      } catch (err) {
+        req.log.error({ err, email: user.email }, "Resend verification email failed");
+        return reply.code(502).send({ error: "otp_delivery_failed" });
+      }
       return { ok: true };
     },
   );
@@ -396,8 +416,13 @@ export async function registerAuthRoutes(
         token: hashToken(resetToken), identifier: user.email,
         expiresAt: Date.now() + 60 * 60 * 1000,
       });
-      const re = passwordResetEmail(user.name, resetToken);
-      await emailService.send({ to: user.email, subject: re.subject, html: re.html });
+      try {
+        const re = passwordResetEmail(user.name, resetToken);
+        await emailService.send({ to: user.email, subject: re.subject, html: re.html });
+      } catch (err) {
+        req.log.error({ err, email: user.email }, "Password reset email failed");
+        // Don't reveal failure — same response regardless (prevents email enumeration)
+      }
       return { ok: true };
     },
   );

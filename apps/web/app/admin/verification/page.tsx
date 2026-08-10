@@ -20,6 +20,7 @@ import {
   type AvailableJudgeDto,
 } from "@/lib/api";
 import { StatusBadge } from "@/components/ui/Badge";
+import { eventDisplayName } from "@/lib/eventNames";
 import { ConfirmModal } from "@/components/ui/Modal";
 
 type EventRound = {
@@ -207,7 +208,7 @@ export default function AdminVerificationPage() {
           <select
             value={selectedCompId}
             onChange={(e) => setSelectedCompId(e.target.value)}
-            className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+            className="w-[220px] rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
           >
             <option value="">Select competition...</option>
             {competitions.map((c) => (
@@ -227,12 +228,12 @@ export default function AdminVerificationPage() {
                 setSelectedEventType(e.target.value);
                 setSelectedRoundId("");
               }}
-              className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+              className="w-[160px] rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
             >
               <option value="">Select event...</option>
               {events.map((ev) => (
                 <option key={ev.eventType} value={ev.eventType}>
-                  {ev.eventType}
+                  {eventDisplayName(ev.eventType)}
                 </option>
               ))}
             </select>
@@ -245,7 +246,7 @@ export default function AdminVerificationPage() {
             <select
               value={selectedRoundId}
               onChange={(e) => setSelectedRoundId(e.target.value)}
-              className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+              className="w-[180px] rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
             >
               <option value="">Select round...</option>
               {filteredRounds.map((r) => (

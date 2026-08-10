@@ -2,9 +2,10 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { fetchAdminPayments, downloadInvoice, confirmPayment, type AdminPaymentDto } from "@/lib/api";
+import { fetchAdminPayments, fetchCompetitions, downloadInvoice, confirmPayment, type AdminPaymentDto, type CompetitionSummary } from "@/lib/api";
 import { EmptyState } from "@/components/EmptyState";
 import { ConfirmModal } from "@/components/ui/Modal";
+import { DateRangeFilter, useDateRange } from "@/components/ui/DateRangeFilter";
 
 
 const STATUSES = ["pending", "paid", "failed", "refunded", "refund_pending"];
@@ -21,25 +22,101 @@ function fmt(paise: number) {
   return `₹${(paise / 100).toFixed(2)}`;
 }
 
+function statusLabel(s: string) {
+  return s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+const inputClass = "rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100";
+
 export default function AdminPaymentsPage() {
   const [payments, setPayments] = useState<AdminPaymentDto[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState("");
+  const dateRange = useDateRange();
+  const [compFilter, setCompFilter] = useState("");
+  const [competitions, setCompetitions] = useState<CompetitionSummary[]>([]);
+  const [allCompetitions, setAllCompetitions] = useState<CompetitionSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
 
   const load = useCallback(() => {
     setLoading(true);
-    fetchAdminPayments(statusFilter || undefined)
+    fetchAdminPayments({
+      status: statusFilter || undefined,
+      competitionId: compFilter || undefined,
+    })
       .then(setPayments)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
-  }, [statusFilter]);
+  }, [statusFilter, compFilter]);
 
   useEffect(() => { load(); }, [load]);
 
+  useEffect(() => {
+    fetchCompetitions().then((c) => { setAllCompetitions(c); setCompetitions(c); }).catch(() => {});
+  }, []);
+
+  // Filter competitions dropdown by date range
+  useEffect(() => {
+    const { from, to } = dateRange.getRange();
+    if (!from && !to) {
+      setCompetitions(allCompetitions);
+      return;
+    }
+    const fromMs = from ? new Date(from).getTime() : 0;
+    const toMs = to ? new Date(to).getTime() : Infinity;
+    setCompetitions(allCompetitions.filter((c) => {
+      const t = new Date(c.startsAt ?? c.createdAt ?? "").getTime();
+      return t >= fromMs && t <= toMs;
+    }));
+    setCompFilter((prev) => {
+      if (!prev) return prev;
+      const still = allCompetitions.find((c) => c.id === prev);
+      if (!still) return "";
+      const t = new Date(still.startsAt ?? still.createdAt ?? "").getTime();
+      return (t >= fromMs && t <= toMs) ? prev : "";
+    });
+  }, [dateRange.getRange, allCompetitions]);
+
   const total = payments.filter((p) => p.status === "paid").reduce((s, p) => s + p.amount, 0);
+
+  const handleExport = async () => {
+    setExporting(true);
+    try {
+      const allPayments = await fetchAdminPayments({
+        status: statusFilter || undefined,
+        competitionId: compFilter || undefined,
+      });
+      const header = "User,CL ID,Email,Competition,Amount,Status,Razorpay Order,Razorpay Payment,Date";
+      const rows = allPayments.map((p) =>
+        [
+          `"${p.userName}"`,
+          p.userClId,
+          p.userEmail,
+          `"${p.competitionTitle}"`,
+          (p.amount / 100).toFixed(2),
+          p.status,
+          p.razorpayOrderId ?? "",
+          p.razorpayPaymentId ?? "",
+          new Date(p.createdAt).toLocaleDateString(),
+        ].join(",")
+      );
+      const csv = [header, ...rows].join("\n");
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `payments-export-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExporting(false);
+    }
+  };
 
   const handleConfirm = async () => {
     if (!confirmingId) return;
@@ -57,28 +134,50 @@ export default function AdminPaymentsPage() {
 
   return (
     <div className="mx-auto max-w-[1400px] px-8 py-10">
-      {/* Sub-nav */}
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-xl font-bold text-zinc-900 dark:text-zinc-100">Payments</h1>
-        {!statusFilter && (
-          <span className="font-mono text-sm text-emerald-400">
-            Total collected: {fmt(total)}
-          </span>
-        )}
+        <span className="font-mono text-sm text-emerald-400">
+          Total collected: {fmt(total)}
+        </span>
       </div>
 
-      {/* Summary chips */}
-      <div className="mb-5 flex flex-wrap gap-2">
-        {["", ...STATUSES].map((s) => (
-          <button key={s} onClick={() => setStatusFilter(s)}
-            className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
-              statusFilter === s
-                ? "border-zinc-400 bg-zinc-800 text-white dark:border-zinc-500 dark:bg-zinc-700 dark:text-zinc-100"
-                : "border-zinc-300 text-zinc-500 hover:border-zinc-400 hover:text-zinc-700 dark:border-zinc-800 dark:hover:border-zinc-600 dark:hover:text-zinc-300"
-            }`}>
-            {s || "All"}
+      {/* Filters */}
+      <div className="mb-5 space-y-3">
+        {/* Status chips */}
+        <div className="flex flex-wrap gap-2">
+          {["", ...STATUSES].map((s) => (
+            <button key={s} onClick={() => setStatusFilter(s)}
+              className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                statusFilter === s
+                  ? "border-zinc-400 bg-zinc-800 text-white dark:border-zinc-500 dark:bg-zinc-700 dark:text-zinc-100"
+                  : "border-zinc-300 text-zinc-500 hover:border-zinc-400 hover:text-zinc-700 dark:border-zinc-800 dark:hover:border-zinc-600 dark:hover:text-zinc-300"
+              }`}>
+              {s ? statusLabel(s) : "All"}
+            </button>
+          ))}
+        </div>
+        {/* Date + competition + export */}
+        <div className="flex flex-wrap items-center gap-3">
+          <DateRangeFilter
+            preset={dateRange.preset}
+            setPreset={dateRange.setPreset}
+            customFrom={dateRange.customFrom}
+            setCustomFrom={dateRange.setCustomFrom}
+            customTo={dateRange.customTo}
+            setCustomTo={dateRange.setCustomTo}
+          />
+          <select value={compFilter} onChange={(e) => setCompFilter(e.target.value)} className={`${inputClass} w-[220px] flex-shrink-0 truncate`}>
+            <option value="">All competitions</option>
+            {competitions.map((c) => <option key={c.id} value={c.id}>{c.title}</option>)}
+          </select>
+          <button
+            onClick={handleExport}
+            disabled={exporting || payments.length === 0}
+            className="flex-shrink-0 rounded-lg border border-zinc-300 px-4 py-2 text-sm font-semibold text-zinc-700 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+          >
+            {exporting ? "Exporting…" : "↓ Export CSV"}
           </button>
-        ))}
+        </div>
       </div>
 
       {error && <div className="mb-4 rounded bg-red-100 px-4 py-2 text-red-700 dark:bg-red-900/30 dark:text-red-300">{error}</div>}
@@ -115,7 +214,7 @@ export default function AdminPaymentsPage() {
                   </td>
                   <td className="px-4 py-3">
                     <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${STATUS_COLOR[p.status] ?? "bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"}`}>
-                      {p.status}
+                      {statusLabel(p.status)}
                     </span>
                   </td>
                   <td className="px-4 py-3 font-mono text-xs text-zinc-500 max-w-[140px] truncate">

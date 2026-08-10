@@ -38,22 +38,24 @@ describe("TimerEngine — competition mode (inspection on)", () => {
   }
 
   it("no penalty when solve starts within 15s", () => {
-    const e = new TimerEngine(); // defaults: inspection on, 15s/17s
+    const e = new TimerEngine(); // defaults: inspection on, 15s/17s, holdToStartMs=550
     startInspection(e, 0);
     expect(e.snapshot(5_000).phase).toBe("inspection");
-    e.down(5_000); // arm
-    e.up(5_000); // start solving
-    e.down(12_000); // stop
-    expect(e.snapshot(12_000).result).toEqual({ time_ms: 7_000, inspectionPenalty: "none", penalty: "none" });
+    e.down(5_000); // begin arming
+    e.tick(5_600); // held >550ms → armed → ready
+    e.up(5_600); // start solving
+    e.down(12_600); // stop
+    expect(e.snapshot(12_600).result).toEqual({ time_ms: 7_000, inspectionPenalty: "none", penalty: "none" });
   });
 
   it("+2 when solve starts between 15s and 17s", () => {
     const e = new TimerEngine();
     startInspection(e, 0);
-    e.down(16_000); // arm at 16s
-    e.up(16_000); // start solving → +2
-    e.down(20_000); // stop
-    expect(e.snapshot(20_000).result).toEqual({ time_ms: 4_000, inspectionPenalty: "plus2", penalty: "none" });
+    e.down(15_500); // begin arming at 15.5s
+    e.tick(16_100); // held >550ms → armed → ready (16.1s > 15s boundary)
+    e.up(16_100); // start solving → +2 (inspection elapsed = 16.1s > 15s)
+    e.down(20_100); // stop
+    expect(e.snapshot(20_100).result).toEqual({ time_ms: 4_000, inspectionPenalty: "plus2", penalty: "none" });
   });
 
   it("auto-DNF if inspection passes 17s without starting the solve", () => {
@@ -74,9 +76,10 @@ describe("TimerEngine — competition mode (inspection on)", () => {
   it("reset returns to idle", () => {
     const e = new TimerEngine();
     startInspection(e, 0);
-    e.down(2_000);
-    e.up(2_000);
-    e.down(5_000);
+    e.down(2_000); // begin arming
+    e.tick(2_600); // armed → ready
+    e.up(2_600); // start solving
+    e.down(5_000); // stop
     expect(e.snapshot(5_000).phase).toBe("stopped");
     e.reset();
     expect(e.snapshot(6_000).phase).toBe("idle");

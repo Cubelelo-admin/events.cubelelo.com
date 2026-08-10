@@ -13,6 +13,8 @@ beforeAll(async () => {
   await seed(repo);
   app = await buildApp(repo);
   admin = await adminToken(app);
+  // Sync admin so auth plugin resolves the token
+  await app.inject({ method: "POST", url: "/api/v1/auth/sync", headers: bearer(admin) });
 });
 
 async function post(url: string, payload: object, token = admin) {
@@ -61,10 +63,15 @@ describe("admin competition lifecycle", () => {
   });
 
   it("generates + locks scrambles, then opens the round", async () => {
-    expect((await post(`/api/v1/admin/rounds/${round1}/scrambles`, { count: 5 })).status).toBe(201);
+    expect((await post(`/api/v1/admin/rounds/${round1}/regenerate-scrambles`, {})).status).toBe(200);
 
     const detail = await get(`/api/v1/competitions/${compId}`, admin);
+    const eventId = detail.body.events[0].id;
     expect(detail.body.events[0].rounds[0].scrambleLocked).toBe(true);
+
+    // Register admin for this competition's event so scramble fetch passes
+    await patch(`/api/v1/admin/competitions/${compId}`, { status: "registration_open" });
+    await post(`/api/v1/competitions/${compId}/register`, { eventIds: [eventId] });
 
     // not open yet → scramble blocked
     expect((await get(`/api/v1/rounds/${round1}/scramble`, admin)).status).toBe(409);

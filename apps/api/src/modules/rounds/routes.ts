@@ -17,6 +17,26 @@ export async function registerRoundRoutes(
   realtime: Realtime,
 ): Promise<void> {
   const adminOnly = { preHandler: requireRole(repo, "admin") };
+  const adminOrMod = { preHandler: requireRole(repo, "admin", "moderator") };
+
+  /** Ownership check: admin always passes; moderator must have created the competition. */
+  async function ownedCompByRound(
+    req: import("fastify").FastifyRequest,
+    reply: import("fastify").FastifyReply,
+    roundId: string,
+  ): Promise<boolean> {
+    const round = await repo.rounds.findById(roundId);
+    if (!round) { reply.code(404).send({ error: "round_not_found" }); return false; }
+    const ev = await repo.competitionEvents.findById(round.competitionEventId);
+    if (!ev) { reply.code(404).send({ error: "event_not_found" }); return false; }
+    const comp = await repo.competitions.findById(ev.competitionId);
+    if (!comp) { reply.code(404).send({ error: "competition_not_found" }); return false; }
+    const user = await repo.users.findById(req.authClaims!.sub);
+    if (!user) { reply.code(403).send({ error: "forbidden" }); return false; }
+    if (user.role === "admin" || user.role === "super_admin") return true;
+    if (user.role === "moderator" && comp.createdBy === user.id) return true;
+    reply.code(403).send({ error: "forbidden" }); return false;
+  }
 
   // Round detail.
   app.get<{ Params: { id: string } }>(
@@ -35,6 +55,7 @@ export async function registerRoundRoutes(
         advancementCount: round.advancementCount ?? null,
         advancementCriteria: round.advancementCriteria ?? null,
         eventType: event?.eventType,
+        videoRequired: round.videoRequired ?? false,
         scrambleLocked: Boolean(set?.lockedAt),
       };
     },
@@ -118,8 +139,9 @@ export async function registerRoundRoutes(
   // View scrambles (admin only).
   app.get<{ Params: { id: string } }>(
     "/api/v1/admin/rounds/:id/scrambles",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
+      if (!(await ownedCompByRound(req, reply, req.params.id))) return;
       const round = await repo.rounds.findById(req.params.id);
       if (!round) return reply.code(404).send({ error: "round_not_found" });
       const set = await repo.scrambleSets.findByRound(round.id);
@@ -134,8 +156,9 @@ export async function registerRoundRoutes(
   // Regenerate scrambles for a round (admin only, only before competition starts).
   app.post<{ Params: { id: string } }>(
     "/api/v1/admin/rounds/:id/regenerate-scrambles",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
+      if (!(await ownedCompByRound(req, reply, req.params.id))) return;
       const round = await repo.rounds.findById(req.params.id);
       if (!round) return reply.code(404).send({ error: "round_not_found" });
 
@@ -183,8 +206,9 @@ export async function registerRoundRoutes(
   // Cancel a round (admin only).
   app.post<{ Params: { id: string } }>(
     "/api/v1/admin/rounds/:id/cancel",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
+      if (!(await ownedCompByRound(req, reply, req.params.id))) return;
       const round = await repo.rounds.findById(req.params.id);
       if (!round) return reply.code(404).send({ error: "round_not_found" });
       const status = effectiveRoundStatus(round);
@@ -202,8 +226,9 @@ export async function registerRoundRoutes(
   // Reopen a closed or advanced round (admin only).
   app.post<{ Params: { id: string } }>(
     "/api/v1/admin/rounds/:id/reopen",
-    adminOnly,
+    adminOrMod,
     async (req, reply) => {
+      if (!(await ownedCompByRound(req, reply, req.params.id))) return;
       const round = await repo.rounds.findById(req.params.id);
       if (!round) return reply.code(404).send({ error: "round_not_found" });
       const status = effectiveRoundStatus(round);
@@ -240,12 +265,13 @@ export async function registerRoundRoutes(
     Params: { id: string };
     Body: {
       advancementCount?: number;
-      advancementCriteria?: { method: string; rankLimit?: number; timeLimitMs?: number } | null;
+      advancementCriteria?: { method: string; rankLimit?: number; timeLimitMs?: number; bestSingleMs?: number } | null;
       opensAt?: string | null;
       closesAt?: string | null;
       durationMinutes?: number;
     };
-  }>("/api/v1/admin/rounds/:id", adminOnly, async (req, reply) => {
+  }>("/api/v1/admin/rounds/:id", adminOrMod, async (req, reply) => {
+    if (!(await ownedCompByRound(req, reply, req.params.id))) return;
     const { advancementCount, advancementCriteria, opensAt, closesAt, durationMinutes } = req.body ?? {};
     const fields: Parameters<typeof repo.rounds.update>[1] = {};
     if (typeof advancementCount === "number") fields.advancementCount = advancementCount;
@@ -263,6 +289,10 @@ export async function registerRoundRoutes(
           if (!advancementCriteria.timeLimitMs || advancementCriteria.timeLimitMs < 1)
             return reply.code(400).send({ error: "time_limit_required" });
           fields.advancementCriteria = { method: "time", timeLimitMs: advancementCriteria.timeLimitMs };
+        } else if (method === "best_single") {
+          if (!advancementCriteria.bestSingleMs || advancementCriteria.bestSingleMs < 1)
+            return reply.code(400).send({ error: "best_single_limit_required" });
+          fields.advancementCriteria = { method: "best_single", bestSingleMs: advancementCriteria.bestSingleMs };
         } else {
           return reply.code(400).send({ error: "invalid_advancement_method" });
         }
@@ -312,6 +342,47 @@ export async function registerRoundRoutes(
       advancementCriteria: updated.advancementCriteria ?? null,
       opensAt: updated.opensAt, closesAt: updated.closesAt,
       durationMinutes: updated.durationMinutes,
+      videoRequired: updated.videoRequired ?? false,
     };
   });
+
+  // ── Round criteria summary (read-only panel data for §3 Verification Hub) ──
+  app.get<{ Params: { id: string } }>(
+    "/api/v1/rounds/:id/criteria",
+    async (req, reply) => {
+      const round = await repo.rounds.findById(req.params.id);
+      if (!round) return reply.code(404).send({ error: "round_not_found" });
+      const event = await repo.competitionEvents.findByRound(round.id);
+      const settings = await repo.systemSettings.get();
+
+      return {
+        roundId: round.id,
+        roundNumber: round.roundNumber,
+        eventType: event?.eventType ?? null,
+        videoRequired: round.videoRequired ?? false,
+        advancementCriteria: round.advancementCriteria ?? null,
+        advancementCount: round.advancementCount ?? null,
+        flagRuleDefaults: settings.flagRuleDefaults,
+        recordReference: event ? (settings.recordReferences[event.eventType] ?? null) : null,
+      };
+    },
+  );
+
+  // ── Admin: toggle videoRequired on a round ──
+  app.patch<{ Params: { id: string }; Body: { videoRequired: boolean } }>(
+    "/api/v1/rounds/:id/video-required",
+    adminOrMod,
+    async (req, reply) => {
+      const { videoRequired } = req.body ?? {};
+      if (typeof videoRequired !== "boolean") {
+        return reply.code(400).send({ error: "videoRequired must be a boolean" });
+      }
+      if (!(await ownedCompByRound(req, reply, req.params.id))) return;
+      const round = await repo.rounds.findById(req.params.id);
+      if (!round) return reply.code(404).send({ error: "round_not_found" });
+
+      const updated = await repo.rounds.update(req.params.id, { videoRequired });
+      return { id: updated!.id, videoRequired: updated!.videoRequired ?? false };
+    },
+  );
 }

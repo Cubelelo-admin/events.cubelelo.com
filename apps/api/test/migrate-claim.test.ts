@@ -51,6 +51,7 @@ async function createStub(clId: string, email: string) {
     rank: 1,
     videoUrl: null,
     flagStatus: "clean",
+    flagReasons: [],
     submittedAt: now,
   });
   const registrationId = randomUUID();

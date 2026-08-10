@@ -12,12 +12,12 @@ export async function registerPracticeRoutes(app: FastifyInstance, repo: Reposit
   app.get(`${prefix}/practice/sessions`, { preHandler: requireAuth }, async (req) => {
     const userId = req.authClaims!.sub;
     const sessions = await repo.practice.findSessionsByUser(userId);
-    const enriched = await Promise.all(
-      sessions.map(async (s) => {
-        const solves = await repo.practice.findSolvesBySession(s.id);
-        return { ...s, solveCount: solves.length };
-      }),
-    );
+    const allSolves = await repo.practice.findSolvesBySessionIds(sessions.map((s) => s.id));
+    const countBySession = new Map<string, number>();
+    for (const s of allSolves) {
+      countBySession.set(s.sessionId, (countBySession.get(s.sessionId) ?? 0) + 1);
+    }
+    const enriched = sessions.map((s) => ({ ...s, solveCount: countBySession.get(s.id) ?? 0 }));
     return { sessions: enriched };
   });
 
@@ -114,19 +114,22 @@ export async function registerPracticeRoutes(app: FastifyInstance, repo: Reposit
   app.get(`${prefix}/practice/stats`, { preHandler: requireAuth }, async (req) => {
     const userId = req.authClaims!.sub;
     const sessions = await repo.practice.findSessionsByUser(userId);
+    const allSolves = await repo.practice.findSolvesBySessionIds(sessions.map((s) => s.id));
+
+    // Build a sessionId → eventType lookup
+    const sessionEvent = new Map(sessions.map((s) => [s.id, s.eventType]));
+
     let totalSolves = 0;
     let totalTimeMs = 0;
     const eventBests: Record<string, number> = {};
-    for (const s of sessions) {
-      const solves = await repo.practice.findSolvesBySession(s.id);
-      for (const solve of solves) {
-        if (solve.penalty === "dnf") continue;
-        totalSolves++;
-        const effective = solve.penalty === "plus2" ? solve.timeMs + 2000 : solve.timeMs;
-        totalTimeMs += effective;
-        if (!eventBests[s.eventType] || effective < eventBests[s.eventType]!) {
-          eventBests[s.eventType] = effective;
-        }
+    for (const solve of allSolves) {
+      if (solve.penalty === "dnf") continue;
+      totalSolves++;
+      const effective = solve.penalty === "plus2" ? solve.timeMs + 2000 : solve.timeMs;
+      totalTimeMs += effective;
+      const eventType = sessionEvent.get(solve.sessionId) ?? "333";
+      if (!eventBests[eventType] || effective < eventBests[eventType]!) {
+        eventBests[eventType] = effective;
       }
     }
     return {

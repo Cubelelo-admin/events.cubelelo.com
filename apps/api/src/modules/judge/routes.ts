@@ -6,6 +6,7 @@ import type { AuditLogEntry } from "../../db/types";
 import { requireRole } from "../../auth/plugin";
 import { shortlistRound, reshortlistAdvancedRound } from "../../lib/roundLifecycle";
 import { applyResultOverride } from "../../lib/resultStats";
+import { computePriority } from "../../lib/flagEngine";
 import type { Realtime } from "../../sockets/realtime";
 
 const FLAG_ACTIONS: FlagStatus[] = ["verified", "plus2", "dnf", "disqualified"];
@@ -95,6 +96,8 @@ export async function registerJudgeRoutes(
           ao5Ms: r.ao5Ms,
           videoUrl: r.videoUrl,
           flagStatus: r.flagStatus,
+          flagReasons: r.flagReasons ?? [],
+          priority: computePriority(r.flagReasons ?? []),
           verifiedBy: r.verifiedBy,
           verifiedByName: verifier?.name ?? null,
           verifiedAt: r.verifiedAt,
@@ -141,12 +144,15 @@ export async function registerJudgeRoutes(
       verificationComment: req.body?.comment || undefined,
     });
 
+    // §10 — Audit log with old/new values
     const entry: AuditLogEntry = {
       id: randomUUID(),
       adminId: judgeId,
       action: `judge_result_${action}`,
       target: result.id,
       reason: req.body?.reason,
+      oldValue: JSON.stringify({ flagStatus: result.flagStatus, flagReasons: result.flagReasons }),
+      newValue: JSON.stringify({ flagStatus: action, comment: req.body?.comment || null }),
       createdAt: now,
     };
     await repo.auditLog.create(entry);
@@ -172,4 +178,35 @@ export async function registerJudgeRoutes(
 
     return { id: result.id, flagStatus: action };
   });
+
+  // Scrambles for an assigned round (judges need these for verification)
+  app.get<{ Params: { roundId: string } }>(
+    "/api/v1/judge/rounds/:roundId/scrambles",
+    judgeOrAbove,
+    async (req, reply) => {
+      const judgeId = req.authClaims!.sub;
+      const judge = await repo.users.findById(judgeId);
+
+      // Judges can only see scrambles for their assigned rounds
+      if (judge?.role === "judge") {
+        const assignments = await repo.judgeAssignments.findByJudge(judgeId);
+        const isAssigned = assignments.some((a) => a.roundId === req.params.roundId);
+        if (!isAssigned)
+          return reply.code(403).send({ error: "not_assigned_to_round" });
+      }
+
+      const round = await repo.rounds.findById(req.params.roundId);
+      if (!round) return reply.code(404).send({ error: "round_not_found" });
+
+      const set = await repo.scrambleSets.findByRound(round.id);
+      if (!set) return { roundId: round.id, scrambles: [], locked: false };
+      return {
+        roundId: round.id,
+        scrambles: set.scrambles,
+        locked: Boolean(set.lockedAt),
+        generatedAt: set.generatedAt,
+        lockedAt: set.lockedAt,
+      };
+    },
+  );
 }

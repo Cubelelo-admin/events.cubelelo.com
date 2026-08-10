@@ -9,9 +9,11 @@ import { requireAuth } from "../../auth/plugin";
 import { effectiveRoundStatus } from "../../lib/statusUtils";
 import { getScrambleFetchTime } from "../../lib/scrambleTiming";
 import { submitLimiter } from "../../lib/rateLimiter";
-import { recomputeRanks } from "../../lib/resultStats";
+import { recomputeRanks, recomputePersonalBest } from "../../lib/resultStats";
 import { ANTICHEAT_THRESHOLDS, DEFAULT_ANTICHEAT_THRESHOLD } from "../../lib/eventConfig";
+import { computeFlags } from "../../lib/flagEngine";
 import { withAdvisoryLock } from "../../db/pool";
+import { env } from "../../config/env";
 import { setLeaderboardCache, getLeaderboardCache, type CachedLeaderboardEntry } from "../../lib/leaderboardCache";
 
 const PENALTIES: SolvePenalty[] = ["none", "plus2", "dnf"];
@@ -132,13 +134,41 @@ export async function registerResultRoutes(
       const stats = computeStats(solves);
       const computedAo5 = ao5(solves);
 
-      // Anti-cheat: flag suspiciously fast results per event type
+      // §6 — Auto-flag engine: evaluate all configurable rules
+      const eventType = event?.eventType ?? "333";
       let flagStatus: FlagStatus = "clean";
+
+      // Legacy absolute-minimum anticheat (always runs, independent of admin config)
       if (computedAo5 !== null && computedAo5 !== Infinity) {
-        const eventType = event?.eventType ?? "333";
         const threshold = ANTICHEAT_THRESHOLDS[eventType] ?? DEFAULT_ANTICHEAT_THRESHOLD;
         if (computedAo5 < threshold) flagStatus = "flagged";
       }
+
+      // Run the configurable flag engine
+      const [settings, personalBest, roundResults] = await Promise.all([
+        repo.systemSettings.get(),
+        repo.personalBests.findByUser(user.id).then((pbs) =>
+          pbs.find((pb) => pb.eventType === eventType) ?? null,
+        ),
+        repo.results.findByRound(round.id),
+      ]);
+
+      const flagReasons = computeFlags({
+        bestSingleMs: stats.best_single_ms,
+        ao5Ms: computedAo5,
+        videoUrl,
+        videoRequired: round.videoRequired ?? false,
+        advancementCriteria: round.advancementCriteria,
+        advancementCount: round.advancementCount,
+        eventType,
+        rules: settings.flagRuleDefaults,
+        record: settings.recordReferences[eventType] ?? null,
+        personalBest,
+        roundResultCount: roundResults.length,
+      });
+
+      // If any rules fired, mark as flagged
+      if (flagReasons.length > 0) flagStatus = "flagged";
 
       const result: Result = {
         id: randomUUID(),
@@ -153,30 +183,39 @@ export async function registerResultRoutes(
         rank: null,
         videoUrl,
         flagStatus,
+        flagReasons,
         submittedAt: new Date().toISOString(),
       };
-      const inserted = await withAdvisoryLock(`round:${round.id}`, async (client) => {
-        const { rows: dupeCheck } = await client.query(
-          "SELECT 1 FROM results WHERE round_id = $1 AND user_id = $2 LIMIT 1",
-          [round.id, user.id],
-        );
-        if (dupeCheck.length > 0) return false;
+      // Use advisory lock in PG mode for race-safe duplicate check;
+      // fall back to repo-only path for mem-repo (tests / CI).
+      if (env.DATABASE_URL) {
+        const inserted = await withAdvisoryLock(`round:${round.id}`, async (client) => {
+          const { rows: dupeCheck } = await client.query(
+            "SELECT 1 FROM results WHERE round_id = $1 AND user_id = $2 LIMIT 1",
+            [round.id, user.id],
+          );
+          if (dupeCheck.length > 0) return false;
 
-        await client.query(
-          `INSERT INTO results
-             (id, round_id, user_id, solves_json, best_single_ms, ao5_ms, mean_ms,
-              median_ms, std_ms, rank, video_url, flag_status, verified_by, verified_at,
-              submitted_at)
-           VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-          [result.id, result.roundId, result.userId, JSON.stringify(result.solves),
-           result.bestSingleMs, result.ao5Ms, result.meanMs, result.medianMs, result.stdMs,
-           result.rank, result.videoUrl, result.flagStatus, null, null, result.submittedAt],
-        );
-        return true;
-      });
+          await client.query(
+            `INSERT INTO results
+               (id, round_id, user_id, solves_json, best_single_ms, ao5_ms, mean_ms,
+                median_ms, std_ms, rank, video_url, flag_status, flag_reasons, verified_by, verified_at,
+                submitted_at)
+             VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16)`,
+            [result.id, result.roundId, result.userId, JSON.stringify(result.solves),
+             result.bestSingleMs, result.ao5Ms, result.meanMs, result.medianMs, result.stdMs,
+             result.rank, result.videoUrl, result.flagStatus, JSON.stringify(result.flagReasons ?? []),
+             null, null, result.submittedAt],
+          );
+          return true;
+        });
 
-      if (!inserted) {
-        return reply.code(409).send({ error: "already_submitted" });
+        if (!inserted) {
+          return reply.code(409).send({ error: "already_submitted" });
+        }
+      } else {
+        // mem-repo path: dupe already checked above (existingResults), just create
+        await repo.results.create(result);
       }
 
       const board = await recomputeRanks(repo, round.id);
@@ -196,6 +235,11 @@ export async function registerResultRoutes(
       });
       await setLeaderboardCache(round.id, enriched);
       realtime.emitLeaderboard(round.id, enriched);
+
+      // Compute personal bests after result submission
+      if (event) {
+        await recomputePersonalBest(repo, user.id, event.eventType);
+      }
 
       return reply.code(201).send(result);
     },

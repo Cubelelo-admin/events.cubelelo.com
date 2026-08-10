@@ -39,7 +39,9 @@ export async function registerCompetitionRoutes(
     "/api/v1/competitions",
     async (req) => {
       const caller = await resolveUser(repo, req);
-      const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || caller?.role === "moderator";
+      const isFullAdmin = caller?.role === "admin" || caller?.role === "super_admin";
+      const isMod = caller?.role === "moderator";
+      const isAdmin = isFullAdmin || isMod;
 
       let comps = await repo.competitions.findAll();
 
@@ -47,6 +49,18 @@ export async function registerCompetitionRoutes(
         comps = comps.filter((c) => {
           const s = effectiveCompStatus(c);
           return s !== "draft" && s !== "cancelled" && s !== "published";
+        });
+      }
+
+      // Moderators only see their own competitions for admin-level views (draft filter)
+      if (isMod && caller) {
+        comps = comps.filter((c) => {
+          const s = effectiveCompStatus(c);
+          // Show published/live/completed competitions to everyone, but drafts only if owned
+          if (s === "draft" || s === "cancelled" || s === "published") {
+            return c.createdBy === caller.id;
+          }
+          return true;
         });
       }
 
@@ -89,6 +103,7 @@ export async function registerCompetitionRoutes(
         featured: c.featured,
         featuredOrder: c.featuredOrder,
         createdAt: c.createdAt,
+        createdBy: c.createdBy ?? null,
         eventTypes: (eventsMap.get(c.id) ?? []).filter((e) => !e.archived).map((e) => e.eventType),
         registrationCount: regCountMap.get(c.id) ?? 0,
         registrationLimit: c.registrationLimit ?? null,

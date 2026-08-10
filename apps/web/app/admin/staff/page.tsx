@@ -15,6 +15,50 @@ import { EmptyState } from "@/components/EmptyState";
 
 const STAFF_ROLES = ["judge", "moderator"] as const;
 
+const ROLE_INFO = [
+  {
+    role: "Admin",
+    color: "border-red-200 dark:border-red-900/40",
+    badge: "text-red-700 bg-red-100 dark:text-red-400 dark:bg-red-900/30",
+    icon: "🛡️",
+    summary: "Full platform access",
+    permissions: [
+      "Create and manage all competitions",
+      "Manage users, payments, and promo codes",
+      "System settings, rank tiers, and content pages",
+      "Staff creation and role assignment",
+      "Verification and appeals for all competitions",
+    ],
+  },
+  {
+    role: "Moderator",
+    color: "border-purple-200 dark:border-purple-900/40",
+    badge: "text-purple-700 bg-purple-100 dark:text-purple-400 dark:bg-purple-900/30",
+    icon: "⚙️",
+    summary: "Scoped to their own competitions",
+    permissions: [
+      "Create new competitions",
+      "Manage events, rounds, scrambles, and results — only for competitions they created",
+      "Verification, appeals, and judge assignment for their competitions",
+      "Email participants and export data for their competitions",
+      "Cannot access payments, users, promo codes, or system settings",
+    ],
+  },
+  {
+    role: "Judge",
+    color: "border-blue-200 dark:border-blue-900/40",
+    badge: "text-blue-700 bg-blue-100 dark:text-blue-400 dark:bg-blue-900/30",
+    icon: "⚖️",
+    summary: "Result verification only",
+    permissions: [
+      "Verify, penalize, or DQ results assigned to them",
+      "View result details, video evidence, and audit history",
+      "Cannot create or manage competitions",
+      "Cannot access admin panel or any management features",
+    ],
+  },
+];
+
 export default function AdminStaffPage() {
   const toast = useToast();
   const [staff, setStaff] = useState<AdminUserDto[]>([]);
@@ -27,6 +71,8 @@ export default function AdminStaffPage() {
   const [pendingRoleChange, setPendingRoleChange] = useState<{ user: AdminUserDto; newRole: string } | null>(null);
   const [demoteTarget, setDemoteTarget] = useState<AdminUserDto | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
+  const [editTarget, setEditTarget] = useState<AdminUserDto | null>(null);
+  const [editForm, setEditForm] = useState({ name: "", email: "", mobileNo: "" });
 
   const load = useCallback(() => {
     Promise.all([
@@ -83,6 +129,31 @@ export default function AdminStaffPage() {
     }
   };
 
+  const openEdit = (user: AdminUserDto) => {
+    setEditTarget(user);
+    setEditForm({ name: user.name, email: user.email, mobileNo: user.mobileNo ?? "" });
+  };
+
+  const saveEdit = async () => {
+    if (!editTarget) return;
+    setConfirmBusy(true);
+    try {
+      const body: { name?: string; email?: string; mobileNo?: string } = {};
+      if (editForm.name.trim() && editForm.name.trim() !== editTarget.name) body.name = editForm.name.trim();
+      if (editForm.email.trim() && editForm.email.trim() !== editTarget.email) body.email = editForm.email.trim();
+      if (editForm.mobileNo.trim() !== (editTarget.mobileNo ?? "")) body.mobileNo = editForm.mobileNo.trim();
+      if (Object.keys(body).length === 0) { setEditTarget(null); setConfirmBusy(false); return; }
+      await updateAdminUser(editTarget.id, body);
+      toast.show(`Updated ${editForm.name || editTarget.name}`, "success");
+      setEditTarget(null);
+      load();
+    } catch (e) {
+      toast.show(e instanceof Error ? e.message : String(e), "error");
+    } finally {
+      setConfirmBusy(false);
+    }
+  };
+
   const confirmDemote = async () => {
     if (!demoteTarget) return;
     setConfirmBusy(true);
@@ -107,78 +178,127 @@ export default function AdminStaffPage() {
     }
   };
 
+  const staffCounts = {
+    admin: staff.filter((u) => u.role === "admin").length,
+    moderator: staff.filter((u) => u.role === "moderator").length,
+    judge: staff.filter((u) => u.role === "judge").length,
+  };
+
   return (
     <div className="mx-auto max-w-[1400px] px-8 py-10">
-      <div className="mb-5 flex items-center justify-between">
-        <div>
-          <h1 className="text-xl font-bold text-zinc-900 dark:text-zinc-100">Staff Management</h1>
-          <p className="mt-1 text-sm text-zinc-500">
-            Create and manage judge and moderator accounts. Judges can verify results; moderators can manage competitions.
-          </p>
+      <div className="mb-6">
+        <h1 className="text-xl font-bold text-zinc-900 dark:text-zinc-100">Staff Management</h1>
+        <p className="mt-1 text-sm text-zinc-500">
+          Create and manage staff accounts. Each role has different levels of access to the platform.
+        </p>
+      </div>
+
+      {/* ── Roles overview ── */}
+      <div className="mb-8 rounded-xl border border-zinc-200 bg-zinc-50/50 dark:border-zinc-800 dark:bg-zinc-900/30 p-5">
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Roles & Permissions</h2>
+          <div className="flex items-center gap-3 text-xs text-zinc-500">
+            <span>{staffCounts.admin} admin{staffCounts.admin !== 1 ? "s" : ""}</span>
+            <span className="text-zinc-300 dark:text-zinc-700">·</span>
+            <span>{staffCounts.moderator} moderator{staffCounts.moderator !== 1 ? "s" : ""}</span>
+            <span className="text-zinc-300 dark:text-zinc-700">·</span>
+            <span>{staffCounts.judge} judge{staffCounts.judge !== 1 ? "s" : ""}</span>
+          </div>
         </div>
-        {!creating && (
-          <button onClick={() => { setCreating(true); setError(null); setSuccess(null); }}
-            className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500">
-            + Create Staff
-          </button>
-        )}
+
+        <div className="grid gap-4 md:grid-cols-3">
+          {ROLE_INFO.map((info) => (
+            <div key={info.role} className={`rounded-lg border ${info.color} bg-white p-4 dark:bg-zinc-900/60`}>
+              <div className="mb-2 flex items-center gap-2">
+                <span className="text-lg">{info.icon}</span>
+                <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${info.badge}`}>
+                  {info.role}
+                </span>
+              </div>
+              <p className="mb-3 text-xs font-medium text-zinc-600 dark:text-zinc-400">{info.summary}</p>
+              <ul className="space-y-1.5">
+                {info.permissions.map((perm, i) => (
+                  <li key={i} className="flex items-start gap-1.5 text-[11px] leading-snug text-zinc-500 dark:text-zinc-500">
+                    <span className={`mt-0.5 shrink-0 ${perm.startsWith("Cannot") ? "text-red-400" : "text-emerald-500"}`}>
+                      {perm.startsWith("Cannot") ? "✕" : "✓"}
+                    </span>
+                    {perm}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+
+        {/* Create staff — inside roles section */}
+        <div className="mt-5 border-t border-zinc-200 pt-4 dark:border-zinc-800">
+          {!creating ? (
+            <button
+              onClick={() => { setCreating(true); setError(null); setSuccess(null); }}
+              className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500"
+            >
+              + Create Staff Account
+            </button>
+          ) : (
+            <div>
+              <h3 className="mb-3 text-sm font-semibold text-zinc-700 dark:text-zinc-300">Create Staff Account</h3>
+              <p className="mb-4 text-xs text-zinc-500">
+                If the email matches an existing user, their role will be updated. Otherwise a new account is created.
+              </p>
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="mb-1 block text-xs text-zinc-500">Email</label>
+                    <input value={form.email}
+                      onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
+                      placeholder="judge@cubelelo.com"
+                      className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-600" />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs text-zinc-500">Name</label>
+                    <input value={form.name}
+                      onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+                      placeholder="Full name"
+                      className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-600" />
+                  </div>
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-zinc-500">Role</label>
+                  <div className="flex gap-4">
+                    {STAFF_ROLES.map((r) => (
+                      <label key={r} className="flex items-center gap-2 text-sm text-zinc-400 cursor-pointer">
+                        <input type="radio" name="role" value={r} checked={form.role === r}
+                          onChange={() => setForm((f) => ({ ...f, role: r }))}
+                          className="accent-emerald-500" />
+                        <span className="capitalize">{r}</span>
+                        <span className="text-[10px] text-zinc-600">
+                          {r === "judge" ? "(verify results)" : "(manage own competitions)"}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <div className="flex gap-3 pt-1">
+                  <button onClick={handleCreate} disabled={busy === "create"}
+                    className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-50">
+                    {busy === "create" ? "Creating..." : "Create"}
+                  </button>
+                  <button onClick={() => { setCreating(false); setError(null); }}
+                    className="rounded-lg border border-zinc-300 px-4 py-2 text-sm text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
       {error && <div className="mb-4 rounded bg-red-100 px-4 py-2 text-red-700 dark:bg-red-900/30 dark:text-red-300">{error}</div>}
       {success && <div className="mb-4 rounded bg-emerald-100 px-4 py-2 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300">{success}</div>}
 
-      {creating && (
-        <div className="mb-6 rounded-xl border border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900/50 p-5">
-          <h2 className="mb-4 text-sm font-semibold text-zinc-700 dark:text-zinc-300">Create Staff Account</h2>
-          <p className="mb-4 text-xs text-zinc-500">
-            If the email matches an existing user, their role will be updated. Otherwise a new account is created.
-          </p>
-          <div className="space-y-3">
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="mb-1 block text-xs text-zinc-500">Email</label>
-                <input value={form.email}
-                  onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
-                  placeholder="judge@cubelelo.com"
-                  className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-600" />
-              </div>
-              <div>
-                <label className="mb-1 block text-xs text-zinc-500">Name</label>
-                <input value={form.name}
-                  onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-                  placeholder="Full name"
-                  className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-600" />
-              </div>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs text-zinc-500">Role</label>
-              <div className="flex gap-3">
-                {STAFF_ROLES.map((r) => (
-                  <label key={r} className="flex items-center gap-2 text-sm text-zinc-400 cursor-pointer">
-                    <input type="radio" name="role" value={r} checked={form.role === r}
-                      onChange={() => setForm((f) => ({ ...f, role: r }))}
-                      className="accent-emerald-500" />
-                    <span className="capitalize">{r}</span>
-                    <span className="text-[10px] text-zinc-600">
-                      {r === "judge" ? "(verify results only)" : "(manage competitions + verify)"}
-                    </span>
-                  </label>
-                ))}
-              </div>
-            </div>
-            <div className="flex gap-3 pt-1">
-              <button onClick={handleCreate} disabled={busy === "create"}
-                className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-50">
-                {busy === "create" ? "Creating..." : "Create"}
-              </button>
-              <button onClick={() => { setCreating(false); setError(null); }}
-                className="rounded-lg border border-zinc-300 px-4 py-2 text-sm text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800">
-                Cancel
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* ── Staff table ── */}
+      <h2 className="mb-3 text-sm font-semibold text-zinc-700 dark:text-zinc-300">Current Staff</h2>
 
       {loading ? (
         <p className="text-zinc-500">Loading...</p>
@@ -192,6 +312,7 @@ export default function AdminStaffPage() {
                 <th className="px-4 py-3">Name</th>
                 <th className="px-4 py-3">CL ID</th>
                 <th className="px-4 py-3">Email</th>
+                <th className="px-4 py-3">Phone</th>
                 <th className="px-4 py-3">Role</th>
                 <th className="px-4 py-3">Actions</th>
               </tr>
@@ -202,6 +323,7 @@ export default function AdminStaffPage() {
                   <td className="px-4 py-2.5 text-zinc-800 dark:text-zinc-200">{u.name}</td>
                   <td className="px-4 py-2.5 font-mono text-xs text-zinc-400">{u.clId}</td>
                   <td className="px-4 py-2.5 text-zinc-500">{u.email}</td>
+                  <td className="px-4 py-2.5 text-zinc-500">{u.mobileNo ?? "—"}</td>
                   <td className="px-4 py-2.5">
                     <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${roleColor(u.role)}`}>
                       {u.role}
@@ -214,11 +336,15 @@ export default function AdminStaffPage() {
                           value={u.role}
                           onChange={(e) => requestRoleChange(u, e.target.value)}
                           disabled={busy === u.id}
-                          className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-700 focus:outline-none disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+                          className="w-[110px] rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-700 focus:outline-none disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
                         >
                           <option value="judge">Judge</option>
                           <option value="moderator">Moderator</option>
                         </select>
+                        <button onClick={() => openEdit(u)}
+                          className="rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800">
+                          Edit
+                        </button>
                         <button onClick={() => setDemoteTarget(u)} disabled={busy === `demote-${u.id}`}
                           className="rounded border border-red-900/40 px-2 py-1 text-xs text-red-500 hover:bg-red-950/30 disabled:opacity-40">
                           Remove
@@ -268,6 +394,46 @@ export default function AdminStaffPage() {
         }
         confirmLabel="Remove"
       />
+
+      {/* Edit staff profile modal */}
+      {editTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setEditTarget(null)}>
+          <div className="w-full max-w-md rounded-xl border border-zinc-200 bg-white p-6 shadow-xl dark:border-zinc-700 dark:bg-zinc-900" onClick={(e) => e.stopPropagation()}>
+            <h2 className="mb-4 text-lg font-bold text-zinc-900 dark:text-zinc-100">Edit Staff — {editTarget.name}</h2>
+            <div className="space-y-3">
+              <div>
+                <label className="mb-1 block text-xs text-zinc-500">Name</label>
+                <input value={editForm.name}
+                  onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))}
+                  className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100" />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-zinc-500">Email</label>
+                <input value={editForm.email} type="email"
+                  onChange={(e) => setEditForm((f) => ({ ...f, email: e.target.value }))}
+                  className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100" />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-zinc-500">Phone</label>
+                <input value={editForm.mobileNo} type="tel"
+                  onChange={(e) => setEditForm((f) => ({ ...f, mobileNo: e.target.value }))}
+                  placeholder="e.g. +91 9876543210"
+                  className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 dark:placeholder:text-zinc-600" />
+              </div>
+            </div>
+            <div className="mt-5 flex justify-end gap-3">
+              <button onClick={() => setEditTarget(null)}
+                className="rounded-lg border border-zinc-300 px-4 py-2 text-sm text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800">
+                Cancel
+              </button>
+              <button onClick={saveEdit} disabled={confirmBusy}
+                className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-50">
+                {confirmBusy ? "Saving..." : "Save"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

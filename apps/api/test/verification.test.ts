@@ -4,18 +4,38 @@ import { buildApp } from "../src/app";
 import { createMemRepo } from "../src/db/mem-repo";
 import type { Repository } from "../src/db/repo";
 import { seed, SEED_DEMO_COMP_ID } from "../src/db/seed";
-import { adminToken, bearer, devToken } from "./helpers";
+import { adminToken, bearer, devToken, syncVerifiedUser } from "./helpers";
 
 let app: FastifyInstance;
 let repo: Repository;
 let admin: string;
+let eventId: string;
 
 beforeAll(async () => {
   repo = createMemRepo();
   await seed(repo);
   app = await buildApp(repo);
   admin = await adminToken(app);
+  // Sync admin so auth plugin resolves the token
+  await app.inject({ method: "POST", url: "/api/v1/auth/sync", headers: bearer(admin) });
+
+  // Resolve event ID
+  const detail = await app.inject({ method: "GET", url: `/api/v1/competitions/${SEED_DEMO_COMP_ID}` });
+  eventId = detail.json().events[0].id;
 });
+
+/** Sync a user, verify them, and register for the seeded event. */
+async function registerUser(email: string, name: string): Promise<{ token: string; id: string }> {
+  const token = await devToken(app, email, name);
+  const { id } = await syncVerifiedUser(app, repo, token);
+  await app.inject({
+    method: "POST",
+    url: `/api/v1/competitions/${SEED_DEMO_COMP_ID}/register`,
+    payload: { eventIds: [eventId] },
+    headers: bearer(token),
+  });
+  return { token, id };
+}
 
 describe("admin verification queue", () => {
   let resultId: string;
@@ -31,8 +51,7 @@ describe("admin verification queue", () => {
   });
 
   it("flags a suspiciously fast result and shows it in queue", async () => {
-    const userTok = await devToken(app, "fast@test.com", "Fast Cuber");
-    await app.inject({ method: "POST", url: "/api/v1/auth/sync", headers: bearer(userTok) });
+    const { token: userTok } = await registerUser("fast@test.com", "Fast Cuber");
 
     const detail = await app.inject({
       method: "GET",
@@ -111,9 +130,8 @@ describe("judge override recalculates stats and personal bests (HIGH-009)", () =
   }
 
   it("sets stats and PB on submission", async () => {
-    const tok = await devToken(app, "override@test.com", "Override Target");
-    const sync = await app.inject({ method: "POST", url: "/api/v1/auth/sync", headers: bearer(tok) });
-    userId = sync.json().id;
+    const { token: tok, id } = await registerUser("override@test.com", "Override Target");
+    userId = id;
 
     const detail = await app.inject({
       method: "GET",

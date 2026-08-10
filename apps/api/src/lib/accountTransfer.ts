@@ -1,6 +1,5 @@
 import type { Repository } from "../db/repo";
 import { recomputePersonalBest } from "./resultStats";
-import { withTransaction } from "../db/pool";
 
 export interface TransferSummary {
   movedResults: number;
@@ -45,39 +44,32 @@ export async function transferUserData(
   ]);
   const takenComps = new Set(toRegs.map((r) => r.competitionId));
 
-  await withTransaction(async (client) => {
-    for (const result of fromResults) {
-      if (takenRounds.has(result.roundId)) {
-        summary.skippedResults++;
-        continue;
-      }
-      await client.query("UPDATE results SET user_id = $1 WHERE id = $2", [toUserId, result.id]);
-      summary.movedResults++;
-      const { rows } = await client.query(
-        "SELECT event_type FROM competition_events WHERE id = (SELECT competition_event_id FROM rounds WHERE id = $1)",
-        [result.roundId],
-      );
-      if (rows[0]) affectedEvents.add(rows[0].event_type);
+  for (const result of fromResults) {
+    if (takenRounds.has(result.roundId)) {
+      summary.skippedResults++;
+      continue;
     }
+    await repo.results.update(result.id, { userId: toUserId });
+    summary.movedResults++;
+    const event = await repo.competitionEvents.findByRound(result.roundId);
+    if (event) affectedEvents.add(event.eventType);
+  }
 
-    for (const reg of fromRegs) {
-      if (takenComps.has(reg.competitionId)) {
-        summary.skippedRegistrations++;
-        continue;
-      }
-      await client.query("UPDATE registrations SET user_id = $1 WHERE id = $2", [toUserId, reg.id]);
-      summary.movedRegistrations++;
+  for (const reg of fromRegs) {
+    if (takenComps.has(reg.competitionId)) {
+      summary.skippedRegistrations++;
+      continue;
     }
+    await repo.registrations.update(reg.id, { userId: toUserId });
+    summary.movedRegistrations++;
+  }
 
-    const { rows: fromPayments } = await client.query(
-      "SELECT id FROM payments WHERE user_id = $1",
-      [fromUserId],
-    );
-    for (const p of fromPayments) {
-      await client.query("UPDATE payments SET user_id = $1 WHERE id = $2", [toUserId, p.id]);
-      summary.movedPayments++;
-    }
-  });
+  const allPayments = await repo.payments.findAll();
+  const fromPayments = allPayments.filter((p) => p.userId === fromUserId);
+  for (const p of fromPayments) {
+    await repo.payments.update(p.id, { userId: toUserId });
+    summary.movedPayments++;
+  }
 
   // Recompute PBs for all events the receiver now has results in,
   // not just transferred ones — skipped results may share events

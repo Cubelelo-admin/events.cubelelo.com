@@ -45,6 +45,12 @@ const FRIENDLY_ERRORS: Record<string, string> = {
   invalid_credentials: "Incorrect email or password.",
   account_locked: "Your account has been locked. Please contact support.",
   user_not_found: "Account not found.",
+  otp_delivery_failed: "Failed to send verification code. Please try again.",
+  // Payments
+  payment_gateway_unavailable: "Payment gateway is temporarily unavailable. Please try again in a moment.",
+  // General
+  internal_error: "Something went wrong. Please try again.",
+  invalid_request: "Invalid request. Please check your input and try again.",
 };
 
 export function friendlyError(raw: string): string {
@@ -96,9 +102,10 @@ export interface AuthUser {
 }
 
 export interface AdvancementCriteria {
-  method: "rank" | "time";
+  method: "rank" | "time" | "best_single";
   rankLimit?: number;
   timeLimitMs?: number;
+  bestSingleMs?: number;
 }
 
 export interface RoundRef {
@@ -131,6 +138,7 @@ export interface CompetitionSummary {
   mobileBannerUrl?: string;
   featured?: boolean;
   createdAt?: string;
+  createdBy?: string | null;
   eventTypes?: string[];
   registrationCount?: number;
   registrationLimit?: number | null;
@@ -297,7 +305,8 @@ async function sendJson<T>(
     handleUnauthorized(res.status);
     let detail = "";
     try {
-      detail = JSON.stringify(await res.json());
+      const body = await res.json();
+      if (body?.error) detail = body.error;
     } catch {
       /* ignore */
     }
@@ -665,6 +674,17 @@ export function updateCompetition(
     mobileBannerUrl?: string;
     registrationLimit?: number | null;
     cancellationReason?: string;
+    events?: Array<{
+      eventType: string;
+      roundCount?: number;
+      cutoffMs?: number;
+      timeLimitMs?: number;
+      fee?: number;
+      durationMinutes?: number;
+      advancementCriteria?: AdvancementCriteria;
+      roundCriteria?: (AdvancementCriteria | undefined)[];
+      roundSchedule?: ({ startTime?: string; durationMinutes?: number } | undefined)[];
+    }>;
   },
 ): Promise<{ id: string; title: string; status: string }> {
   return sendJson("PATCH", `/api/v1/admin/competitions/${id}`, body);
@@ -682,6 +702,27 @@ export function createPracticeEvent(
   body: { startsAt?: string; endsAt?: string },
 ): Promise<{ id: string; title: string; participantsCopied: number }> {
   return sendJson("POST", `/api/v1/admin/competitions/${id}/practice`, body);
+}
+
+export interface AdminParticipantEntry {
+  userId: string;
+  clId: string;
+  name: string;
+  email: string;
+  mobileNo: string | null;
+  city: string | null;
+  country: string | null;
+  eventTypes: string[];
+  paymentStatus: string;
+  paymentAmount: number;
+  registeredAt: string;
+}
+
+export function fetchAdminParticipants(compId: string): Promise<{
+  count: number;
+  participants: AdminParticipantEntry[];
+}> {
+  return getJson(`/api/v1/admin/competitions/${compId}/participants`);
 }
 
 export interface CompetitionScrambles {
@@ -703,6 +744,12 @@ export interface CompetitionScrambles {
 
 export function fetchCompetitionScrambles(id: string): Promise<CompetitionScrambles> {
   return getJson(`/api/v1/admin/competitions/${id}/scrambles`);
+}
+
+export function fetchRoundScrambles(
+  roundId: string,
+): Promise<{ roundId: string; scrambles: string[]; locked: boolean; generatedAt?: string; lockedAt?: string }> {
+  return getJson(`/api/v1/admin/rounds/${roundId}/scrambles`);
 }
 
 export async function regenerateRoundScrambles(roundId: string): Promise<{ roundId: string; scrambles: string[]; generatedAt: string }> {
@@ -803,6 +850,8 @@ export async function fetchAdminUsers(params?: {
   search?: string;
   role?: string;
   stage?: string;
+  competitionId?: string;
+  limit?: number;
 }): Promise<AdminUserDto[]> {
   const qs = new URLSearchParams(
     Object.entries(params ?? {}).filter(([, v]) => v) as [string, string][],
@@ -813,7 +862,7 @@ export async function fetchAdminUsers(params?: {
 
 export function updateAdminUser(
   id: string,
-  body: { role?: string; accountStage?: string },
+  body: { role?: string; accountStage?: string; name?: string; email?: string; mobileNo?: string },
 ): Promise<AdminUserDto> {
   return sendJson("PATCH", `/api/v1/admin/users/${id}`, body);
 }
@@ -868,9 +917,11 @@ export interface AdminPaymentDto {
   competitionTitle: string;
 }
 
-export async function fetchAdminPayments(status?: string): Promise<AdminPaymentDto[]> {
-  const qs = status ? `?status=${status}` : "";
-  const res = await getJson<{ data: AdminPaymentDto[] } | AdminPaymentDto[]>(`/api/v1/admin/payments${qs}`);
+export async function fetchAdminPayments(params?: { status?: string; competitionId?: string }): Promise<AdminPaymentDto[]> {
+  const qs = new URLSearchParams(
+    Object.entries(params ?? {}).filter(([, v]) => v) as [string, string][],
+  ).toString();
+  const res = await getJson<{ data: AdminPaymentDto[] } | AdminPaymentDto[]>(`/api/v1/admin/payments${qs ? `?${qs}` : ""}`);
   return Array.isArray(res) ? res : res.data;
 }
 
@@ -1503,7 +1554,7 @@ export async function deleteContentPage(id: string): Promise<void> {
 export function createStaff(body: {
   email: string;
   name: string;
-  role: "judge" | "moderator";
+  role: "judge" | "moderator" | "admin";
 }): Promise<{ id: string; clId: string; name: string; email: string; role: string }> {
   return sendJson("POST", `/api/v1/admin/create-staff`, body);
 }
@@ -1629,6 +1680,12 @@ export async function submitDailyChallenge(timeMs: number, penalty?: string): Pr
 
 // ── Verification management ──────────────────────────────────────────────────
 
+export interface FlagReasonDto {
+  type: string;
+  message: string;
+  severity: number;
+}
+
 export interface VerificationResultDto {
   id: string;
   userId: string;
@@ -1641,6 +1698,9 @@ export interface VerificationResultDto {
   ao5Ms: number | null;
   videoUrl: string | null;
   flagStatus: string;
+  flagReasons: FlagReasonDto[];
+  /** §7 priority score — higher = more urgent to review. */
+  priority: number;
   verifiedBy: string | null;
   verifiedByName?: string | null;
   verifiedAt: string | null;
@@ -1709,6 +1769,12 @@ export function fetchJudgeRoundResults(roundId: string): Promise<VerificationRes
   return getJson<VerificationResultDto[]>(`/api/v1/judge/rounds/${roundId}/results`);
 }
 
+export function fetchJudgeRoundScrambles(
+  roundId: string,
+): Promise<{ roundId: string; scrambles: string[]; locked: boolean; generatedAt?: string; lockedAt?: string }> {
+  return getJson(`/api/v1/judge/rounds/${roundId}/scrambles`);
+}
+
 export function judgeVerifyResult(
   resultId: string,
   action: string,
@@ -1720,6 +1786,107 @@ export function judgeVerifyResult(
     reason,
     comment,
   });
+}
+
+// ── Verification Hub (§1) ────────────────────────────────────────────────────
+
+export interface HubRoundStats {
+  total: number;
+  flagged: number;
+  verified: number;
+  clean: number;
+}
+
+export interface HubRoundJudge {
+  judgeId: string;
+  judgeName: string;
+  judgeClId: string;
+}
+
+export interface HubRound {
+  id: string;
+  roundNumber: number;
+  status: string;
+  videoRequired: boolean;
+  resultsPublishedAt: string | null;
+  stats: HubRoundStats;
+  verificationStatus: "complete" | "has_flagged" | "in_progress" | "empty";
+  judges: HubRoundJudge[];
+}
+
+export interface HubEvent {
+  eventType: string;
+  competitionEventId: string;
+  rounds: HubRound[];
+}
+
+export interface VerificationHubDto {
+  competition: { id: string; title: string; status: string };
+  events: HubEvent[];
+}
+
+export function fetchVerificationHub(compId: string): Promise<VerificationHubDto> {
+  return getJson<VerificationHubDto>(`/api/v1/admin/verification/hub?compId=${compId}`);
+}
+
+export interface HubOverviewComp {
+  id: string;
+  title: string;
+  status: string;
+  startsAt: string | null;
+  endsAt: string | null;
+  bannerUrl: string | null;
+  mobileBannerUrl: string | null;
+  registrationCount: number;
+  roundCount: number;
+  eventCount: number;
+  stats: { total: number; verified: number; flagged: number; clean: number };
+  verificationStatus: "complete" | "needs_review" | "in_progress" | "empty";
+}
+
+export function fetchVerificationOverview(): Promise<{ competitions: HubOverviewComp[] }> {
+  return getJson<{ competitions: HubOverviewComp[] }>("/api/v1/admin/verification/hub/overview");
+}
+
+export function updateVideoRequired(roundId: string, videoRequired: boolean): Promise<{ id: string; videoRequired: boolean }> {
+  return sendJson("PATCH", `/api/v1/rounds/${roundId}/video-required`, { videoRequired });
+}
+
+/** §6 — Re-run flag engine on all unverified results in a round. */
+export function reflagRound(roundId: string): Promise<{ roundId: string; totalResults: number; updated: number }> {
+  return sendJson("POST", `/api/v1/admin/verification/rounds/${roundId}/reflag`, {});
+}
+
+/** §8 — Bulk verify multiple results at once. */
+export function bulkVerify(
+  resultIds: string[],
+  action: string,
+  reason?: string,
+  comment?: string,
+): Promise<{ updated: number; previousStates: { id: string; flagStatus: string }[] }> {
+  return sendJson("POST", "/api/v1/admin/verification/bulk-verify", { resultIds, action, reason, comment });
+}
+
+/** §8 — Undo a bulk action by restoring previous states. */
+export function bulkUndo(
+  restorations: { id: string; flagStatus: string }[],
+): Promise<{ restored: number }> {
+  return sendJson("POST", "/api/v1/admin/verification/bulk-undo", { restorations });
+}
+
+/** §10 — Get audit trail for a specific result. */
+export interface AuditTrailEntry {
+  id: string;
+  action: string;
+  adminName: string;
+  reason: string | null;
+  oldValue: Record<string, unknown> | null;
+  newValue: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+export function fetchResultAudit(resultId: string): Promise<AuditTrailEntry[]> {
+  return getJson<AuditTrailEntry[]>(`/api/v1/admin/verification/results/${resultId}/audit`);
 }
 
 // ── System Settings ──────────────────────────────────────────────────────────
