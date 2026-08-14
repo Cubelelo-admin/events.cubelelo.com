@@ -15,6 +15,10 @@ import {
 } from "@/lib/api";
 import { eventDisplayName } from "@/lib/eventNames";
 import { EventIcon } from "@/components/EventIcon";
+import {
+  hoursToMinutes,
+  minutesToHours,
+} from "@/features/admin/competition/competitionFields";
 
 const INPUT =
   "rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100";
@@ -31,7 +35,8 @@ export default function AdminSettingsPage() {
   const [regDays, setRegDays] = useState(5);
   const [gapMinutes, setGapMinutes] = useState(0);
   const [defaultDuration, setDefaultDuration] = useState(20);
-  const [videoDeadline, setVideoDeadline] = useState(1440);
+  // Held as the typed string in hours; converted at load and save.
+  const [videoDeadlineHours, setVideoDeadlineHours] = useState("24");
 
   const load = useCallback(() => {
     setLoading(true);
@@ -42,7 +47,7 @@ export default function AdminSettingsPage() {
         setRegDays(s.registrationDurationDays);
         setGapMinutes(s.gapBetweenEventsMinutes);
         setDefaultDuration(s.defaultRoundDurationMinutes);
-        setVideoDeadline(s.videoDeadlineMinutes);
+        setVideoDeadlineHours(minutesToHours(s.videoDeadlineMinutes));
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
@@ -60,7 +65,7 @@ export default function AdminSettingsPage() {
         registrationDurationDays: regDays,
         gapBetweenEventsMinutes: gapMinutes,
         defaultRoundDurationMinutes: defaultDuration,
-        videoDeadlineMinutes: videoDeadline,
+        videoDeadlineMinutes: hoursToMinutes(videoDeadlineHours) ?? 1440,
       });
       setSettings(updated);
       setSaved(true);
@@ -214,17 +219,20 @@ export default function AdminSettingsPage() {
             <label className="mb-1 block text-xs text-zinc-500">
               Video Upload Deadline
             </label>
+            {/* Entered in hours to match the per-competition field; stored in
+                minutes, which is what every deadline calculation uses. */}
             <div className="flex items-center gap-2">
               <input
                 type="number"
-                min={1}
-                value={videoDeadline}
-                onChange={(e) => setVideoDeadline(Number(e.target.value))}
+                min={0}
+                step="0.5"
+                value={videoDeadlineHours}
+                onChange={(e) => setVideoDeadlineHours(e.target.value)}
                 className={`w-24 ${INPUT}`}
               />
-              <span className="text-xs text-zinc-400">minutes</span>
+              <span className="text-xs text-zinc-400">hours</span>
               <span className="text-xs text-zinc-500">
-                ({Math.floor(videoDeadline / 60)}h {videoDeadline % 60}m after round closes)
+                after each round closes
               </span>
             </div>
           </div>

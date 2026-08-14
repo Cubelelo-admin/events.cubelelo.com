@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   fetchAdminUsers,
@@ -73,6 +73,10 @@ export default function AdminStaffPage() {
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [editTarget, setEditTarget] = useState<AdminUserDto | null>(null);
   const [editForm, setEditForm] = useState({ name: "", email: "", mobileNo: "" });
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<AdminUserDto[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const load = useCallback(() => {
     Promise.all([
@@ -97,8 +101,10 @@ export default function AdminStaffPage() {
     setSuccess(null);
     try {
       const result = await createStaff(form);
-      setSuccess(`Created ${result.role} account for ${result.email} (${result.clId})`);
+      setSuccess(`Assigned ${result.role} role to ${result.name} (${result.clId})`);
       setForm({ email: "", name: "", role: "judge" });
+      setSearchQuery("");
+      setSearchResults([]);
       setCreating(false);
       load();
     } catch (e) {
@@ -234,34 +240,103 @@ export default function AdminStaffPage() {
         <div className="mt-5 border-t border-zinc-200 pt-4 dark:border-zinc-800">
           {!creating ? (
             <button
-              onClick={() => { setCreating(true); setError(null); setSuccess(null); }}
+              onClick={() => { setCreating(true); setError(null); setSuccess(null); setSearchQuery(""); setSearchResults([]); }}
               className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500"
             >
-              + Create Staff Account
+              + Add Staff Member
             </button>
           ) : (
             <div>
-              <h3 className="mb-3 text-sm font-semibold text-zinc-700 dark:text-zinc-300">Create Staff Account</h3>
+              <h3 className="mb-3 text-sm font-semibold text-zinc-700 dark:text-zinc-300">Add Staff Member</h3>
               <p className="mb-4 text-xs text-zinc-500">
-                If the email matches an existing user, their role will be updated. Otherwise a new account is created.
+                Search for an existing user by name, email, or CL ID to assign them a staff role.
               </p>
               <div className="space-y-3">
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="mb-1 block text-xs text-zinc-500">Email</label>
-                    <input value={form.email}
-                      onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
-                      placeholder="judge@cubelelo.com"
-                      className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-600" />
-                  </div>
-                  <div>
-                    <label className="mb-1 block text-xs text-zinc-500">Name</label>
-                    <input value={form.name}
-                      onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-                      placeholder="Full name"
-                      className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-600" />
-                  </div>
+                {/* User search */}
+                <div className="relative">
+                  <label className="mb-1 block text-xs text-zinc-500">Search User</label>
+                  <input
+                    value={searchQuery}
+                    onChange={(e) => {
+                      const q = e.target.value;
+                      setSearchQuery(q);
+                      if (searchTimer.current) clearTimeout(searchTimer.current);
+                      if (q.trim().length < 2) { setSearchResults([]); return; }
+                      setSearchLoading(true);
+                      searchTimer.current = setTimeout(async () => {
+                        try {
+                          const results = await fetchAdminUsers({ search: q.trim(), limit: 8 });
+                          setSearchResults(results);
+                        } catch { setSearchResults([]); }
+                        finally { setSearchLoading(false); }
+                      }, 300);
+                    }}
+                    placeholder="Type name, email, or CL ID…"
+                    className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-600"
+                  />
+                  {/* Search results dropdown */}
+                  {searchQuery.trim().length >= 2 && (searchResults.length > 0 || searchLoading) && (
+                    <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-48 overflow-y-auto rounded-lg border border-zinc-200 bg-white shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                      {searchLoading && <p className="px-3 py-2 text-xs text-zinc-400">Searching…</p>}
+                      {!searchLoading && searchResults.map((u) => {
+                        const alreadyStaff = ["admin", "moderator", "judge"].includes(u.role);
+                        return (
+                          <button
+                            key={u.id}
+                            type="button"
+                            disabled={alreadyStaff}
+                            onClick={() => {
+                              setForm({ email: u.email, name: u.name, role: form.role });
+                              setSearchQuery("");
+                              setSearchResults([]);
+                            }}
+                            className={`flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition ${
+                              alreadyStaff
+                                ? "cursor-not-allowed opacity-50"
+                                : "hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                            }`}
+                          >
+                            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-zinc-100 text-xs font-bold text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                              {u.name.charAt(0).toUpperCase()}
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate font-medium text-zinc-800 dark:text-zinc-200">{u.name}</p>
+                              <p className="truncate text-xs text-zinc-500">{u.email} · {u.clId}</p>
+                            </div>
+                            {alreadyStaff && (
+                              <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase ${roleColor(u.role)}`}>
+                                {u.role}
+                              </span>
+                            )}
+                          </button>
+                        );
+                      })}
+                      {!searchLoading && searchResults.length === 0 && (
+                        <p className="px-3 py-2 text-xs text-zinc-400">No users found</p>
+                      )}
+                    </div>
+                  )}
                 </div>
+
+                {/* Selected user preview or manual entry */}
+                {form.email && (
+                  <div className="flex items-center gap-3 rounded-lg border border-emerald-200 bg-emerald-50/50 px-3 py-2 dark:border-emerald-900/40 dark:bg-emerald-900/10">
+                    <div className="flex h-8 w-8 items-center justify-center rounded-full bg-emerald-100 text-sm font-bold text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400">
+                      {form.name.charAt(0).toUpperCase() || "?"}
+                    </div>
+                    <div className="flex-1">
+                      <p className="text-sm font-medium text-zinc-800 dark:text-zinc-200">{form.name}</p>
+                      <p className="text-xs text-zinc-500">{form.email}</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => { setForm({ email: "", name: "", role: form.role }); setSearchQuery(""); }}
+                      className="text-xs text-zinc-400 hover:text-red-400"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                )}
                 <div>
                   <label className="mb-1 block text-xs text-zinc-500">Role</label>
                   <div className="flex gap-4">
@@ -279,11 +354,11 @@ export default function AdminStaffPage() {
                   </div>
                 </div>
                 <div className="flex gap-3 pt-1">
-                  <button onClick={handleCreate} disabled={busy === "create"}
+                  <button onClick={handleCreate} disabled={busy === "create" || !form.email.trim()}
                     className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-50">
-                    {busy === "create" ? "Creating..." : "Create"}
+                    {busy === "create" ? "Assigning…" : "Assign Role"}
                   </button>
-                  <button onClick={() => { setCreating(false); setError(null); }}
+                  <button onClick={() => { setCreating(false); setError(null); setSearchQuery(""); setSearchResults([]); }}
                     className="rounded-lg border border-zinc-300 px-4 py-2 text-sm text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800">
                     Cancel
                   </button>

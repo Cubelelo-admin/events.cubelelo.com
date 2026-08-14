@@ -277,6 +277,16 @@ export function createMemRepo(): Repository {
         return map;
       },
       async create(result) { results.set(result.id, result); },
+      async createIfAbsent(result) {
+        // Single-threaded, so the check-then-set is already atomic here; the
+        // semantics match the advisory-locked Postgres path.
+        const duplicate = [...results.values()].some(
+          (r) => r.roundId === result.roundId && r.userId === result.userId,
+        );
+        if (duplicate) return false;
+        results.set(result.id, result);
+        return true;
+      },
       async update(id, fields) {
         const result = results.get(id);
         if (!result) return null;
@@ -372,11 +382,16 @@ export function createMemRepo(): Repository {
       async findByRegistration(registrationId) {
         return [...payments.values()].find((p) => p.registrationId === registrationId && p.status === "pending") ?? null;
       },
+      async findPendingByUserAndComp(userId, competitionId) {
+        return [...payments.values()].find(
+          (p) => p.userId === userId && p.competitionId === competitionId && p.status === "pending",
+        ) ?? null;
+      },
       async findByRegistrationIds(registrationIds) {
         const set = new Set(registrationIds);
         const map = new Map<string, import("./types").Payment>();
         for (const p of payments.values()) {
-          if (set.has(p.registrationId)) {
+          if (p.registrationId && set.has(p.registrationId)) {
             const existing = map.get(p.registrationId);
             if (!existing || p.createdAt > existing.createdAt) map.set(p.registrationId, p);
           }
@@ -709,7 +724,24 @@ export function createMemRepo(): Repository {
       return {
         async findAll() { return [...store.values()].sort((a, b) => a.name.localeCompare(b.name)); },
         async findById(id: string) { return store.get(id) ?? null; },
-        async create(rs: RuleSet) { store.set(rs.id, rs); },
+        async findByIds(ids: string[]) {
+          const map = new Map<string, RuleSet>();
+          for (const id of ids) {
+            const rs = store.get(id);
+            if (rs) map.set(id, rs);
+          }
+          return map;
+        },
+        async create(rs: RuleSet) {
+          // PG enforces `unique index on lower(name)` (migration 036) and the
+          // route maps the throw to 409 duplicate_name. Without this the mem
+          // backend silently accepted duplicates and that path was never tested.
+          const clash = [...store.values()].some(
+            (existing) => existing.name.toLowerCase() === rs.name.toLowerCase(),
+          );
+          if (clash) throw new Error("duplicate rule set name");
+          store.set(rs.id, rs);
+        },
         async update(id: string, fields: Partial<RuleSet>) {
           const rs = store.get(id);
           if (!rs) return null;
@@ -717,6 +749,31 @@ export function createMemRepo(): Repository {
           return rs;
         },
         async delete(id: string) { store.delete(id); },
+      };
+    })(),
+
+    competitionRuleSets: (() => {
+      /** competitionId → ordered rule set ids. */
+      const store = new Map<string, string[]>();
+      return {
+        async findByCompetition(competitionId: string) {
+          return [...(store.get(competitionId) ?? [])];
+        },
+        async findByCompetitions(competitionIds: string[]) {
+          const map = new Map<string, string[]>();
+          for (const id of competitionIds) {
+            const ids = store.get(id);
+            if (ids?.length) map.set(id, [...ids]);
+          }
+          return map;
+        },
+        async replace(competitionId: string, ruleSetIds: string[]) {
+          // Mirror the PG primary key: a rule set can appear once per
+          // competition, and order is the order given.
+          const deduped = [...new Set(ruleSetIds)];
+          if (deduped.length === 0) store.delete(competitionId);
+          else store.set(competitionId, deduped);
+        },
       };
     })(),
 
@@ -760,6 +817,9 @@ export function createMemRepo(): Repository {
     async ping() { return null; },
 
     judgeAssignments: {
+      async findById(id) {
+        return judgeAssignmentStore.get(id) ?? null;
+      },
       async findByRound(roundId) {
         return [...judgeAssignmentStore.values()].filter((a) => a.roundId === roundId);
       },
@@ -767,6 +827,13 @@ export function createMemRepo(): Repository {
         return [...judgeAssignmentStore.values()].filter((a) => a.judgeId === judgeId);
       },
       async create(assignment) {
+        // Mirror the PG `ON CONFLICT (judge_id, round_id) DO NOTHING`, which this
+        // previously lacked — the same judge could be assigned to a round N times
+        // in memory but only once against Postgres.
+        const duplicate = [...judgeAssignmentStore.values()].some(
+          (a) => a.judgeId === assignment.judgeId && a.roundId === assignment.roundId,
+        );
+        if (duplicate) return;
         judgeAssignmentStore.set(assignment.id, assignment);
       },
       async delete(id) {

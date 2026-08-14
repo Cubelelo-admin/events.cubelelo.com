@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import type { Solve } from "@cubers/types";
@@ -16,17 +16,15 @@ import {
   reflagRound,
   bulkVerify,
   bulkUndo,
-  fetchResultAudit,
   type VerificationResultDto,
   type JudgeAssignmentDto,
-  type AuditTrailEntry,
 } from "@/lib/api";
 import { useAuth } from "@/features/auth/AuthProvider";
 import { eventDisplayName } from "@/lib/eventNames";
 import { EventIcon } from "@/components/EventIcon";
 import { StatusBadge } from "@/components/ui/Badge";
 import { Skeleton } from "@/components/Skeleton";
-import { useSidebar } from "@/features/admin/SidebarContext";
+import { useBodyClass } from "@/hooks/useBodyClass";
 import { TwistyPlayer } from "@/features/scramble/TwistyPlayer";
 import { EVENTS, type EventId } from "@cubers/scramble-core";
 
@@ -59,20 +57,46 @@ function extractYoutubeId(url: string): string | null {
   return null;
 }
 
+/* ── Score recalculation helpers ──────────────────────────────────────────── */
+
+/** Compute ao5 from solves (trim best + worst, average middle 3). */
+function computeAo5(solves: Solve[]): number | null {
+  if (solves.length < 5) return null;
+  const times = solves.slice(0, 5).map((s) => {
+    if (s.penalty === "dnf") return Infinity;
+    const base = s.time_ms;
+    return s.penalty === "plus2" ? base + 2000 : base;
+  });
+  const dnfCount = times.filter((t) => t === Infinity).length;
+  if (dnfCount >= 2) return null; // DNF average
+  const sorted = [...times].sort((a, b) => a - b);
+  // trim best and worst
+  const middle = sorted.slice(1, 4);
+  return Math.round(middle.reduce((a, b) => a + b, 0) / 3);
+}
+
+/** Find best single from solves. */
+function computeBest(solves: Solve[]): number | null {
+  let best: number | null = null;
+  for (const s of solves) {
+    if (s.penalty === "dnf") continue;
+    const t = s.penalty === "plus2" ? s.time_ms + 2000 : s.time_ms;
+    if (best === null || t < best) best = t;
+  }
+  return best;
+}
+
 /* ── Main Page ───────────────────────────────────────────────────────────── */
 
 export default function VerificationWorkspacePage() {
   const searchParams = useSearchParams();
   const roundId = searchParams.get("roundId") ?? "";
-  const { setCollapsed } = useSidebar();
+  const compName = searchParams.get("comp") ?? "";
   const { user } = useAuth();
   const isJudgeOnly = user?.role === "judge";
 
-  // Auto-hide sidebar in workspace for maximum working space
-  useEffect(() => {
-    setCollapsed(true);
-    return () => setCollapsed(false);
-  }, [setCollapsed]);
+  // Focused mode — hide navbar, footer, sidebar for maximum working space
+  useBodyClass("focused-workspace");
 
   const [results, setResults] = useState<VerificationResultDto[]>([]);
   const [judges, setJudges] = useState<JudgeAssignmentDto[]>([]);
@@ -86,7 +110,6 @@ export default function VerificationWorkspacePage() {
   const [busy, setBusy] = useState<string | null>(null);
 
   // Verification form state
-  const [reason, setReason] = useState("");
   const [comment, setComment] = useState("");
 
   // §8 — Bulk selection (admin/mod only)
@@ -94,12 +117,14 @@ export default function VerificationWorkspacePage() {
   const [bulkReason, setBulkReason] = useState("");
   const [undoStack, setUndoStack] = useState<{ id: string; flagStatus: string }[][]>([]);
 
+  // Per-solve penalty overrides (local state, sent on verify)
+  const [solveOverrides, setSolveOverrides] = useState<Map<string, (Solve["penalty"] | null)[]>>(new Map());
+
   const loadData = useCallback(async () => {
     if (!roundId) return;
     setLoading(true);
     setError(null);
     try {
-      // Judges use judge-scoped endpoints; admins/mods use admin endpoints
       const resultsPromise = isJudgeOnly
         ? fetchJudgeRoundResults(roundId)
         : fetchRoundResults(roundId);
@@ -120,7 +145,7 @@ export default function VerificationWorkspacePage() {
     } finally {
       setLoading(false);
     }
-  }, [roundId]);
+  }, [roundId, isJudgeOnly]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
@@ -138,10 +163,36 @@ export default function VerificationWorkspacePage() {
     if (tabResults.length > 0 && (!selectedId || !tabResults.find((r) => r.id === selectedId))) {
       setSelectedId(tabResults[0].id);
     }
-    setSelectedIds(new Set()); // clear bulk selection on tab change
+    setSelectedIds(new Set());
   }, [activeTab, tabResults.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const selected = results.find((r) => r.id === selectedId) ?? null;
+
+  // Get solves with local overrides applied
+  const getOverriddenSolves = useCallback((result: VerificationResultDto): Solve[] => {
+    const overrides = solveOverrides.get(result.id);
+    if (!overrides) return result.solves;
+    return result.solves.map((s, i) => {
+      const override = overrides[i];
+      if (override === undefined || override === null) return s;
+      return { ...s, penalty: override };
+    });
+  }, [solveOverrides]);
+
+  const toggleSolvePenalty = useCallback((resultId: string, solveIndex: number, penalty: "plus2" | "dnf") => {
+    setSolveOverrides((prev) => {
+      const next = new Map(prev);
+      const result = results.find((r) => r.id === resultId);
+      if (!result) return prev;
+      const current = next.get(resultId) ?? result.solves.map(() => null);
+      const arr = [...current];
+      const currentPenalty = arr[solveIndex] ?? result.solves[solveIndex]?.penalty ?? null;
+      // Toggle: if already this penalty, remove it; otherwise set it
+      arr[solveIndex] = currentPenalty === penalty ? null : penalty;
+      next.set(resultId, arr);
+      return next;
+    });
+  }, [results]);
 
   // Keyboard navigation
   useEffect(() => {
@@ -166,9 +217,20 @@ export default function VerificationWorkspacePage() {
     setBusy(`verify-${selected.id}`);
     try {
       const verifyFn = isJudgeOnly ? judgeVerifyResult : verifyResult;
-      await verifyFn(selected.id, action, reason.trim() || undefined, comment.trim() || undefined);
-      setReason("");
+      // The per-attempt toggles are the judge's actual verdict — send them so the
+      // penalty lands on the attempt they picked. Previously they were local-only
+      // preview state, and the server applied a flat +2 to every stat instead.
+      const penalties = solveOverrides.get(selected.id);
+      await verifyFn(
+        selected.id,
+        action,
+        undefined,
+        comment.trim() || undefined,
+        penalties ?? undefined,
+      );
       setComment("");
+      // Clear overrides for this result
+      setSolveOverrides((prev) => { const n = new Map(prev); n.delete(selected.id); return n; });
       await loadData();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -273,60 +335,7 @@ export default function VerificationWorkspacePage() {
   }
 
   return (
-    <div className="flex h-[calc(100vh-56px)] flex-col">
-      {/* Header bar */}
-      <div className="flex items-center justify-between border-b border-zinc-200 bg-white px-5 py-3 dark:border-zinc-800 dark:bg-zinc-950">
-        <div className="flex items-center gap-3">
-          <SidebarToggle />
-          <Link
-            href={isJudgeOnly ? "/judge/verifications" : "/admin/verification-hub"}
-            className="text-xs text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300"
-          >
-            ← {isJudgeOnly ? "My Verifications" : "Hub"}
-          </Link>
-          {roundInfo && (
-            <>
-              <EventIcon eventId={roundInfo.eventType} size={18} />
-              <span className="text-sm font-bold text-zinc-800 dark:text-zinc-200">
-                {eventDisplayName(roundInfo.eventType)} — Round {roundInfo.roundNumber}
-              </span>
-            </>
-          )}
-          <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-mono text-zinc-500 dark:bg-zinc-800">
-            {results.length} results
-          </span>
-        </div>
-        <div className="flex items-center gap-2">
-          {!isJudgeOnly && (
-            <button
-              onClick={handleReflag}
-              disabled={busy === "reflag"}
-              className="rounded-md border border-amber-300 bg-amber-50 px-3 py-1 text-[11px] font-semibold text-amber-700 hover:bg-amber-100 disabled:opacity-50 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-400"
-              title="Re-run flag rules on all unverified results"
-            >
-              {busy === "reflag" ? "Re-flagging..." : "⚑ Re-flag"}
-            </button>
-          )}
-          {!isJudgeOnly && undoStack.length > 0 && (
-            <button
-              onClick={handleUndo}
-              disabled={busy === "undo"}
-              className="rounded-md border border-zinc-300 bg-white px-3 py-1 text-[11px] font-semibold text-zinc-600 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400"
-            >
-              ↩ Undo
-            </button>
-          )}
-          {judges.map((j) => (
-            <span
-              key={j.id}
-              className="rounded-full bg-blue-50 px-2.5 py-0.5 text-[10px] font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-400"
-            >
-              {j.judgeName}
-            </span>
-          ))}
-        </div>
-      </div>
-
+    <div className="flex h-screen flex-col">
       {error && (
         <div className="bg-red-100 px-5 py-2 text-sm text-red-700 dark:bg-red-900/30 dark:text-red-300">
           {error}
@@ -334,7 +343,6 @@ export default function VerificationWorkspacePage() {
         </div>
       )}
 
-      {/* §8 toast */}
       {toast && (
         <div className="bg-emerald-100 px-5 py-2 text-sm text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300">
           {toast}
@@ -350,116 +358,155 @@ export default function VerificationWorkspacePage() {
           </div>
         </div>
       ) : (
-        <div className="flex flex-1 overflow-hidden">
-          {/* ── Left panel: tabs + result list ── */}
-          <div className="flex w-[380px] flex-shrink-0 flex-col border-r border-zinc-200 dark:border-zinc-800">
-            {/* Tabs */}
-            <div className="flex border-b border-zinc-200 dark:border-zinc-800">
-              {TABS.map((tab) => (
-                <button
-                  key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
-                  className={`flex-1 px-3 py-2.5 text-xs font-semibold transition ${
-                    activeTab === tab.id
-                      ? "border-b-2 border-emerald-500 text-emerald-600 dark:text-emerald-400"
-                      : "text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"
-                  }`}
+        <ResizableSplitPane
+          leftPanel={
+            <div className="flex h-full flex-col">
+              {/* Compact toolbar — back link, round info, reflag */}
+              <div className="flex items-center gap-2 border-b border-zinc-200 bg-white px-3 py-1.5 dark:border-zinc-800 dark:bg-zinc-950">
+                <Link
+                  href={isJudgeOnly ? "/judge/verifications" : "/admin/verification-hub"}
+                  className="text-[11px] text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300"
                 >
-                  {tab.label}
-                  <span className={`ml-1.5 rounded-full px-1.5 py-0.5 text-[10px] font-bold ${
-                    activeTab === tab.id
-                      ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
-                      : "bg-zinc-100 text-zinc-500 dark:bg-zinc-800"
-                  }`}>
-                    {counts[tab.id]}
-                  </span>
-                </button>
-              ))}
-            </div>
-
-            {/* §8 — Bulk action bar (admin/mod only) */}
-            {!isJudgeOnly && tabResults.length > 0 && (
-              <div className="flex items-center gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
-                <label className="flex items-center gap-1.5 text-[11px] text-zinc-500">
-                  <input
-                    type="checkbox"
-                    checked={selectedIds.size === tabResults.length && tabResults.length > 0}
-                    onChange={toggleSelectAll}
-                    className="accent-emerald-500"
-                  />
-                  All
-                </label>
-                {selectedIds.size > 0 && (
+                  ← Hub
+                </Link>
+                {roundInfo && (
                   <>
-                    <span className="text-[10px] font-mono text-zinc-400">{selectedIds.size} selected</span>
-                    <div className="ml-auto flex items-center gap-1">
-                      {activeTab !== "verified" && (
-                        <>
-                          <input
-                            type="text"
-                            value={bulkReason}
-                            onChange={(e) => setBulkReason(e.target.value)}
-                            placeholder="Reason..."
-                            className="w-24 rounded border border-zinc-300 px-1.5 py-0.5 text-[10px] dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
-                          />
-                          <button
-                            onClick={() => handleBulkVerify("verified")}
-                            disabled={busy === "bulk"}
-                            className="rounded bg-emerald-600 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
-                          >
-                            ✓ Bulk Verify
-                          </button>
-                        </>
-                      )}
-                    </div>
+                    <EventIcon eventId={roundInfo.eventType} size={14} />
+                    <span className="text-[11px] font-bold text-zinc-700 dark:text-zinc-300">
+                      {eventDisplayName(roundInfo.eventType)} R{roundInfo.roundNumber}
+                    </span>
                   </>
                 )}
-              </div>
-            )}
-
-            {/* Result list */}
-            <div className="flex-1 overflow-y-auto">
-              {tabResults.length === 0 ? (
-                <div className="flex h-full items-center justify-center p-4 text-center text-xs text-zinc-400">
-                  No results in this tab.
+                <span className="font-mono text-[10px] text-zinc-400">{results.length}</span>
+                <div className="ml-auto flex items-center gap-1">
+                  {!isJudgeOnly && (
+                    <button
+                      onClick={handleReflag}
+                      disabled={busy === "reflag"}
+                      className="rounded px-1.5 py-0.5 text-[10px] font-semibold text-amber-600 hover:bg-amber-50 disabled:opacity-50 dark:text-amber-400 dark:hover:bg-amber-950/30"
+                      title="Re-run flag rules on all unverified results"
+                    >
+                      ⚑
+                    </button>
+                  )}
+                  {!isJudgeOnly && undoStack.length > 0 && (
+                    <button
+                      onClick={handleUndo}
+                      disabled={busy === "undo"}
+                      className="rounded px-1.5 py-0.5 text-[10px] font-semibold text-zinc-500 hover:bg-zinc-100 disabled:opacity-50 dark:hover:bg-zinc-800"
+                    >
+                      ↩
+                    </button>
+                  )}
                 </div>
-              ) : (
-                tabResults.map((r) => (
-                  <ResultListItem
-                    key={r.id}
-                    result={r}
-                    isSelected={selectedId === r.id}
-                    isChecked={selectedIds.has(r.id)}
-                    showCheckbox={!isJudgeOnly}
-                    onCheck={() => toggleSelect(r.id)}
-                    onClick={() => { setSelectedId(r.id); setReason(""); setComment(""); }}
-                  />
-                ))
-              )}
-            </div>
-          </div>
+              </div>
 
-          {/* ── Right panel: detail + actions ── */}
-          <div className="flex-1 overflow-y-auto bg-zinc-50 dark:bg-zinc-900/30">
-            {selected ? (
+              {/* Tabs */}
+              <div className="flex border-b border-zinc-200 dark:border-zinc-800">
+                {TABS.map((tab) => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setActiveTab(tab.id)}
+                    className={`flex-1 px-3 py-2.5 text-xs font-semibold transition ${
+                      activeTab === tab.id
+                        ? "border-b-2 border-emerald-500 text-emerald-600 dark:text-emerald-400"
+                        : "text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"
+                    }`}
+                  >
+                    {tab.label}
+                    <span className={`ml-1.5 rounded-full px-1.5 py-0.5 text-[10px] font-bold ${
+                      activeTab === tab.id
+                        ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
+                        : "bg-zinc-100 text-zinc-500 dark:bg-zinc-800"
+                    }`}>
+                      {counts[tab.id]}
+                    </span>
+                  </button>
+                ))}
+              </div>
+
+              {/* §8 — Bulk action bar (admin/mod only) */}
+              {!isJudgeOnly && tabResults.length > 0 && (
+                <div className="flex items-center gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
+                  <label className="flex items-center gap-1.5 text-[11px] text-zinc-500">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.size === tabResults.length && tabResults.length > 0}
+                      onChange={toggleSelectAll}
+                      className="accent-emerald-500"
+                    />
+                    All
+                  </label>
+                  {selectedIds.size > 0 && (
+                    <>
+                      <span className="text-[10px] font-mono text-zinc-400">{selectedIds.size} selected</span>
+                      <div className="ml-auto flex items-center gap-1">
+                        {activeTab !== "verified" && (
+                          <>
+                            <input
+                              type="text"
+                              value={bulkReason}
+                              onChange={(e) => setBulkReason(e.target.value)}
+                              placeholder="Reason..."
+                              className="w-24 rounded border border-zinc-300 px-1.5 py-0.5 text-[10px] dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                            />
+                            <button
+                              onClick={() => handleBulkVerify("verified")}
+                              disabled={busy === "bulk"}
+                              className="rounded bg-emerald-600 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+                            >
+                              ✓ Bulk Verify
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* Result list */}
+              <div className="flex-1 overflow-y-auto">
+                {tabResults.length === 0 ? (
+                  <div className="flex h-full items-center justify-center p-4 text-center text-xs text-zinc-400">
+                    No results in this tab.
+                  </div>
+                ) : (
+                  tabResults.map((r) => (
+                    <ResultListItem
+                      key={r.id}
+                      result={r}
+                      isSelected={selectedId === r.id}
+                      isChecked={selectedIds.has(r.id)}
+                      showCheckbox={!isJudgeOnly}
+                      onCheck={() => toggleSelect(r.id)}
+                      onClick={() => { setSelectedId(r.id); setComment(""); }}
+                    />
+                  ))
+                )}
+              </div>
+            </div>
+          }
+          rightPanel={
+            selected ? (
               <ResultDetail
                 result={selected}
                 scrambles={scrambles}
                 isJudgeOnly={isJudgeOnly}
-                reason={reason}
                 comment={comment}
                 busy={busy}
-                onReasonChange={setReason}
                 onCommentChange={setComment}
                 onVerify={handleVerify}
+                overriddenSolves={getOverriddenSolves(selected)}
+                onTogglePenalty={(idx, pen) => toggleSolvePenalty(selected.id, idx, pen)}
               />
             ) : (
               <div className="flex h-full items-center justify-center text-sm text-zinc-400">
                 Select a result from the list.
               </div>
-            )}
-          </div>
-        </div>
+            )
+          }
+        />
       )}
     </div>
   );
@@ -490,7 +537,6 @@ function ResultListItem({
           : "hover:bg-zinc-50 dark:hover:bg-zinc-900/40"
       }`}
     >
-      {/* §8 checkbox */}
       {showCheckbox && <div className="flex items-start px-2 pt-3.5">
         <input
           type="checkbox"
@@ -554,28 +600,90 @@ function ResultListItem({
   );
 }
 
+/* ── Resizable split pane ───────────────────────────────────────────────── */
+
+function ResizableSplitPane({
+  leftPanel,
+  rightPanel,
+}: {
+  leftPanel: React.ReactNode;
+  rightPanel: React.ReactNode;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [leftWidth, setLeftWidth] = useState(380);
+  const dragging = useRef(false);
+
+  const onMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    dragging.current = true;
+
+    const onMouseMove = (ev: MouseEvent) => {
+      if (!dragging.current || !containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const newLeft = ev.clientX - rect.left;
+      setLeftWidth(Math.max(240, Math.min(newLeft, rect.width * 0.6)));
+    };
+
+    const onMouseUp = () => {
+      dragging.current = false;
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+  }, []);
+
+  return (
+    <div ref={containerRef} className="flex flex-1 overflow-hidden">
+      <div
+        className="flex flex-shrink-0 flex-col border-r border-zinc-200 dark:border-zinc-800"
+        style={{ width: leftWidth }}
+      >
+        {leftPanel}
+      </div>
+
+      {/* Drag handle */}
+      <div
+        onMouseDown={onMouseDown}
+        className="group flex w-1.5 flex-shrink-0 cursor-col-resize items-center justify-center bg-zinc-100 transition-colors hover:bg-zinc-200 active:bg-blue-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:active:bg-blue-900"
+      >
+        <div className="h-8 w-0.5 rounded-full bg-zinc-300 transition-colors group-hover:bg-zinc-400 dark:bg-zinc-600 dark:group-hover:bg-zinc-500" />
+      </div>
+
+      <div className="flex min-w-0 flex-1 flex-col bg-zinc-50 dark:bg-zinc-900/30">
+        {rightPanel}
+      </div>
+    </div>
+  );
+}
+
 /* ── Result detail (right panel) ─────────────────────────────────────────── */
 
 function ResultDetail({
   result,
   scrambles,
   isJudgeOnly,
-  reason,
   comment,
   busy,
-  onReasonChange,
   onCommentChange,
   onVerify,
+  overriddenSolves,
+  onTogglePenalty,
 }: {
   result: VerificationResultDto;
   scrambles: string[];
   isJudgeOnly: boolean;
-  reason: string;
   comment: string;
   busy: string | null;
-  onReasonChange: (v: string) => void;
   onCommentChange: (v: string) => void;
   onVerify: (action: string) => void;
+  overriddenSolves: Solve[];
+  onTogglePenalty: (solveIndex: number, penalty: "plus2" | "dnf") => void;
 }) {
   const isBusy = busy === `verify-${result.id}`;
   const isVerified =
@@ -586,300 +694,197 @@ function ResultDetail({
 
   const ytId = result.videoUrl ? extractYoutubeId(result.videoUrl) : null;
 
-  // §10 — Audit trail (use ref to track result ID changes instead of useEffect
-  // to avoid StrictMode double-mount resetting showAudit after async fetch)
-  const [auditTrail, setAuditTrail] = useState<AuditTrailEntry[]>([]);
-  const [showAudit, setShowAudit] = useState(false);
-  const [auditLoading, setAuditLoading] = useState(false);
-  const prevResultId = useRef(result.id);
+  // Recalculated scores based on overridden penalties
+  const recalcAo5 = useMemo(() => computeAo5(overriddenSolves), [overriddenSolves]);
+  const recalcBest = useMemo(() => computeBest(overriddenSolves), [overriddenSolves]);
 
-  if (prevResultId.current !== result.id) {
-    prevResultId.current = result.id;
-    if (showAudit) setShowAudit(false);
-    if (auditTrail.length > 0) setAuditTrail([]);
-  }
-
-  const loadAudit = async () => {
-    if (showAudit) { setShowAudit(false); return; }
-    setAuditLoading(true);
-    try {
-      const trail = await fetchResultAudit(result.id);
-      setAuditTrail(trail);
-      setShowAudit(true);
-    } catch { /* ignore */ }
-    finally { setAuditLoading(false); }
-  };
+  // Check if scores changed from original
+  const ao5Changed = recalcAo5 !== result.ao5Ms;
+  const bestChanged = recalcBest !== result.bestSingleMs;
 
   return (
-    <div className="p-6">
-      {/* Header */}
-      <div className="mb-5 flex items-center justify-between">
-        <div>
-          <h2 className="text-lg font-bold text-zinc-800 dark:text-zinc-100">
-            {result.userName}
-          </h2>
-          <span className="font-mono text-xs text-zinc-400">{result.userClId}</span>
-        </div>
+    <div className="flex h-full flex-col">
+      {/* ── Compact header ── */}
+      <div className="flex items-center justify-between border-b border-zinc-200 bg-white px-4 py-2 dark:border-zinc-800 dark:bg-zinc-950">
         <div className="flex items-center gap-2">
-          <StatusBadge domain="verification" status={result.flagStatus} />
+          <span className="text-sm font-bold text-zinc-800 dark:text-zinc-100">{result.userName}</span>
+          <span className="font-mono text-[10px] text-zinc-400">{result.userClId}</span>
           {result.rank && (
-            <span className="rounded bg-zinc-200 px-2 py-0.5 text-xs font-mono font-bold text-zinc-700 dark:bg-zinc-700 dark:text-zinc-200">
+            <span className="rounded bg-zinc-200 px-1.5 py-0.5 text-[10px] font-mono font-bold text-zinc-700 dark:bg-zinc-700 dark:text-zinc-200">
               #{result.rank}
             </span>
           )}
         </div>
+        <StatusBadge domain="verification" status={result.flagStatus} />
       </div>
 
-      {/* Stats cards */}
-      <div className="mb-5 grid grid-cols-3 gap-3">
-        <StatCard label="Average (ao5)" value={result.ao5Ms !== null ? formatTime(result.ao5Ms) : "DNF"} />
-        <StatCard label="Best Single" value={result.bestSingleMs !== null ? formatTime(result.bestSingleMs) : "DNF"} />
-        <StatCard label="Submitted" value={new Date(result.submittedAt).toLocaleString()} small />
-      </div>
-
-      {/* Solves */}
-      <div className="mb-5 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
-        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
-          Individual Solves
-        </h3>
-        <div className="flex flex-wrap gap-2">
-          {result.solves.map((s: Solve, i: number) => (
-            <span
-              key={i}
-              className={`rounded-md border px-3 py-1.5 font-mono text-sm ${
-                s.penalty === "dnf"
-                  ? "border-red-200 bg-red-50 text-red-600 dark:border-red-900 dark:bg-red-950/30 dark:text-red-400"
-                  : s.penalty === "plus2"
-                    ? "border-amber-200 bg-amber-50 text-amber-600 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-400"
-                    : "border-zinc-200 bg-zinc-50 text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300"
-              }`}
-            >
-              {formatSolve(s)}
-            </span>
-          ))}
-        </div>
-      </div>
-
-      {/* Scrambles */}
-      {scrambles.length > 0 && <ScrambleViewer scrambles={scrambles} solveCount={result.solves.length} eventType={result.eventType} />}
-
-      {/* Flag reasons */}
-      {result.flagReasons.length > 0 && (
-        <div className="mb-5 rounded-lg border border-amber-200 bg-amber-50/50 p-4 dark:border-amber-900 dark:bg-amber-950/20">
-          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-amber-600 dark:text-amber-400">
-            Flag Reasons
-          </h3>
-          <div className="space-y-2">
-            {result.flagReasons.map((fr, i) => (
-              <div key={i} className="flex items-start gap-2 text-sm">
-                <span className="mt-0.5 rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-bold uppercase text-amber-800 dark:bg-amber-800 dark:text-amber-200">
-                  {fr.severity}
-                </span>
-                <div>
-                  <span className="font-medium text-amber-800 dark:text-amber-300">
-                    {fr.type.replace(/_/g, " ")}
-                  </span>
-                  <p className="text-xs text-amber-700/80 dark:text-amber-400/70">{fr.message}</p>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* §9 — Video review panel */}
-      <div className="mb-5 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
-        <div className="mb-2 flex items-center justify-between">
-          <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
-            Video Review
-          </h3>
-          {result.videoUrl && (
-            <a
-              href={result.videoUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-[10px] text-blue-500 hover:underline"
-            >
-              Open in new tab ↗
-            </a>
+      {/* ── Scrollable content ── */}
+      <div className="flex-1 overflow-y-auto">
+        {/* 1 + 2. Scramble & Video — side by side */}
+        <div className="flex border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
+          {/* Scramble (left half) */}
+          {scrambles.length > 0 && (
+            <ScrambleViewer
+              scrambles={scrambles}
+              solveCount={result.solves.length}
+              eventType={result.eventType}
+            />
           )}
-        </div>
-        {result.videoUrl ? (
-          <>
-            {ytId ? (
-              <div className="aspect-video w-full overflow-hidden rounded-lg bg-black">
-                <iframe
-                  src={`https://www.youtube-nocookie.com/embed/${ytId}?rel=0`}
-                  className="h-full w-full"
-                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                  allowFullScreen
-                  title="Solve video"
-                />
-              </div>
-            ) : (
-              <div className="rounded-lg border border-blue-200 bg-blue-50/50 p-4 dark:border-blue-900 dark:bg-blue-950/20">
-                <p className="mb-2 text-xs text-zinc-500">Non-YouTube video link:</p>
-                <a
-                  href={result.videoUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-blue-100 px-4 py-2 text-sm font-medium text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-400"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-                  Open Video
+
+          {/* Video (right half) */}
+          <div className="flex flex-1 flex-col border-l border-zinc-200 px-3 py-3 dark:border-zinc-800">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">Video</span>
+              {result.videoUrl && (
+                <a href={result.videoUrl} target="_blank" rel="noopener noreferrer" className="text-[10px] text-blue-500 hover:underline">
+                  Open ↗
                 </a>
-                <p className="mt-2 break-all font-mono text-[10px] text-zinc-400">{result.videoUrl}</p>
-              </div>
-            )}
-          </>
-        ) : (
-          <div className="rounded-lg border border-dashed border-zinc-300 p-6 text-center dark:border-zinc-700">
-            <span className="text-2xl">📹</span>
-            <p className="mt-1 text-xs text-zinc-400">No video submitted</p>
+              )}
+            </div>
+            <div className="flex-1">
+              {result.videoUrl ? (
+                ytId ? (
+                  <div className="h-full min-h-[160px] w-full overflow-hidden rounded-lg bg-black">
+                    <iframe
+                      src={`https://www.youtube-nocookie.com/embed/${ytId}?rel=0`}
+                      className="h-full w-full"
+                      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                      allowFullScreen
+                      title="Solve video"
+                    />
+                  </div>
+                ) : (
+                  <div className="flex h-full items-center justify-center">
+                    <a href={result.videoUrl} target="_blank" rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-blue-100 px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-400">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                      Open Video
+                    </a>
+                  </div>
+                )
+              ) : (
+                <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-zinc-300 dark:border-zinc-700">
+                  <p className="text-[10px] text-zinc-400">No video submitted</p>
+                </div>
+              )}
+            </div>
           </div>
-        )}
+        </div>
+
+        {/* 3. Solves + Score — side by side */}
+        <div className="flex border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
+          {/* Solves — horizontal row */}
+          <div className="flex-1 border-r border-zinc-200 px-4 py-3 dark:border-zinc-800">
+            <div className="mb-2">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">Solves</span>
+            </div>
+            <div className="flex gap-1.5 overflow-x-auto">
+              {overriddenSolves.map((s: Solve, i: number) => (
+                <div
+                  key={i}
+                  className={`flex flex-shrink-0 flex-col items-center rounded-lg border px-2.5 py-1.5 ${
+                    s.penalty === "dnf"
+                      ? "border-red-200 bg-red-50 dark:border-red-900 dark:bg-red-950/30"
+                      : s.penalty === "plus2"
+                        ? "border-amber-200 bg-amber-50 dark:border-amber-900 dark:bg-amber-950/30"
+                        : "border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900"
+                  }`}
+                >
+                  <span className="text-[8px] font-semibold text-zinc-400">S{i + 1}</span>
+                  <span className={`font-mono text-sm font-medium leading-tight ${
+                    s.penalty === "dnf"
+                      ? "text-red-600 dark:text-red-400"
+                      : s.penalty === "plus2"
+                        ? "text-amber-600 dark:text-amber-400"
+                        : "text-zinc-800 dark:text-zinc-200"
+                  }`}>
+                    {formatSolve(s)}
+                  </span>
+                  <div className="mt-1 flex gap-0.5">
+                    <button
+                      onClick={() => onTogglePenalty(i, "plus2")}
+                      className={`rounded px-1.5 py-0.5 text-[9px] font-bold transition ${
+                        s.penalty === "plus2"
+                          ? "bg-amber-500 text-white"
+                          : "bg-zinc-100 text-zinc-500 hover:bg-amber-100 hover:text-amber-600 dark:bg-zinc-800 dark:text-zinc-400"
+                      }`}
+                    >
+                      +2
+                    </button>
+                    <button
+                      onClick={() => onTogglePenalty(i, "dnf")}
+                      className={`rounded px-1.5 py-0.5 text-[9px] font-bold transition ${
+                        s.penalty === "dnf"
+                          ? "bg-red-500 text-white"
+                          : "bg-zinc-100 text-zinc-500 hover:bg-red-100 hover:text-red-600 dark:bg-zinc-800 dark:text-zinc-400"
+                      }`}
+                    >
+                      DNF
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Score column */}
+          <div className="w-[360px] flex-shrink-0 px-5 py-3">
+            <div className="mb-3">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">Score</span>
+            </div>
+            <div className="flex items-start gap-6">
+              <div>
+                <span className="text-xs text-zinc-400">ao5</span>
+                <div className={`font-mono text-2xl font-bold ${ao5Changed ? "text-amber-600 dark:text-amber-400" : "text-zinc-800 dark:text-zinc-200"}`}>
+                  {recalcAo5 !== null ? formatTime(recalcAo5) : "DNF"}
+                </div>
+                {ao5Changed && result.ao5Ms !== null && (
+                  <span className="font-mono text-[10px] text-zinc-400 line-through">{formatTime(result.ao5Ms)}</span>
+                )}
+              </div>
+              <div>
+                <span className="text-xs text-zinc-400">Best</span>
+                <div className={`font-mono text-2xl font-bold ${bestChanged ? "text-amber-600 dark:text-amber-400" : "text-zinc-800 dark:text-zinc-200"}`}>
+                  {recalcBest !== null ? formatTime(recalcBest) : "DNF"}
+                </div>
+                {bestChanged && result.bestSingleMs !== null && (
+                  <span className="font-mono text-[10px] text-zinc-400 line-through">{formatTime(result.bestSingleMs)}</span>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
 
-      {/* Verification info (if already verified) */}
-      {isVerified && result.verifiedAt && (
-        <div className="mb-5 rounded-lg border border-emerald-200 bg-emerald-50/50 p-4 dark:border-emerald-900 dark:bg-emerald-950/20">
-          <h3 className="mb-1 text-xs font-semibold uppercase tracking-wider text-emerald-600 dark:text-emerald-400">
-            Verification Record
-          </h3>
-          <p className="text-sm text-emerald-700 dark:text-emerald-300">
-            Verified as <strong>{result.flagStatus}</strong>
-            {result.verifiedByName && <> by {result.verifiedByName}</>}
-            <span className="ml-2 text-xs text-zinc-500">
-              {new Date(result.verifiedAt).toLocaleString()}
-            </span>
-          </p>
-          {result.verificationComment && (
-            <p className="mt-1 text-xs italic text-zinc-600 dark:text-zinc-400">
-              &ldquo;{result.verificationComment}&rdquo;
-            </p>
-          )}
-        </div>
-      )}
-
-      {/* Action area */}
-      <div className="mb-5 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
-        <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">
-          {isVerified ? "Re-verify" : "Verify Result"}
-        </h3>
-
-        <div className="mb-3 grid grid-cols-2 gap-3">
-          <div>
-            <label className="mb-1 block text-[11px] font-medium text-zinc-500">
-              Reason <span className="text-zinc-400">(required for +2/DNF/DQ)</span>
-            </label>
-            <input
-              type="text"
-              value={reason}
-              onChange={(e) => onReasonChange(e.target.value)}
-              placeholder="Enter reason..."
-              className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
-            />
-          </div>
-          <div>
-            <label className="mb-1 block text-[11px] font-medium text-zinc-500">
-              Comment <span className="text-zinc-400">(optional)</span>
-            </label>
-            <input
-              type="text"
-              value={comment}
-              onChange={(e) => onCommentChange(e.target.value)}
-              placeholder="Add a comment..."
-              className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
-            />
-          </div>
-        </div>
-
-        <div className="flex flex-wrap gap-2">
+      {/* ── Pinned bottom: remark + verify ── */}
+      <div className="border-t border-zinc-200 bg-white px-4 py-2.5 dark:border-zinc-800 dark:bg-zinc-950">
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={comment}
+            onChange={(e) => onCommentChange(e.target.value)}
+            placeholder="Add a remark..."
+            className="min-w-0 flex-[3] rounded-lg border border-zinc-300 bg-zinc-50 px-3 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+          />
           <button
             onClick={() => onVerify("verified")}
             disabled={isBusy}
-            className="rounded-lg bg-emerald-600 px-5 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+            className="flex-shrink-0 rounded-lg bg-emerald-600 px-5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
           >
-            ✓ Verify Clean
-          </button>
-          <button
-            onClick={() => onVerify("plus2")}
-            disabled={isBusy || !reason.trim()}
-            className="rounded-lg bg-amber-600 px-5 py-2 text-sm font-semibold text-white hover:bg-amber-500 disabled:opacity-50"
-          >
-            +2 Penalty
-          </button>
-          <button
-            onClick={() => onVerify("dnf")}
-            disabled={isBusy || !reason.trim()}
-            className="rounded-lg bg-orange-600 px-5 py-2 text-sm font-semibold text-white hover:bg-orange-500 disabled:opacity-50"
-          >
-            DNF
-          </button>
-          <button
-            onClick={() => onVerify("disqualified")}
-            disabled={isBusy || !reason.trim()}
-            className="rounded-lg bg-red-600 px-5 py-2 text-sm font-semibold text-white hover:bg-red-500 disabled:opacity-50"
-          >
-            Disqualify
+            ✓ Verify
           </button>
         </div>
       </div>
-
-      {/* §10 — Audit trail (admin/mod only) */}
-      {!isJudgeOnly && <div className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
-        <button
-          onClick={loadAudit}
-          className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300"
-        >
-          {auditLoading ? "Loading..." : showAudit ? "▾ Audit Trail" : "▸ Audit Trail"}
-        </button>
-        {showAudit && auditTrail.length > 0 && (
-          <div className="mt-3 space-y-2">
-            {auditTrail.map((e) => (
-              <div key={e.id} className="flex items-start gap-3 border-l-2 border-zinc-200 pl-3 dark:border-zinc-700">
-                <div className="flex-1">
-                  <div className="flex items-center gap-2 text-xs">
-                    <span className="font-semibold text-zinc-700 dark:text-zinc-300">{e.adminName}</span>
-                    <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-mono text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">
-                      {e.action}
-                    </span>
-                    <span className="text-zinc-400">{new Date(e.createdAt).toLocaleString()}</span>
-                  </div>
-                  {e.reason && (
-                    <p className="mt-0.5 text-[11px] text-zinc-500">Reason: {e.reason}</p>
-                  )}
-                  {e.oldValue && e.newValue && (
-                    <div className="mt-1 flex items-center gap-2 text-[10px] font-mono">
-                      <span className="rounded bg-red-50 px-1.5 py-0.5 text-red-600 dark:bg-red-900/20 dark:text-red-400">
-                        {(e.oldValue as Record<string, unknown>).flagStatus as string ?? "—"}
-                      </span>
-                      <span className="text-zinc-400">→</span>
-                      <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-emerald-600 dark:bg-emerald-900/20 dark:text-emerald-400">
-                        {(e.newValue as Record<string, unknown>).flagStatus as string ?? "—"}
-                      </span>
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-        {showAudit && auditTrail.length === 0 && (
-          <p className="mt-2 text-xs text-zinc-400">No audit history for this result.</p>
-        )}
-      </div>}
     </div>
   );
 }
 
-/* ── Scramble viewer ────────────────────────────────────────────────────── */
+/* ── Scramble viewer — full-width image only ─────────────────────────────── */
 
 function ScrambleViewer({ scrambles, solveCount, eventType }: { scrambles: string[]; solveCount: number; eventType: string }) {
   const [index, setIndex] = useState(0);
   const total = Math.min(scrambles.length, solveCount);
 
-  // Reset to 0 when scrambles change (different round)
   useEffect(() => { setIndex(0); }, [scrambles]);
 
   if (total === 0) return null;
@@ -888,115 +893,43 @@ function ScrambleViewer({ scrambles, solveCount, eventType }: { scrambles: strin
   const puzzle = (eventType in EVENTS) ? EVENTS[eventType as EventId].puzzle : "3x3x3";
 
   return (
-    <div className="mb-5 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
-      <div className="mb-3 flex items-center justify-between">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
-          Scramble
-        </h3>
-        <div className="flex items-center gap-2">
+    <div className="relative flex w-1/2 flex-col items-center justify-center px-3 py-3">
+      {/* Left/Right nav buttons */}
+      {total > 1 && (
+        <>
           <button
-            onClick={() => setIndex(Math.max(0, safeIndex - 1))}
-            disabled={safeIndex === 0}
-            className="rounded px-2 py-0.5 text-xs font-semibold text-zinc-500 transition hover:bg-zinc-100 disabled:opacity-30 dark:hover:bg-zinc-800"
+            onClick={() => setIndex((safeIndex - 1 + total) % total)}
+            className="absolute left-1 top-1/2 z-10 -translate-y-1/2 rounded-full bg-zinc-200/80 p-1 text-zinc-600 transition hover:bg-zinc-300 dark:bg-zinc-700/80 dark:text-zinc-300 dark:hover:bg-zinc-600"
           >
-            ‹ Prev
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M8.5 3L4.5 7l4 4" />
+            </svg>
           </button>
-          <span className="font-mono text-xs text-zinc-600 dark:text-zinc-400">
-            {safeIndex + 1} / {total}
-          </span>
           <button
-            onClick={() => setIndex(Math.min(total - 1, safeIndex + 1))}
-            disabled={safeIndex >= total - 1}
-            className="rounded px-2 py-0.5 text-xs font-semibold text-zinc-500 transition hover:bg-zinc-100 disabled:opacity-30 dark:hover:bg-zinc-800"
+            onClick={() => setIndex((safeIndex + 1) % total)}
+            className="absolute right-1 top-1/2 z-10 -translate-y-1/2 rounded-full bg-zinc-200/80 p-1 text-zinc-600 transition hover:bg-zinc-300 dark:bg-zinc-700/80 dark:text-zinc-300 dark:hover:bg-zinc-600"
           >
-            Next ›
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M5.5 3l4 4-4 4" />
+            </svg>
           </button>
-        </div>
+        </>
+      )}
+
+      {/* Scramble image */}
+      <div className="flex h-[160px] w-full items-center justify-center">
+        <TwistyPlayer
+          puzzle={puzzle}
+          scramble={scrambles[safeIndex]}
+          className="h-[150px] w-[200px]"
+        />
       </div>
 
-      {/* Scramble diagram + notation side by side */}
-      <div className="flex gap-4">
-        {/* 2D cube state diagram */}
-        <div className="flex-shrink-0 rounded-lg border border-zinc-100 bg-zinc-50 p-2 dark:border-zinc-800 dark:bg-zinc-900">
-          <TwistyPlayer
-            puzzle={puzzle}
-            scramble={scrambles[safeIndex]}
-            className="h-36 w-36"
-          />
-        </div>
-
-        {/* Text notation */}
-        <div className="flex min-w-0 flex-1 flex-col justify-between">
-          <div className="rounded-md border border-zinc-100 bg-zinc-50 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900">
-            <p className="font-mono text-sm leading-relaxed text-zinc-800 dark:text-zinc-200" style={{ wordBreak: "break-word" }}>
-              {scrambles[safeIndex]}
-            </p>
-          </div>
-
-          {/* Quick-select pills */}
-          {total > 1 && (
-            <div className="mt-2 flex gap-1">
-              {Array.from({ length: total }, (_, i) => (
-                <button
-                  key={i}
-                  onClick={() => setIndex(i)}
-                  className={`rounded px-2 py-0.5 font-mono text-[10px] font-semibold transition ${
-                    i === safeIndex
-                      ? "bg-zinc-800 text-white dark:bg-zinc-200 dark:text-zinc-900"
-                      : "bg-zinc-100 text-zinc-500 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700"
-                  }`}
-                >
-                  S{i + 1}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
+      {/* S1/S2 label at the bottom */}
+      <span className="mt-1 font-mono text-[10px] font-semibold text-zinc-400">
+        S{safeIndex + 1}
+      </span>
     </div>
   );
 }
 
-/* ── Sidebar toggle (workspace header) ──────────────────────────────────── */
-
-function SidebarToggle() {
-  const { collapsed, toggle } = useSidebar();
-  return (
-    <button
-      onClick={toggle}
-      className="hidden rounded-md p-1 text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-600 dark:hover:bg-zinc-800 dark:hover:text-zinc-300 md:block"
-      title={collapsed ? "Show sidebar" : "Hide sidebar"}
-    >
-      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-        {collapsed ? (
-          /* panel-left-open icon */
-          <>
-            <rect x="1" y="2" width="14" height="12" rx="1.5" />
-            <line x1="5.5" y1="2" x2="5.5" y2="14" />
-            <path d="M8.5 6.5L11 8l-2.5 1.5" />
-          </>
-        ) : (
-          /* panel-left-close icon */
-          <>
-            <rect x="1" y="2" width="14" height="12" rx="1.5" />
-            <line x1="5.5" y1="2" x2="5.5" y2="14" />
-            <path d="M11 6.5L8.5 8 11 9.5" />
-          </>
-        )}
-      </svg>
-    </button>
-  );
-}
-
-/* ── Stat card ───────────────────────────────────────────────────────────── */
-
-function StatCard({ label, value, small }: { label: string; value: string; small?: boolean }) {
-  return (
-    <div className="rounded-lg border border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950">
-      <div className="text-[10px] uppercase tracking-wider text-zinc-500">{label}</div>
-      <div className={`font-mono font-bold text-zinc-800 dark:text-zinc-200 ${small ? "text-xs" : "text-base"}`}>
-        {value}
-      </div>
-    </div>
-  );
-}

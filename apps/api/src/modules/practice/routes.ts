@@ -24,7 +24,7 @@ export async function registerPracticeRoutes(app: FastifyInstance, repo: Reposit
   app.post(`${prefix}/practice/sessions`, { preHandler: requireAuth }, async (req, reply) => {
     const userId = req.authClaims!.sub;
     const { eventType, name } = req.body as { eventType: string; name?: string };
-    if (!eventType) return reply.code(400).send({ error: "eventType required" });
+    if (!eventType) return reply.code(400).send({ error: "event_type_required" });
     const session = {
       id: randomUUID(),
       userId,
@@ -33,7 +33,7 @@ export async function registerPracticeRoutes(app: FastifyInstance, repo: Reposit
       createdAt: new Date().toISOString(),
     };
     await repo.practice.createSession(session);
-    return { session };
+    return reply.code(201).send({ session });
   });
 
   app.get(`${prefix}/practice/sessions/:id`, { preHandler: requireAuth }, async (req, reply) => {
@@ -83,7 +83,7 @@ export async function registerPracticeRoutes(app: FastifyInstance, repo: Reposit
     const { timeMs, scramble, penalty, note } = req.body as {
       timeMs: number; scramble: string; penalty?: string; note?: string;
     };
-    if (timeMs == null || !scramble) return reply.code(400).send({ error: "timeMs and scramble required" });
+    if (timeMs == null || !scramble) return reply.code(400).send({ error: "time_ms_and_scramble_required" });
     const validPenalty: "none" | "plus2" | "dnf" = penalty === "plus2" || penalty === "dnf" ? penalty : "none";
     const solve = {
       id: randomUUID(),
@@ -95,7 +95,7 @@ export async function registerPracticeRoutes(app: FastifyInstance, repo: Reposit
       createdAt: new Date().toISOString(),
     };
     await repo.practice.addSolve(solve);
-    return { solve };
+    return reply.code(201).send({ solve });
   });
 
   app.delete(`${prefix}/practice/solves/:id`, { preHandler: requireAuth }, async (req, reply) => {
@@ -179,12 +179,12 @@ export async function registerPracticeRoutes(app: FastifyInstance, repo: Reposit
   app.post(`${prefix}/daily-challenge/submit`, { preHandler: requireAuth }, async (req, reply) => {
     const userId = req.authClaims!.sub;
     const { timeMs, penalty } = req.body as { timeMs: number; penalty?: string };
-    if (!timeMs || timeMs <= 0) return reply.code(400).send({ error: "valid timeMs required" });
+    if (!timeMs || timeMs <= 0) return reply.code(400).send({ error: "invalid_time_ms" });
     const validPenalty = penalty === "plus2" || penalty === "dnf" ? penalty : "none";
 
     const today = new Date().toISOString().slice(0, 10);
     const challenge = await repo.dailyChallenge.findByDate(today);
-    if (!challenge) return reply.code(404).send({ error: "no challenge today" });
+    if (!challenge) return reply.code(404).send({ error: "no_challenge_today" });
 
     const existing = await repo.dailyChallenge.findResultByUserAndChallenge(userId, challenge.id);
     if (existing) return reply.code(409).send({ error: "already_submitted" });
@@ -199,6 +199,6 @@ export async function registerPracticeRoutes(app: FastifyInstance, repo: Reposit
     };
     await repo.dailyChallenge.submitResult(result);
     const streak = await repo.dailyChallenge.findUserStreak(userId);
-    return { result, streak };
+    return reply.code(201).send({ result, streak });
   });
 }

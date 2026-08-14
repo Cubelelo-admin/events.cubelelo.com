@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import type { Repository } from "../../db/repo";
 import { sanitizeUser } from "../../db/types";
-import { requireAuth } from "../../auth/plugin";
+import { requireAuth, resolveUser } from "../../auth/plugin";
+import { isAdminOrMod } from "../../auth/ownership";
 import type { Solve } from "@cubers/types";
 import { env } from "../../config/env";
 import { getStorage } from "../../lib/storage";
@@ -27,8 +28,11 @@ export async function registerUserRoutes(
   app: FastifyInstance,
   repo: Repository,
 ): Promise<void> {
+  // Authenticated: a two-character query returns real names and CL IDs, so
+  // leaving it open exposed the whole user directory to enumeration.
   app.get<{ Querystring: { q?: string } }>(
     "/api/v1/users/search",
+    { preHandler: requireAuth },
     async (req, reply) => {
       const q = req.query.q?.trim();
       if (!q || q.length < 2)
@@ -265,7 +269,7 @@ export async function registerUserRoutes(
         wcaId: formatted,
         wcaVerified: false,
       });
-      if (!updated) return reply.code(404).send({ error: "not_synced" });
+      if (!updated) return reply.code(403).send({ error: "not_synced" });
 
       return { wcaId: updated.wcaId, wcaVerified: updated.wcaVerified, pendingReview: true };
     },
@@ -295,7 +299,7 @@ export async function registerUserRoutes(
       const avatarUrl = await storage.upload(filename, buffer, `image/${ext === "jpg" ? "jpeg" : ext}`);
 
       const updated = await repo.users.update(req.authClaims!.sub, { avatarUrl });
-      if (!updated) return reply.code(404).send({ error: "not_synced" });
+      if (!updated) return reply.code(403).send({ error: "not_synced" });
 
       return { avatarUrl };
     },
@@ -316,7 +320,7 @@ export async function registerUserRoutes(
         }
       }
       const updated = await repo.users.update(req.authClaims!.sub, fields);
-      if (!updated) return reply.code(404).send({ error: "not_synced" });
+      if (!updated) return reply.code(403).send({ error: "not_synced" });
       return sanitizeUser(updated);
     },
   );
@@ -329,16 +333,13 @@ export async function registerUserRoutes(
       if (!q || q.length < 2)
         return reply.code(400).send({ error: "query_too_short" });
 
-      let userRole: string | undefined;
-      try {
-        if (req.authClaims?.sub) {
-          const u = await repo.users.findById(req.authClaims.sub);
-          userRole = u?.role;
-        }
-      } catch {}
+      const caller = await resolveUser(repo, req);
 
+      // Competitions, announcements and pages are public. People are not — a
+      // signed-out visitor searching two characters could otherwise walk the
+      // entire user directory.
       const [users, competitions, announcements, pages] = await Promise.all([
-        repo.users.findAll(q),
+        caller ? repo.users.findAll(q) : Promise.resolve([]),
         repo.competitions.findAll(q),
         repo.announcements.findAll(true),
         repo.contentPages.findAll(true),
@@ -386,7 +387,7 @@ export async function registerUserRoutes(
       const results: SearchItem[] = [...matchedComps, ...matchedUsers, ...matchedAnnouncements, ...matchedPages];
 
       // Admin pages only for admin/moderator
-      if (userRole === "admin" || userRole === "super_admin" || userRole === "moderator") {
+      if (isAdminOrMod(caller)) {
         const adminPages = [
           { slug: "competitions", title: "Admin: Competitions" },
           { slug: "users", title: "Admin: Users" },

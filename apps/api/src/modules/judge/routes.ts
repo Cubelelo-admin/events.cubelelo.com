@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import type { FlagStatus } from "@cubers/types";
+import type { FlagStatus, SolvePenalty } from "@cubers/types";
 import type { Repository } from "../../db/repo";
 import type { AuditLogEntry } from "../../db/types";
 import { requireRole } from "../../auth/plugin";
 import { shortlistRound, reshortlistAdvancedRound } from "../../lib/roundLifecycle";
-import { applyResultOverride } from "../../lib/resultStats";
+import { applyResultOverride, parseSolvePenalties, requiresAttemptPenalties } from "../../lib/resultStats";
 import { computePriority } from "../../lib/flagEngine";
 import type { Realtime } from "../../sockets/realtime";
 
@@ -112,7 +112,13 @@ export async function registerJudgeRoutes(
   // Judge verifies a result
   app.post<{
     Params: { id: string };
-    Body: { action?: FlagStatus; reason?: string; comment?: string };
+    Body: {
+      action?: FlagStatus;
+      reason?: string;
+      comment?: string;
+      /** Per-attempt penalties, parallel to the result's solves. null = unchanged. */
+      solvePenalties?: (SolvePenalty | null)[];
+    };
   }>("/api/v1/judge/results/:id/verify", judgeOrAbove, async (req, reply) => {
     const judgeId = req.authClaims!.sub;
     const result = await repo.results.findById(req.params.id);
@@ -135,6 +141,13 @@ export async function registerJudgeRoutes(
     if (["plus2", "dnf", "disqualified"].includes(action) && !req.body?.reason)
       return reply.code(400).send({ error: "reason_required" });
 
+    const solvePenalties = parseSolvePenalties(req.body?.solvePenalties, result.solves.length);
+    if (solvePenalties === "invalid")
+      return reply.code(400).send({ error: "invalid_solve_penalties" });
+    // A +2 or DNF belongs to a specific attempt; refuse to guess which.
+    if (requiresAttemptPenalties(action) && !solvePenalties)
+      return reply.code(400).send({ error: "attempt_penalties_required" });
+
     const now = new Date().toISOString();
 
     await repo.results.update(result.id, {
@@ -151,15 +164,23 @@ export async function registerJudgeRoutes(
       action: `judge_result_${action}`,
       target: result.id,
       reason: req.body?.reason,
-      oldValue: JSON.stringify({ flagStatus: result.flagStatus, flagReasons: result.flagReasons }),
-      newValue: JSON.stringify({ flagStatus: action, comment: req.body?.comment || null }),
+      oldValue: JSON.stringify({
+        flagStatus: result.flagStatus,
+        flagReasons: result.flagReasons,
+        judgeOverrides: result.judgeOverrides ?? null,
+      }),
+      newValue: JSON.stringify({
+        flagStatus: action,
+        comment: req.body?.comment || null,
+        solvePenalties: solvePenalties ?? null,
+      }),
       createdAt: now,
     };
     await repo.auditLog.create(entry);
 
     // Re-derive stats under the action, re-rank, rebuild the user's PB,
     // and broadcast the corrected leaderboard (HIGH-009).
-    await applyResultOverride(repo, realtime, result, action);
+    await applyResultOverride(repo, realtime, result, action, solvePenalties);
 
     // Auto-shortlist if no more flagged results
     const round = await repo.rounds.findById(result.roundId);

@@ -1,17 +1,36 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { isEventId } from "@cubers/scramble-core";
-import type { CompStatus, CompType, FlagStatus } from "@cubers/types";
+import type { CompStatus, CompType, FlagStatus, SolvePenalty } from "@cubers/types";
+import { defaultFormatForEvent } from "@cubers/types";
 import type { Repository } from "../../db/repo";
 import { type Competition, type CompetitionEvent, type Round, type AuditLogEntry, type Announcement, type PromoCode, type Appeal, type RankTier, type Banner, type FaqEntry, type ContentPage, type PersonalBest, sanitizeUser } from "../../db/types";
 import type { Realtime } from "../../sockets/realtime";
-import { requireRole } from "../../auth/plugin";
+import { requireRole, requireAuth } from "../../auth/plugin";
+import { promoLimiter } from "../../lib/rateLimiter";
+import {
+  createOwnershipChecks,
+  isAdmin as isAdminRole,
+  isStaff,
+  isSuperAdmin,
+} from "../../auth/ownership";
 import { effectiveCompStatus, effectiveRoundStatus } from "../../lib/statusUtils";
 import { shortlistRound, reshortlistAdvancedRound, ensureScramblesGenerated } from "../../lib/roundLifecycle";
-import { validateCompetitionSchedule, validateScheduleFields } from "../../lib/scheduleValidation";
+import { validateCompetitionSchedule, validateScheduleFields, validateForPublish } from "../../lib/scheduleValidation";
+import {
+  applyCompetitionFields,
+  buildRoundFields,
+  clampRoundCount,
+  parseRuleSetIds,
+  COMP_TYPES,
+  type CompetitionEventInput,
+  type CompetitionInput,
+  type CreateOnlyInput,
+  type RoundFields,
+} from "./competitionInput";
 import { collectCertificateData, generateCertificatePDF } from "../../lib/certificate";
 import { emailService, sendBulk, roundNotificationEmail, bulkEmail, migrationEmail, staffWelcomeEmail } from "../../lib/email";
-import { applyResultOverride } from "../../lib/resultStats";
+import { applyResultOverride, parseSolvePenalties, requiresAttemptPenalties } from "../../lib/resultStats";
 import { scheduleRoundJobs } from "../../lib/roundScheduler";
 import { transferUserData } from "../../lib/accountTransfer";
 import { ZipArchive } from "archiver";
@@ -19,7 +38,9 @@ import { ANTICHEAT_THRESHOLDS, DEFAULT_ANTICHEAT_THRESHOLD } from "../../lib/eve
 import { computeFlags, computePriority } from "../../lib/flagEngine";
 import { getQueue } from "../../lib/jobQueue";
 
-const COMP_TYPES: CompType[] = ["paid", "free", "practice"];
+/** Video deadline applied when a competition does not set its own. */
+const DEFAULT_VIDEO_DEADLINE_MINUTES = 1440;
+
 const COMP_STATUSES: CompStatus[] = [
   "draft", "published", "registration_open", "registration_closed",
   "cancelled", "live", "results_pending", "completed",
@@ -36,273 +57,179 @@ export async function registerAdminRoutes(
 
   // ── Helpers: moderator ownership checks ──────────────────────────────────
 
-  /** Returns the competition if the caller is admin OR moderator who created it. */
-  async function ownedComp(
-    req: import("fastify").FastifyRequest,
-    reply: import("fastify").FastifyReply,
-    compId: string,
-  ): Promise<Competition | null> {
-    const comp = await repo.competitions.findById(compId);
-    if (!comp) { reply.code(404).send({ error: "competition_not_found" }); return null; }
-    const user = await repo.users.findById(req.authClaims!.sub);
-    if (!user) { reply.code(403).send({ error: "forbidden" }); return null; }
-    if (user.role === "admin" || user.role === "super_admin") return comp;
-    if (user.role === "moderator" && comp.createdBy === user.id) return comp;
-    reply.code(403).send({ error: "forbidden" });
-    return null;
-  }
-
-  /** Ownership check via round → competition event → competition. */
-  async function ownedCompByRound(
-    req: import("fastify").FastifyRequest,
-    reply: import("fastify").FastifyReply,
-    roundId: string,
-  ): Promise<Competition | null> {
-    const round = await repo.rounds.findById(roundId);
-    if (!round) { reply.code(404).send({ error: "round_not_found" }); return null; }
-    const ev = await repo.competitionEvents.findById(round.competitionEventId);
-    if (!ev) { reply.code(404).send({ error: "event_not_found" }); return null; }
-    return ownedComp(req, reply, ev.competitionId);
-  }
-
-  /** Ownership check via competition event → competition. */
-  async function ownedCompByEvent(
-    req: import("fastify").FastifyRequest,
-    reply: import("fastify").FastifyReply,
-    eventId: string,
-  ): Promise<Competition | null> {
-    const ev = await repo.competitionEvents.findById(eventId);
-    if (!ev) { reply.code(404).send({ error: "event_not_found" }); return null; }
-    return ownedComp(req, reply, ev.competitionId);
-  }
-
-  /** Ownership check via result → round → event → competition. */
-  async function ownedCompByResult(
-    req: import("fastify").FastifyRequest,
-    reply: import("fastify").FastifyReply,
-    resultId: string,
-  ): Promise<Competition | null> {
-    const result = await repo.results.findById(resultId);
-    if (!result) { reply.code(404).send({ error: "result_not_found" }); return null; }
-    return ownedCompByRound(req, reply, result.roundId);
-  }
+  const { ownedComp, ownedCompByRound, ownedCompByEvent, ownedCompByResult } =
+    createOwnershipChecks(repo);
 
   /** Check if the caller is admin (not just moderator). */
   async function isAdmin(req: import("fastify").FastifyRequest): Promise<boolean> {
-    const user = await repo.users.findById(req.authClaims!.sub);
-    return user?.role === "admin" || user?.role === "super_admin";
+    return isAdminRole(await repo.users.findById(req.authClaims!.sub));
+  }
+
+  /**
+   * Validate a `ruleSetIds` payload and confirm every id exists.
+   *
+   * Checked before anything is written, so an unknown id returns 400 rather than
+   * surfacing as a foreign-key violation mid-write.
+   */
+  async function resolveRuleSetIds(
+    raw: unknown,
+  ): Promise<{ ok: true; ids: string[] | undefined } | { ok: false; code: string }> {
+    const parsed = parseRuleSetIds(raw);
+    if (parsed === "invalid") return { ok: false, code: "invalid_rule_set_ids" };
+    if (parsed === undefined) return { ok: true, ids: undefined };
+    if (parsed.length > 0) {
+      const found = await repo.ruleSets.findByIds(parsed);
+      if (found.size !== parsed.length) return { ok: false, code: "rule_set_not_found" };
+    }
+    return { ok: true, ids: parsed };
   }
 
   // ── Competitions ──────────────────────────────────────────────────────────
 
-  app.post<{
-    Body: {
-      title?: string;
-      type?: CompType;
-      description?: string;
-      rulesMd?: string;
-      ruleSetId?: string;
-      baseFee?: number;
-      perEventFee?: number;
-      registrationOpensAt?: string;
-      registrationDeadline?: string;
-      startsAt?: string;
-      endsAt?: string;
-      saveAsDraft?: boolean;
-      registrationLimit?: number;
-      eventType?: string;
-      roundCount?: number;
-      events?: Array<{
-        eventType: string;
-        roundCount?: number;
-        cutoffMs?: number;
-        timeLimitMs?: number;
-        fee?: number;
-        advancementCount?: number;
-        advancementCriteria?: { method: string; rankLimit?: number; timeLimitMs?: number; bestSingleMs?: number };
-        roundCriteria?: Array<{ method: string; rankLimit?: number; timeLimitMs?: number; bestSingleMs?: number } | null>;
-        roundSchedule?: Array<{ startTime?: string; durationMinutes?: number } | null>;
-        durationMinutes?: number;
-      }>;
-    };
-  }>("/api/v1/admin/competitions", adminOrMod, async (req, reply) => {
-    const { title, type, description, rulesMd, ruleSetId, baseFee, perEventFee,
-            registrationOpensAt, registrationDeadline, startsAt, endsAt, saveAsDraft,
-            registrationLimit } =
-      req.body ?? {};
-    if (!title || typeof title !== "string")
-      return reply.code(400).send({ error: "missing_title" });
+  app.post<{ Body: CompetitionInput & CreateOnlyInput }>(
+    "/api/v1/admin/competitions",
+    adminOrMod,
+    async (req, reply) => {
+      const body = req.body ?? {};
+      const { saveAsDraft } = body;
 
-    const existing = await repo.competitions.findByTitle(title);
-    if (existing)
-      return reply.code(409).send({ error: "duplicate_title" });
+      const title = typeof body.title === "string" ? body.title.trim() : "";
+      if (!title) return reply.code(400).send({ error: "missing_title" });
 
-    const user = await repo.users.findById(req.authClaims!.sub);
-    const now = new Date().toISOString();
-    const compId = randomUUID();
+      const existing = await repo.competitions.findByTitle(title);
+      if (existing) return reply.code(409).send({ error: "duplicate_title" });
 
-    const competition: Competition = {
-      id: compId,
-      title,
-      type: type && COMP_TYPES.includes(type) ? type : "free",
-      status: "draft",
-      description: typeof description === "string" ? description : undefined,
-      rulesMd: typeof rulesMd === "string" ? rulesMd : undefined,
-      baseFee: typeof baseFee === "number" ? baseFee : 0,
-      perEventFee: typeof perEventFee === "number" ? perEventFee : 0,
-      registrationOpensAt: typeof registrationOpensAt === "string" ? registrationOpensAt : undefined,
-      registrationDeadline: typeof registrationDeadline === "string" ? registrationDeadline : undefined,
-      startsAt: typeof startsAt === "string" ? startsAt : undefined,
-      endsAt: typeof endsAt === "string" ? endsAt : undefined,
-      featured: false,
-      videoDeadlineMinutes: 1440,
-      registrationLimit: typeof registrationLimit === "number" && registrationLimit > 0 ? registrationLimit : undefined,
-      ruleSetId: typeof ruleSetId === "string" ? ruleSetId : undefined,
-      createdBy: user?.id,
-      createdAt: now,
-    };
+      const user = await repo.users.findById(req.authClaims!.sub);
+      const now = new Date().toISOString();
+      const compId = randomUUID();
 
-    const eventSpecs = req.body?.events?.length
-      ? req.body.events
-      : req.body?.eventType
-        ? [{ eventType: req.body.eventType, roundCount: req.body.roundCount }]
-        : [];
+      // Same reducer the PATCH handler uses, so any field settable on one
+      // endpoint is settable on the other.
+      const fields: Partial<Competition> = {};
+      const applied = applyCompetitionFields(body, fields, { isAdmin: isAdminRole(user) });
+      if (!applied.ok) return reply.code(applied.status).send({ error: applied.code });
 
-    const validSpecs = eventSpecs.filter((s) => s.eventType && isEventId(s.eventType));
-    if (eventSpecs.length > 0 && validSpecs.length === 0)
-      return reply.code(400).send({ error: "invalid_event_type" });
+      const ruleSets = await resolveRuleSetIds(body.ruleSetIds);
+      if (!ruleSets.ok) return reply.code(400).send({ error: ruleSets.code });
 
-    await repo.competitions.create(competition);
-
-    for (const spec of validSpecs) {
-      const rounds = Math.max(1, Math.min(spec.roundCount ?? 1, 10));
-      const event: CompetitionEvent = {
-        id: randomUUID(),
-        competitionId: compId,
-        eventType: spec.eventType,
-        roundCount: rounds,
-        cutoffMs: spec.cutoffMs,
-        timeLimitMs: spec.timeLimitMs,
-        fee: spec.fee,
+      const competition: Competition = {
+        id: compId,
+        title,
+        type: fields.type ?? "free",
+        status: "draft",
+        baseFee: fields.baseFee ?? 0,
+        perEventFee: fields.perEventFee ?? 0,
+        featured: fields.featured ?? false,
+        videoDeadlineMinutes: fields.videoDeadlineMinutes ?? DEFAULT_VIDEO_DEADLINE_MINUTES,
+        ...fields,
+        createdBy: user?.id,
+        createdAt: now,
       };
-      await repo.competitionEvents.create(event);
 
-      for (let i = 1; i <= rounds; i++) {
-        const rc = spec.roundCriteria?.[i - 1];
-        const fallback = i < rounds && spec.advancementCriteria ? spec.advancementCriteria : undefined;
-        const criteria = rc ?? fallback;
-        const rs = spec.roundSchedule?.[i - 1];
-        const roundDuration = rs?.durationMinutes ?? spec.durationMinutes;
-        const opensAt = rs?.startTime;
-        let closesAt: string | undefined;
-        if (opensAt && roundDuration) {
-          const close = new Date(new Date(opensAt).getTime() + roundDuration * 60_000);
-          closesAt = close.toISOString();
+      const eventSpecs: CompetitionEventInput[] = body.events?.length
+        ? body.events
+        : body.eventType
+          ? [{ eventType: body.eventType, roundCount: body.roundCount }]
+          : [];
+
+      // Reject the whole request on any invalid event type. Previously only an
+      // all-invalid array 400'd, so a mixed array silently dropped entries.
+      const invalid = eventSpecs.find((s) => !s.eventType || !isEventId(s.eventType));
+      if (invalid) return reply.code(400).send({ error: "invalid_event_type" });
+
+      // Validate every round's criteria before writing anything, so a bad spec
+      // cannot leave a half-built competition behind.
+      const plans: { spec: CompetitionEventInput; rounds: number; roundFields: RoundFields[] }[] = [];
+      for (const spec of eventSpecs) {
+        const rounds = clampRoundCount(spec.roundCount);
+        const roundFields: RoundFields[] = [];
+        for (let i = 1; i <= rounds; i++) {
+          const built = buildRoundFields(spec, i, rounds);
+          if (!built.ok) return reply.code(400).send({ error: built.code });
+          roundFields.push(built.fields);
         }
-        const round: Round = {
+        plans.push({ spec, rounds, roundFields });
+      }
+
+      await repo.competitions.create(competition);
+      if (ruleSets.ids) await repo.competitionRuleSets.replace(compId, ruleSets.ids);
+
+      for (const { spec, rounds, roundFields } of plans) {
+        const event: CompetitionEvent = {
           id: randomUUID(),
-          competitionEventId: event.id,
-          roundNumber: i,
-          status: "pending",
-          advancementCount: i < rounds ? (spec.advancementCount ?? undefined) : undefined,
-          advancementCriteria: criteria
-            ? { method: criteria.method as "rank" | "time" | "best_single",
-                rankLimit: criteria.rankLimit,
-                timeLimitMs: criteria.timeLimitMs,
-                bestSingleMs: criteria.bestSingleMs }
-            : undefined,
-          opensAt,
-          closesAt,
-          durationMinutes: roundDuration,
+          competitionId: compId,
+          eventType: spec.eventType,
+          roundCount: rounds,
+          cutoffMs: spec.cutoffMs,
+          timeLimitMs: spec.timeLimitMs,
+          fee: spec.fee,
+          archived: spec.archived ?? false,
         };
-        await repo.rounds.create(round);
-        if (round.opensAt || round.closesAt) await scheduleRoundJobs(round);
-      }
-    }
+        await repo.competitionEvents.create(event);
 
-    // saveAsDraft = true keeps it as draft (default). If false, publish immediately.
-    if (saveAsDraft === false) {
-      await repo.competitions.update(compId, { status: "published", publishedBy: req.authClaims!.sub });
-      const allRounds = await repo.rounds.findByCompetition(compId);
-      for (const round of allRounds) {
-        await ensureScramblesGenerated(repo, round);
+        for (let i = 1; i <= rounds; i++) {
+          const round: Round = {
+            id: randomUUID(),
+            competitionEventId: event.id,
+            roundNumber: i,
+            status: "pending",
+            ...roundFields[i - 1]!,
+          };
+          await repo.rounds.create(round);
+          if (round.opensAt || round.closesAt) await scheduleRoundJobs(round);
+        }
       }
-    }
 
-    return reply.code(201).send({ id: compId, status: saveAsDraft === false ? "published" : "draft" });
-  });
+      // saveAsDraft = true keeps it as draft (default). If false, publish now —
+      // through the same gate as PATCH {status:"published"}, which this path
+      // used to bypass entirely.
+      if (saveAsDraft === false) {
+        const allRounds = await repo.rounds.findByCompetition(compId);
+        const allEvents = await repo.competitionEvents.findByCompetition(compId);
+        const check = validateForPublish(competition, allRounds, allEvents);
+        if (!check.valid) {
+          return reply.code(400).send({
+            error: competition.bannerUrl ? "schedule_validation_failed" : "banner_required",
+            errors: check.errors,
+          });
+        }
+        await repo.competitions.update(compId, { status: "published", publishedBy: req.authClaims!.sub });
+        for (const round of allRounds) {
+          await ensureScramblesGenerated(repo, round);
+        }
+      }
+
+      return reply.code(201).send({ id: compId, status: saveAsDraft === false ? "published" : "draft" });
+    },
+  );
 
   // Edit competition fields (includes featured toggle and status)
   app.patch<{
     Params: { id: string };
-    Body: {
-      title?: string;
-      status?: CompStatus;
-      description?: string;
-      rulesMd?: string;
-      ruleSetId?: string | null;
-      baseFee?: number;
-      perEventFee?: number;
-      registrationOpensAt?: string;
-      registrationDeadline?: string;
-      startsAt?: string;
-      endsAt?: string;
-      featured?: boolean;
-      featuredOrder?: number;
-      coverCaption?: string;
-      coverUrl?: string;
-      bannerUrl?: string;
-      mobileBannerUrl?: string;
-      cancellationReason?: string;
-      events?: Array<{
-        eventType: string;
-        roundCount?: number;
-        cutoffMs?: number;
-        timeLimitMs?: number;
-        fee?: number;
-        durationMinutes?: number;
-        advancementCount?: number;
-        advancementCriteria?: { method: string; rankLimit?: number; timeLimitMs?: number; bestSingleMs?: number };
-        roundCriteria?: Array<{ method: string; rankLimit?: number; timeLimitMs?: number; bestSingleMs?: number } | undefined>;
-        roundSchedule?: Array<{ startTime?: string; durationMinutes?: number } | undefined>;
-      }>;
-    };
+    Body: CompetitionInput & { status?: CompStatus; cancellationReason?: string };
   }>("/api/v1/admin/competitions/:id", adminOrMod, async (req, reply) => {
     if (!(await ownedComp(req, reply, req.params.id))) return;
-    const {
-      title, status, description, rulesMd, baseFee, perEventFee,
-      registrationOpensAt, registrationDeadline, startsAt, endsAt,
-      featured, featuredOrder, coverCaption, coverUrl, bannerUrl, mobileBannerUrl,
-      cancellationReason, ruleSetId,
-    } = req.body ?? {};
+    const body = req.body ?? {};
+    const { status, cancellationReason } = body;
 
     const fields: Partial<Competition> = {};
-    if (typeof title === "string") {
-      const dup = await repo.competitions.findByTitle(title);
+
+    if (typeof body.title === "string") {
+      const dup = await repo.competitions.findByTitle(body.title.trim());
       if (dup && dup.id !== req.params.id)
         return reply.code(409).send({ error: "duplicate_title" });
-      fields.title = title;
     }
-    if (typeof description === "string") fields.description = description;
-    if (typeof rulesMd === "string") fields.rulesMd = rulesMd;
-    if (typeof baseFee === "number") fields.baseFee = baseFee;
-    if (typeof perEventFee === "number") fields.perEventFee = perEventFee;
-    if (typeof registrationOpensAt === "string") fields.registrationOpensAt = registrationOpensAt;
-    if (typeof registrationDeadline === "string") fields.registrationDeadline = registrationDeadline;
-    if (typeof startsAt === "string") fields.startsAt = startsAt;
-    if (typeof endsAt === "string") fields.endsAt = endsAt;
+
+    // Same reducer the create handler uses.
+    const caller = await repo.users.findById(req.authClaims!.sub);
+    const applied = applyCompetitionFields(body, fields, { isAdmin: isAdminRole(caller) });
+    if (!applied.ok) return reply.code(applied.status).send({ error: applied.code });
+
+    const ruleSets = await resolveRuleSetIds(body.ruleSetIds);
+    if (!ruleSets.ok) return reply.code(400).send({ error: ruleSets.code });
+
     if (status && COMP_STATUSES.includes(status)) fields.status = status;
-    if (typeof featured === "boolean") {
-      if (!(await isAdmin(req))) return reply.code(403).send({ error: "featured_admin_only" });
-      fields.featured = featured;
-    }
-    if (typeof featuredOrder === "number") fields.featuredOrder = featuredOrder;
-    if (typeof coverCaption === "string") fields.coverCaption = coverCaption;
-    if (typeof coverUrl === "string") fields.coverUrl = coverUrl;
-    if (typeof bannerUrl === "string") fields.bannerUrl = bannerUrl;
-    if (typeof mobileBannerUrl === "string") fields.mobileBannerUrl = mobileBannerUrl;
     if (typeof cancellationReason === "string") fields.cancellationReason = cancellationReason;
-    if (typeof ruleSetId === "string" || ruleSetId === null) fields.ruleSetId = ruleSetId ?? undefined;
 
     if (status === "cancelled" && !cancellationReason?.trim()) {
       return reply.code(400).send({ error: "cancellation_reason_required" });
@@ -327,14 +254,14 @@ export async function registerAdminRoutes(
       }
 
       if (fields.status === "published") {
-        if (!merged.bannerUrl) {
-          return reply.code(400).send({ error: "banner_required", errors: ["Desktop banner is required before publishing"] });
-        }
         const rounds = await repo.rounds.findByCompetition(req.params.id);
         const events = await repo.competitionEvents.findByCompetition(req.params.id);
-        const result = validateCompetitionSchedule(merged, rounds, true, events);
+        const result = validateForPublish(merged, rounds, events);
         if (!result.valid) {
-          return reply.code(400).send({ error: "schedule_validation_failed", errors: result.errors });
+          return reply.code(400).send({
+            error: merged.bannerUrl ? "schedule_validation_failed" : "banner_required",
+            errors: result.errors,
+          });
         }
       }
     }
@@ -342,6 +269,8 @@ export async function registerAdminRoutes(
     if (fields.status === "published") {
       (fields as Record<string, unknown>).publishedBy = req.authClaims!.sub;
     }
+    if (ruleSets.ids) await repo.competitionRuleSets.replace(req.params.id, ruleSets.ids);
+
     const updated = await repo.competitions.update(req.params.id, fields);
 
     if (!updated) return reply.code(404).send({ error: "competition_not_found" });
@@ -352,66 +281,78 @@ export async function registerAdminRoutes(
       const existingEvents = await repo.competitionEvents.findByCompetition(req.params.id);
       const existingRounds = await repo.rounds.findByCompetition(req.params.id);
 
-      for (const spec of eventSpecs) {
-        if (!spec.eventType || !isEventId(spec.eventType)) continue;
-        const rounds = Math.max(1, Math.min(spec.roundCount ?? 1, 10));
+      // Reject any invalid event type outright rather than skipping it silently.
+      const badSpec = eventSpecs.find((s) => !s.eventType || !isEventId(s.eventType));
+      if (badSpec) return reply.code(400).send({ error: "invalid_event_type" });
 
-        const existing = existingEvents.find((e) => e.eventType === spec.eventType && !e.archived);
+      // Validate every round's criteria up front so a bad spec cannot leave the
+      // competition half-reconciled.
+      const plans: { spec: CompetitionEventInput; rounds: number; roundFields: RoundFields[] }[] = [];
+      for (const spec of eventSpecs) {
+        const rounds = clampRoundCount(spec.roundCount);
+        const roundFields: RoundFields[] = [];
+        for (let i = 1; i <= rounds; i++) {
+          const built = buildRoundFields(spec, i, rounds);
+          if (!built.ok) return reply.code(400).send({ error: built.code });
+          roundFields.push(built.fields);
+        }
+        plans.push({ spec, rounds, roundFields });
+      }
+
+      for (const { spec, rounds, roundFields } of plans) {
+        // Match archived events too. Filtering them out meant re-adding an
+        // archived event type inserted a duplicate row, violating
+        // `unique (competition_id, event_type)` as an unhandled 500.
+        const existing = existingEvents.find((e) => e.eventType === spec.eventType);
         if (existing) {
           const evFields: Partial<CompetitionEvent> = {};
           if (spec.cutoffMs !== undefined) evFields.cutoffMs = spec.cutoffMs;
           if (spec.timeLimitMs !== undefined) evFields.timeLimitMs = spec.timeLimitMs;
           if (spec.fee !== undefined) evFields.fee = spec.fee;
           if (rounds !== existing.roundCount) evFields.roundCount = rounds;
+          // An explicit `archived` wins, so the events array can archive as well
+          // as un-archive. Otherwise, re-adding an archived event un-archives it.
+          if (spec.archived !== undefined) evFields.archived = spec.archived;
+          else if (existing.archived) evFields.archived = false;
           if (Object.keys(evFields).length > 0) {
             await repo.competitionEvents.update(existing.id, evFields);
           }
 
           const eventRounds = existingRounds.filter((r) => r.competitionEventId === existing.id);
 
-          // Create missing round rows
           for (let i = 1; i <= rounds; i++) {
-            if (eventRounds.some((r) => r.roundNumber === i)) {
-              // Update existing round's schedule if provided
-              const er = eventRounds.find((r) => r.roundNumber === i)!;
-              const rs = spec.roundSchedule?.[i - 1];
-              const rc = spec.roundCriteria?.[i - 1];
+            const planned = roundFields[i - 1]!;
+            const er = eventRounds.find((r) => r.roundNumber === i);
+
+            if (er) {
+              // Existing round: only schedule and criteria are reconciled here.
+              // Cutoff, time limit and format stay under the round's own control
+              // (see `applyToExistingRounds` below) so a per-round override is
+              // not silently clobbered by an event-level edit.
               const rFields: Partial<Round> = {};
-              if (rs?.startTime) rFields.opensAt = rs.startTime;
-              if (rs?.durationMinutes) {
-                rFields.durationMinutes = rs.durationMinutes;
-                if (rs.startTime) {
-                  rFields.closesAt = new Date(new Date(rs.startTime).getTime() + rs.durationMinutes * 60_000).toISOString();
-                }
+              if (planned.opensAt) rFields.opensAt = planned.opensAt;
+              if (planned.durationMinutes) {
+                rFields.durationMinutes = planned.durationMinutes;
+                if (planned.closesAt) rFields.closesAt = planned.closesAt;
               }
-              if (rc) {
-                rFields.advancementCriteria = { method: rc.method as "rank" | "time" | "best_single", rankLimit: rc.rankLimit, timeLimitMs: rc.timeLimitMs, bestSingleMs: rc.bestSingleMs };
+              if (spec.roundCriteria?.[i - 1] !== undefined) {
+                rFields.advancementCriteria = planned.advancementCriteria;
+              }
+              // Explicit opt-in to push the event's cutoff / time limit down.
+              if (spec.applyToExistingRounds) {
+                if (spec.cutoffMs !== undefined) rFields.cutoffMs = spec.cutoffMs;
+                if (spec.timeLimitMs !== undefined) rFields.timeLimitMs = spec.timeLimitMs;
               }
               if (Object.keys(rFields).length > 0) await repo.rounds.update(er.id, rFields);
               continue;
             }
-            const rc = spec.roundCriteria?.[i - 1];
-            const fallback = i < rounds && spec.advancementCriteria ? spec.advancementCriteria : undefined;
-            const criteria = rc ?? fallback;
-            const rs = spec.roundSchedule?.[i - 1];
-            const roundDuration = rs?.durationMinutes ?? spec.durationMinutes;
-            const opensAt = rs?.startTime;
-            let closesAt: string | undefined;
-            if (opensAt && roundDuration) {
-              closesAt = new Date(new Date(opensAt).getTime() + roundDuration * 60_000).toISOString();
-            }
+
             const round: Round = {
               id: randomUUID(),
               competitionEventId: existing.id,
               roundNumber: i,
               status: "pending",
-              advancementCount: i < rounds ? (spec.advancementCount ?? undefined) : undefined,
-              advancementCriteria: criteria
-                ? { method: criteria.method as "rank" | "time" | "best_single", rankLimit: criteria.rankLimit, timeLimitMs: criteria.timeLimitMs, bestSingleMs: criteria.bestSingleMs }
-                : undefined,
-              opensAt,
-              closesAt,
-              durationMinutes: roundDuration,
+              ...planned,
             };
             await repo.rounds.create(round);
             if (round.opensAt || round.closesAt) await scheduleRoundJobs(round);
@@ -436,31 +377,18 @@ export async function registerAdminRoutes(
             cutoffMs: spec.cutoffMs,
             timeLimitMs: spec.timeLimitMs,
             fee: spec.fee,
+            archived: spec.archived ?? false,
           };
           await repo.competitionEvents.create(event);
 
           for (let i = 1; i <= rounds; i++) {
-            const rc = spec.roundCriteria?.[i - 1];
-            const fallback = i < rounds && spec.advancementCriteria ? spec.advancementCriteria : undefined;
-            const criteria = rc ?? fallback;
-            const rs = spec.roundSchedule?.[i - 1];
-            const roundDuration = rs?.durationMinutes ?? spec.durationMinutes;
-            const opensAt = rs?.startTime;
-            let closesAt: string | undefined;
-            if (opensAt && roundDuration) {
-              closesAt = new Date(new Date(opensAt).getTime() + roundDuration * 60_000).toISOString();
-            }
             const round: Round = {
               id: randomUUID(),
               competitionEventId: event.id,
               roundNumber: i,
               status: "pending",
-              advancementCriteria: criteria
-                ? { method: criteria.method as "rank" | "time" | "best_single", rankLimit: criteria.rankLimit, timeLimitMs: criteria.timeLimitMs, bestSingleMs: criteria.bestSingleMs }
-                : undefined,
-              opensAt,
-              closesAt,
-              durationMinutes: roundDuration,
+              // `advancementCount` used to be omitted on this branch only.
+              ...roundFields[i - 1]!,
             };
             await repo.rounds.create(round);
             if (round.opensAt || round.closesAt) await scheduleRoundJobs(round);
@@ -620,6 +548,9 @@ export async function registerAdminRoutes(
           competitionEventId: event.id,
           roundNumber: srcRound.roundNumber,
           status: "pending",
+          format: srcRound.format,
+          cutoffMs: srcRound.cutoffMs,
+          timeLimitMs: srcRound.timeLimitMs,
           advancementCount: srcRound.advancementCount,
           advancementCriteria: srcRound.advancementCriteria,
           opensAt: copySched ? srcRound.opensAt : undefined,
@@ -704,6 +635,9 @@ export async function registerAdminRoutes(
           competitionEventId: newEventId,
           roundNumber: srcRound.roundNumber,
           status: "pending",
+          format: srcRound.format,
+          cutoffMs: srcRound.cutoffMs,
+          timeLimitMs: srcRound.timeLimitMs,
           advancementCount: srcRound.advancementCount,
           advancementCriteria: srcRound.advancementCriteria,
         });
@@ -885,7 +819,13 @@ export async function registerAdminRoutes(
   // Verify / override a result (admin + moderator + assigned judge)
   app.post<{
     Params: { id: string };
-    Body: { action?: FlagStatus; reason?: string; comment?: string };
+    Body: {
+      action?: FlagStatus;
+      reason?: string;
+      comment?: string;
+      /** Per-attempt penalties, parallel to the result's solves. null = unchanged. */
+      solvePenalties?: (SolvePenalty | null)[];
+    };
   }>("/api/v1/admin/results/:id/verify", adminOrMod, async (req, reply) => {
     if (!(await ownedCompByResult(req, reply, req.params.id))) return;
     const result = await repo.results.findById(req.params.id);
@@ -899,6 +839,13 @@ export async function registerAdminRoutes(
     if (["plus2", "dnf", "disqualified"].includes(action) && !req.body?.reason) {
       return reply.code(400).send({ error: "reason_required" });
     }
+
+    const solvePenalties = parseSolvePenalties(req.body?.solvePenalties, result.solves.length);
+    if (solvePenalties === "invalid")
+      return reply.code(400).send({ error: "invalid_solve_penalties" });
+    // A +2 or DNF belongs to a specific attempt; refuse to guess which.
+    if (requiresAttemptPenalties(action) && !solvePenalties)
+      return reply.code(400).send({ error: "attempt_penalties_required" });
 
     const admin = await repo.users.findById(req.authClaims!.sub);
     const now = new Date().toISOString();
@@ -917,8 +864,16 @@ export async function registerAdminRoutes(
       action: `result_${action}`,
       target: result.id,
       reason: req.body?.reason,
-      oldValue: JSON.stringify({ flagStatus: result.flagStatus, flagReasons: result.flagReasons }),
-      newValue: JSON.stringify({ flagStatus: action, comment: req.body?.comment || null }),
+      oldValue: JSON.stringify({
+        flagStatus: result.flagStatus,
+        flagReasons: result.flagReasons,
+        judgeOverrides: result.judgeOverrides ?? null,
+      }),
+      newValue: JSON.stringify({
+        flagStatus: action,
+        comment: req.body?.comment || null,
+        solvePenalties: solvePenalties ?? null,
+      }),
       createdAt: now,
     };
     await repo.auditLog.create(entry);
@@ -926,7 +881,7 @@ export async function registerAdminRoutes(
     // Re-derive stats under the action, re-rank, rebuild the user's PB,
     // and broadcast the corrected leaderboard. Runs for every action so a
     // "verified" verdict also restores stats from a previous penalty.
-    await applyResultOverride(repo, realtime, result, action);
+    await applyResultOverride(repo, realtime, result, action, solvePenalties);
 
     // Check if shortlisting should trigger (no more flagged results in this round)
     const round = await repo.rounds.findById(result.roundId);
@@ -957,15 +912,17 @@ export async function registerAdminRoutes(
   }>("/api/v1/admin/verification/bulk-verify", adminOrMod, async (req, reply) => {
     const { resultIds, action, reason, comment } = req.body ?? {};
     if (!resultIds || !Array.isArray(resultIds) || resultIds.length === 0)
-      return reply.code(400).send({ error: "resultIds required" });
+      return reply.code(400).send({ error: "result_ids_required" });
     if (!action || !FLAG_ACTIONS.includes(action))
       return reply.code(400).send({ error: "invalid_action" });
     if (resultIds.length > 200)
-      return reply.code(400).send({ error: "max 200 results per bulk action" });
+      return reply.code(400).send({ error: "bulk_limit_exceeded" });
     if (["plus2", "dnf", "disqualified"].includes(action) && !reason)
       return reply.code(400).send({ error: "reason_required" });
     // Ownership check on first result (bulk ops are within a single competition)
-    if (!(await ownedCompByResult(req, reply, resultIds[0]))) return;
+    const firstResultId = resultIds[0];
+    if (!firstResultId) return reply.code(400).send({ error: "result_ids_required" });
+    if (!(await ownedCompByResult(req, reply, firstResultId))) return;
 
     const adminId = req.authClaims!.sub;
     const now = new Date().toISOString();
@@ -1008,9 +965,11 @@ export async function registerAdminRoutes(
   }>("/api/v1/admin/verification/bulk-undo", adminOrMod, async (req, reply) => {
     const { restorations } = req.body ?? {};
     if (!restorations || !Array.isArray(restorations) || restorations.length === 0)
-      return reply.code(400).send({ error: "restorations required" });
+      return reply.code(400).send({ error: "restorations_required" });
     // Ownership check on first result
-    if (!(await ownedCompByResult(req, reply, restorations[0].id))) return;
+    const firstRestoration = restorations[0];
+    if (!firstRestoration) return reply.code(400).send({ error: "restorations_required" });
+    if (!(await ownedCompByResult(req, reply, firstRestoration.id))) return;
 
     const adminId = req.authClaims!.sub;
     const now = new Date().toISOString();
@@ -1163,7 +1122,7 @@ export async function registerAdminRoutes(
     adminOrMod,
     async (req, reply) => {
       const { compId } = req.query;
-      if (!compId) return reply.code(400).send({ error: "compId is required" });
+      if (!compId) return reply.code(400).send({ error: "competition_id_required" });
 
       const comp = await ownedComp(req, reply, compId);
       if (!comp) return;
@@ -1423,7 +1382,7 @@ export async function registerAdminRoutes(
     if (!(await ownedCompByRound(req, reply, roundId))) return;
 
     const judge = await repo.users.findById(judgeId);
-    if (!judge || !["judge", "moderator", "admin"].includes(judge.role))
+    if (!judge || !isStaff(judge))
       return reply.code(400).send({ error: "invalid_judge" });
 
     const round = await repo.rounds.findById(roundId);
@@ -1438,14 +1397,20 @@ export async function registerAdminRoutes(
     };
     await repo.judgeAssignments.create(assignment);
 
-    return { id: assignment.id, judgeId, roundId };
+    return reply.code(201).send({ id: assignment.id, judgeId, roundId });
   });
 
   // Unassign a judge
   app.delete<{ Params: { id: string } }>(
     "/api/v1/admin/verification/assign/:id",
     adminOrMod,
-    async (req) => {
+    async (req, reply) => {
+      // The paired POST checks ownership; without it here a moderator could
+      // unassign judges from any competition, including ones they don't run.
+      const assignment = await repo.judgeAssignments.findById(req.params.id);
+      if (!assignment) return reply.code(404).send({ error: "assignment_not_found" });
+      if (!(await ownedCompByRound(req, reply, assignment.roundId))) return;
+
       await repo.judgeAssignments.delete(req.params.id);
       return { ok: true };
     },
@@ -1455,7 +1420,7 @@ export async function registerAdminRoutes(
   app.get("/api/v1/admin/verification/judges", adminOrMod, async () => {
     const allUsers = await repo.users.findAll();
     return allUsers
-      .filter((u) => ["judge", "moderator", "admin"].includes(u.role))
+      .filter(isStaff)
       .map((u) => ({ id: u.id, name: u.name, clId: u.clId, role: u.role }));
   });
 
@@ -1468,10 +1433,27 @@ export async function registerAdminRoutes(
     if (!(await ownedCompByEvent(req, reply, req.params.id))) return;
     const { cutoffMs, timeLimitMs, roundCount, fee, archived } = req.body ?? {};
     const fields: Partial<CompetitionEvent> = {};
-    if (cutoffMs !== undefined) fields.cutoffMs = cutoffMs;
-    if (timeLimitMs !== undefined) fields.timeLimitMs = timeLimitMs;
-    if (roundCount !== undefined) fields.roundCount = roundCount;
-    if (fee !== undefined) fields.fee = fee;
+    if (cutoffMs !== undefined) {
+      if (cutoffMs !== null && (typeof cutoffMs !== "number" || cutoffMs < 1))
+        return reply.code(400).send({ error: "invalid_cutoff" });
+      fields.cutoffMs = cutoffMs ?? undefined;
+    }
+    if (timeLimitMs !== undefined) {
+      if (timeLimitMs !== null && (typeof timeLimitMs !== "number" || timeLimitMs < 1))
+        return reply.code(400).send({ error: "invalid_time_limit" });
+      fields.timeLimitMs = timeLimitMs ?? undefined;
+    }
+    if (roundCount !== undefined) {
+      // Clamped like the two competition endpoints, which this used to bypass —
+      // a raw value here also desynchronises round_count from the actual rows.
+      if (typeof roundCount !== "number") return reply.code(400).send({ error: "invalid_round_count" });
+      fields.roundCount = clampRoundCount(roundCount);
+    }
+    if (fee !== undefined) {
+      if (fee !== null && (typeof fee !== "number" || fee < 0))
+        return reply.code(400).send({ error: "invalid_fee" });
+      fields.fee = fee ?? undefined;
+    }
     if (archived !== undefined) fields.archived = archived;
     if (Object.keys(fields).length === 0) return reply.code(400).send({ error: "no_valid_fields" });
 
@@ -1527,12 +1509,15 @@ export async function registerAdminRoutes(
 
   app.patch<{
     Params: { id: string };
-    Body: { role?: string; accountStage?: string; name?: string; email?: string; mobileNo?: string };
+    Body: {
+      role?: string; accountStage?: string; name?: string; email?: string; mobileNo?: string;
+      emailVerified?: boolean; mobileVerified?: boolean;
+    };
   }>("/api/v1/admin/users/:id", adminOnly, async (req, reply) => {
-    const { role, accountStage, name, email, mobileNo } = req.body ?? {};
+    const { role, accountStage, name, email, mobileNo, emailVerified, mobileVerified } = req.body ?? {};
     const admin = await repo.users.findById(req.authClaims!.sub);
-    const isSuperAdmin = admin?.role === "super_admin";
-    const ROLES = isSuperAdmin
+    const isSuper = isSuperAdmin(admin);
+    const ROLES = isSuper
       ? ["user", "judge", "moderator", "admin", "super_admin"]
       : ["user", "judge", "moderator", "admin"];
     const STAGES = ["active", "migrated_stub", "suspended", "banned", "deleted"];
@@ -1543,6 +1528,8 @@ export async function registerAdminRoutes(
     if (typeof name === "string" && name.trim()) fields.name = name.trim();
     if (typeof email === "string" && email.trim()) fields.email = email.trim();
     if (typeof mobileNo === "string") fields.mobileNo = mobileNo.trim() || undefined;
+    if (typeof emailVerified === "boolean") fields.emailVerified = emailVerified;
+    if (typeof mobileVerified === "boolean") fields.mobileVerified = mobileVerified;
 
     if (Object.keys(fields).length === 0) return reply.code(400).send({ error: "no_valid_fields" });
 
@@ -1735,7 +1722,10 @@ export async function registerAdminRoutes(
       if (req.query.competitionId) {
         const compRegs = await repo.registrations.findByCompetition(req.query.competitionId);
         const compRegIds = new Set(compRegs.map((r) => r.id));
-        payments = payments.filter((p) => compRegIds.has(p.registrationId));
+        payments = payments.filter((p) =>
+          (p.registrationId && compRegIds.has(p.registrationId)) ||
+          p.competitionId === req.query.competitionId,
+        );
       }
 
       const total = payments.length;
@@ -1744,18 +1734,18 @@ export async function registerAdminRoutes(
       const paginated = payments.slice((page - 1) * limit, page * limit);
 
       const userIds = [...new Set(paginated.map((p) => p.userId))];
-      const regIds = [...new Set(paginated.map((p) => p.registrationId))];
+      const regIds = paginated.map((p) => p.registrationId).filter((id): id is string => !!id);
       const [usersMap, regsMap] = await Promise.all([
         repo.users.findByIds(userIds),
-        repo.registrations.findByIds(regIds),
+        repo.registrations.findByIds([...new Set(regIds)]),
       ]);
       const compIds = [...new Set([...regsMap.values()].map((r) => r.competitionId))];
       const compsById = await repo.competitions.findByIds(compIds);
       const compsMap = new Map<string, string>();
       for (const p of paginated) {
-        const reg = regsMap.get(p.registrationId);
-        const comp = reg ? compsById.get(reg.competitionId) : undefined;
-        compsMap.set(p.registrationId, comp?.title ?? "Unknown");
+        const reg = p.registrationId ? regsMap.get(p.registrationId) : undefined;
+        const comp = reg ? compsById.get(reg.competitionId) : (p.competitionId ? compsById.get(p.competitionId) : undefined);
+        compsMap.set(p.id, comp?.title ?? "Unknown");
       }
 
       return {
@@ -1766,7 +1756,7 @@ export async function registerAdminRoutes(
             userName: user?.name ?? p.userId,
             userClId: user?.clId ?? p.userId,
             userEmail: user?.email ?? "",
-            competitionTitle: compsMap.get(p.registrationId) ?? "Unknown",
+            competitionTitle: compsMap.get(p.id) ?? "Unknown",
           };
         }),
         total, page, limit,
@@ -1784,7 +1774,26 @@ export async function registerAdminRoutes(
     if (payment.status === "paid") return reply.code(409).send({ error: "already_paid" });
 
     await repo.payments.update(payment.id, { status: "paid" });
-    await repo.registrations.update(payment.registrationId, { paymentStatus: "paid" });
+
+    // Create registration if payment-first flow (no registrationId yet)
+    if (payment.registrationId) {
+      await repo.registrations.update(payment.registrationId, { paymentStatus: "paid" });
+    } else if (payment.competitionId && payment.eventIds) {
+      // fulfillRegistration equivalent inline
+      const regId = randomUUID();
+      const eventIds = payment.eventIds.split(",").filter(Boolean);
+      await repo.registrations.create({
+        id: regId,
+        userId: payment.userId,
+        competitionId: payment.competitionId,
+        paymentStatus: "paid",
+        createdAt: new Date().toISOString(),
+      });
+      for (const eid of eventIds) {
+        await repo.registrations.addEvent(regId, eid);
+      }
+      await repo.payments.update(payment.id, { registrationId: regId } as Partial<import("../../db/types").Payment>);
+    }
 
     await repo.auditLog.create({
       id: randomUUID(),
@@ -2159,9 +2168,12 @@ export async function registerAdminRoutes(
 
   // ── Promo code validation (public, auth required) ────────────────────────
 
+  // Authenticated: the response confirms a code's validity, type and value, so
+  // leaving it open allowed anyone to enumerate promo codes. The comment above
+  // already claimed auth was required; there was no preHandler.
   app.post<{
     Body: { code?: string; competitionId?: string; eventIds?: string[] };
-  }>("/api/v1/promo/validate", async (req, reply) => {
+  }>("/api/v1/promo/validate", { preHandler: [promoLimiter, requireAuth] }, async (req, reply) => {
     const { code, competitionId, eventIds } = req.body ?? {};
     if (!code?.trim()) return reply.code(400).send({ error: "code_required" });
 
@@ -2239,6 +2251,8 @@ export async function registerAdminRoutes(
     "/api/v1/admin/rounds/:id/advanced",
     adminOrMod,
     async (req, reply) => {
+      // Every other /admin/rounds/:id/* route makes this check.
+      if (!(await ownedCompByRound(req, reply, req.params.id))) return;
       const round = await repo.rounds.findById(req.params.id);
       if (!round) return reply.code(404).send({ error: "round_not_found" });
       const advanced = await repo.advancements.findByRound(round.id);
@@ -2931,7 +2945,7 @@ export async function registerAdminRoutes(
     // Promoting to admin requires super_admin
     if (role === "admin") {
       const caller = await repo.users.findById(req.authClaims!.sub);
-      if (caller?.role !== "super_admin")
+      if (!isSuperAdmin(caller))
         return reply.code(403).send({ error: "super_admin_required_for_admin_promotion" });
     }
 
@@ -3081,6 +3095,9 @@ export async function registerAdminRoutes(
       registrationDurationDays: settings.registrationDurationDays,
       gapBetweenEventsMinutes: settings.gapBetweenEventsMinutes,
       defaultRoundDurationMinutes: settings.defaultRoundDurationMinutes,
+      // The admin form shows this as the placeholder for a competition that has
+      // not set its own video deadline.
+      videoDeadlineMinutes: settings.videoDeadlineMinutes,
     });
   });
 

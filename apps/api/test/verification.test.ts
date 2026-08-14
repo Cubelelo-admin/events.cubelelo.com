@@ -111,11 +111,11 @@ describe("judge override recalculates stats and personal bests (HIGH-009)", () =
   let resultId: string;
   let userId: string;
 
-  async function override(action: string) {
+  async function override(action: string, solvePenalties?: (string | null)[]) {
     const res = await app.inject({
       method: "POST",
       url: `/api/v1/admin/results/${resultId}/verify`,
-      payload: { action, reason: "test override" },
+      payload: { action, reason: "test override", solvePenalties },
       headers: bearer(admin),
     });
     expect(res.statusCode).toBe(200);
@@ -159,27 +159,55 @@ describe("judge override recalculates stats and personal bests (HIGH-009)", () =
     expect(pb?.bestSingleMs).toBe(7000);
   });
 
-  it("plus2 adds 2s to the result stats and rebuilds the PB", async () => {
-    await override("plus2");
-    const result = await currentResult();
-    expect(result.ao5Ms).toBe(10500);
-    expect(result.bestSingleMs).toBe(9000);
-
-    const pb = await currentPb();
-    expect(pb?.bestAo5Ms).toBe(10500);
-    expect(pb?.bestSingleMs).toBe(9000);
+  it("rejects a +2 that does not say which attempt it applies to", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/admin/results/${resultId}/verify`,
+      payload: { action: "plus2", reason: "no attempt named" },
+      headers: bearer(admin),
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("attempt_penalties_required");
   });
 
-  it("dnf clears the result stats and the PB no longer counts it", async () => {
-    await override("dnf");
+  it("plus2 on the fastest attempt moves the single and the average correctly", async () => {
+    // Solves 8.00 9.00 7.00 10.00 8.50 → +2 on the 7.00 makes it 9.00.
+    // Single: 7.00 → 8.00. Ao5: trim 8.00 and 10.00, mean(8.50, 9.00, 9.00) = 8.83.
+    // The old flat +2000-on-every-stat gave 10.50 / 9.00 — wrong on both.
+    await override("plus2", [null, null, "plus2", null, null]);
     const result = await currentResult();
-    expect(result.ao5Ms).toBeNull();
-    expect(result.bestSingleMs).toBeNull();
+    expect(result.bestSingleMs).toBe(8000);
+    expect(result.ao5Ms).toBe(8830);
 
-    // Only result for this user/event → PB has nothing left to count
     const pb = await currentPb();
-    expect(pb?.bestAo5Ms).toBeNull();
-    expect(pb?.bestSingleMs).toBeNull();
+    expect(pb?.bestAo5Ms).toBe(8830);
+    expect(pb?.bestSingleMs).toBe(8000);
+  });
+
+  it("plus2 on a non-fastest attempt leaves the single untouched", async () => {
+    // +2 on the 8.00 → 10.00. Single stays 7.00; Ao5 trims 7.00 and one 10.00,
+    // mean(8.50, 9.00, 10.00) = 9.17 — a 0.67 s shift, not 2 s.
+    await override("plus2", ["plus2", null, null, null, null]);
+    const result = await currentResult();
+    expect(result.bestSingleMs).toBe(7000);
+    expect(result.ao5Ms).toBe(9170);
+  });
+
+  it("dnf on one attempt does not void the other four", async () => {
+    // A single DNF is trimmed as the worst (WCA 9f). Single becomes the best of
+    // the remaining attempts; the average is still computable. Nulling every
+    // stat, as before, threw away four valid attempts.
+    await override("dnf", [null, null, "dnf", null, null]);
+    const result = await currentResult();
+    expect(result.bestSingleMs).toBe(8000);
+    expect(result.ao5Ms).toBe(9170);
+  });
+
+  it("two DNFs make the average a DNF but keep the single", async () => {
+    await override("dnf", [null, null, "dnf", "dnf", null]);
+    const result = await currentResult();
+    expect(result.bestSingleMs).toBe(8000);
+    expect(result.ao5Ms).toBeNull();
   });
 
   it("verified restores the original stats and PB", async () => {
@@ -196,7 +224,9 @@ describe("judge override recalculates stats and personal bests (HIGH-009)", () =
   it("disqualified excludes the result from ranks and PBs", async () => {
     await override("disqualified");
     const result = await currentResult();
-    expect(result.rank).toBe(0);
+    // Unranked, not rank 0 — every leaderboard sorts ascending by rank, so a 0
+    // put disqualified results at the top of the board.
+    expect(result.rank).toBeNull();
 
     const pb = await currentPb();
     expect(pb?.bestAo5Ms).toBeNull();

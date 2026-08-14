@@ -4,6 +4,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getEvent, isEventId, type EventId } from "@cubers/scramble-core";
 import { ao5, effectiveTime, formatSolve, formatTime } from "@cubers/timer-core";
 import type { Solve, SolvePenalty } from "@cubers/types";
+import {
+  FORMAT_ATTEMPTS,
+  FORMAT_CUTOFF_ATTEMPTS,
+  defaultFormatForEvent,
+} from "@cubers/types";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useTimer } from "@/features/timer/useTimer";
@@ -20,8 +25,6 @@ import {
   type ResultDto,
 } from "@/lib/api";
 
-const SOLVES_PER_ROUND = 5;
-
 interface CompetitionTerminalProps {
   competitionId: string;
   round: string;
@@ -31,7 +34,18 @@ interface CompetitionTerminalProps {
 type LoadState =
   | { kind: "loading" }
   | { kind: "error"; message: string }
-  | { kind: "ready"; roundId: string; eventType: EventId; scrambles: string[]; cutoffMs?: number; timeLimitMs?: number; closesAt?: string | null };
+  | {
+      kind: "ready";
+      roundId: string;
+      eventType: EventId;
+      scrambles: string[];
+      /** Attempts this round gives, from its WCA format — never assume 5. */
+      attempts: number;
+      cutoffAttempts: number;
+      cutoffMs?: number;
+      timeLimitMs?: number;
+      closesAt?: string | null;
+    };
 
 export function CompetitionTerminal({
   competitionId,
@@ -98,13 +112,19 @@ export function CompetitionTerminal({
 
         const sc = await fetchScramble(rnd.id);
         if (!active) return;
+        // Attempt count comes from the round's WCA format. Falling back to the
+        // event default (rather than a hardcoded 5) keeps 3-attempt events
+        // working against an API that predates the format field.
+        const fmt = rnd.format ?? defaultFormatForEvent(ev.eventType);
         setLoad({
           kind: "ready",
           roundId: rnd.id,
           eventType: isEventId(ev.eventType) ? ev.eventType : "333",
           scrambles: sc.scrambles,
-          cutoffMs: ev.cutoffMs,
-          timeLimitMs: ev.timeLimitMs,
+          attempts: rnd.attempts ?? FORMAT_ATTEMPTS[fmt],
+          cutoffAttempts: FORMAT_CUTOFF_ATTEMPTS[fmt],
+          cutoffMs: rnd.cutoffMs ?? ev.cutoffMs,
+          timeLimitMs: rnd.timeLimitMs ?? ev.timeLimitMs,
           closesAt: rnd.closesAt ?? null,
         });
       } catch (e) {
@@ -119,9 +139,27 @@ export function CompetitionTerminal({
     };
   }, [competitionId, round, eventId]);
 
+  // Attempt counts for this round. While loading we fall back to Ao5 so the
+  // progress UI has something to render; nothing is submitted until `load` is
+  // ready, so the fallback can never reach the API.
+  const attempts = load.kind === "ready" ? load.attempts : FORMAT_ATTEMPTS.a;
+  const cutoffAttempts = load.kind === "ready" ? load.cutoffAttempts : FORMAT_CUTOFF_ATTEMPTS.a;
+
   const [cutoffFailed, setCutoffFailed] = useState(false);
   const [timeLimitHit, setTimeLimitHit] = useState(false);
   const stoppedRef = useRef(false);
+
+  /**
+   * WCA 9g1: a competitor continues past the cutoff only if at least one of the
+   * cutoff attempts is *strictly better* than the cutoff. A result exactly equal
+   * to the cutoff does not pass.
+   */
+  const failsCutoff = useCallback(
+    (attemptSet: Solve[], cutoffMs: number) =>
+      attemptSet.length >= cutoffAttempts &&
+      attemptSet.slice(0, cutoffAttempts).every((s) => effectiveTime(s) >= cutoffMs),
+    [cutoffAttempts],
+  );
 
   useEffect(() => {
     if (snapshot.phase === "stopped" && !stoppedRef.current) {
@@ -144,21 +182,12 @@ export function CompetitionTerminal({
         setSolves((prev) => {
           const next = [...prev, inspectionDnfSolve];
           // WCA cutoff: inspection DNF counts as exceeding cutoff (Infinity effective time)
-          if (
-            load.kind === "ready" &&
-            load.cutoffMs &&
-            next.length === 2
-          ) {
-            const allAboveCutoff = next.every(
-              (s) => effectiveTime(s) > (load as { cutoffMs: number }).cutoffMs,
-            );
-            if (allAboveCutoff) {
-              setCutoffFailed(true);
-            }
+          if (load.kind === "ready" && load.cutoffMs && failsCutoff(next, load.cutoffMs)) {
+            setCutoffFailed(true);
           }
           return next;
         });
-        setIndex((i) => Math.min(i + 1, SOLVES_PER_ROUND - 1));
+        setIndex((i) => Math.min(i + 1, attempts - 1));
         reset();
       }
     } else if (snapshot.phase !== "stopped") {
@@ -202,7 +231,7 @@ export function CompetitionTerminal({
     return () => clearTimeout(timer);
   }, [closesAtMs]);
 
-  const roundComplete = cutoffFailed || solves.length >= SOLVES_PER_ROUND || roundExpired;
+  const roundComplete = cutoffFailed || solves.length >= attempts || roundExpired;
 
   const currentScramble = load.kind === "ready" ? (load.scrambles[index] ?? "") : "";
   const scrambleMoves = useMemo(() => currentScramble.trim().split(/\s+/).filter(Boolean), [currentScramble]);
@@ -249,34 +278,27 @@ export function CompetitionTerminal({
 
   const confirmSolve = useCallback(() => {
     if (!snapshot.result) return;
-    const inspPenalty = timeLimitHit ? "dnf" as const : (snapshot.result!.inspectionPenalty ?? "none" as const);
+    // A time-limit DNF (Reg A1a4) is a penalty on the attempt, not an inspection
+    // penalty — recording it as the latter misreports the reason in the judge UI.
     const newSolve: Solve = {
       time_ms: snapshot.result!.time_ms,
-      inspectionPenalty: inspPenalty,
-      penalty: pendingPenalty,
+      inspectionPenalty: snapshot.result!.inspectionPenalty ?? "none",
+      penalty: timeLimitHit ? "dnf" : pendingPenalty,
     };
     const newSolves = [...solves, newSolve];
     setSolves(newSolves);
 
-    // WCA cutoff enforcement: after solve 2, check if both solves exceed cutoff
-    if (
-      load.kind === "ready" &&
-      load.cutoffMs &&
-      newSolves.length === 2
-    ) {
-      const allAboveCutoff = newSolves.every(
-        (s) => effectiveTime(s) > load.cutoffMs!,
-      );
-      if (allAboveCutoff) {
-        setCutoffFailed(true);
-        reset();
-        return;
-      }
+    // WCA 9g cutoff: once the cutoff attempts are done, stop the competitor if
+    // none of them beat the cutoff.
+    if (load.kind === "ready" && load.cutoffMs && failsCutoff(newSolves, load.cutoffMs)) {
+      setCutoffFailed(true);
+      reset();
+      return;
     }
 
-    setIndex((i) => Math.min(i + 1, SOLVES_PER_ROUND - 1));
+    setIndex((i) => Math.min(i + 1, attempts - 1));
     reset();
-  }, [snapshot.result, pendingPenalty, timeLimitHit, reset, solves, load]);
+  }, [snapshot.result, pendingPenalty, timeLimitHit, reset, solves, load, attempts, failsCutoff]);
 
   const handleSubmit = useCallback(async () => {
     if (load.kind !== "ready") return;
@@ -297,7 +319,7 @@ export function CompetitionTerminal({
   const autoSubmitDone = useRef(false);
   useEffect(() => {
     if (!roundExpired || autoSubmitDone.current) return;
-    if (solves.length >= SOLVES_PER_ROUND && submit.kind === "idle") {
+    if (solves.length >= attempts && submit.kind === "idle") {
       autoSubmitDone.current = true;
       handleSubmit();
     }
@@ -378,7 +400,7 @@ export function CompetitionTerminal({
           )}
           <span className="text-zinc-500">Solve</span>
           <span className="font-mono font-semibold">
-            {Math.min(index + 1, SOLVES_PER_ROUND)} / {SOLVES_PER_ROUND}
+            {Math.min(index + 1, attempts)} / {attempts}
           </span>
         </div>
       </header>
@@ -497,7 +519,7 @@ export function CompetitionTerminal({
               <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-900/40">
                 {/* Progress bar — scoped to solves panel */}
                 <div className="mb-2">
-                  <ProgressBar current={solves.length} total={SOLVES_PER_ROUND} />
+                  <ProgressBar current={solves.length} total={attempts} />
                 </div>
                 <div className="mb-2 flex items-center justify-between text-sm">
                   <span className="text-zinc-500 dark:text-zinc-400">This round</span>
@@ -509,7 +531,7 @@ export function CompetitionTerminal({
                   </span>
                 </div>
                 <ol className="space-y-1 font-mono text-sm">
-                  {Array.from({ length: SOLVES_PER_ROUND }).map((_, i) => (
+                  {Array.from({ length: attempts }).map((_, i) => (
                     <li
                       key={i}
                       className={`flex justify-between rounded px-2 py-1 ${i === index ? "bg-zinc-200/60 dark:bg-zinc-800/60" : ""
@@ -543,7 +565,7 @@ export function CompetitionTerminal({
                   onClick={confirmSolve}
                   className="rounded-lg bg-emerald-600 px-5 py-2 font-semibold text-white transition hover:bg-emerald-500"
                 >
-                  {index + 1 >= SOLVES_PER_ROUND ? "Confirm & Finish" : "Confirm & Next"}
+                  {index + 1 >= attempts ? "Confirm & Finish" : "Confirm & Next"}
                 </button>
               </div>
             ) : (

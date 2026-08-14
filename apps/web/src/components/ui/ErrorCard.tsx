@@ -11,6 +11,15 @@ const ERROR_INFO: Record<string, { title: string; message: string; steps: string
       "Make sure you selected this event during registration.",
     ],
   },
+  payment_pending: {
+    title: "Payment Pending",
+    message: "Your registration payment has not been completed yet.",
+    steps: [
+      "Go to the competition page and complete your payment.",
+      "If you already paid, wait a moment and try again — confirmation may take a few seconds.",
+      "Contact support if payment was deducted but not reflected.",
+    ],
+  },
   not_shortlisted: {
     title: "Not Qualified",
     message: "You were not shortlisted for this round.",

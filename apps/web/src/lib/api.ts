@@ -1,4 +1,4 @@
-import type { Solve } from "@cubers/types";
+import type { Solve, SolvePenalty, WcaFormat } from "@cubers/types";
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
 
@@ -15,6 +15,8 @@ const FRIENDLY_ERRORS: Record<string, string> = {
   registration_closed_cannot_withdraw: "Registration is closed — you can no longer withdraw.",
   paid_registration_contact_admin: "You have a paid registration. Please contact the organiser to withdraw.",
   competition_not_found: "Competition not found.",
+  event_has_results:
+    "This event already has results, so it can't be deleted. Leave it archived instead.",
   // Payments
   missing_registration_id: "Registration not found. Please try again.",
   registration_not_found: "Registration not found.",
@@ -48,6 +50,19 @@ const FRIENDLY_ERRORS: Record<string, string> = {
   otp_delivery_failed: "Failed to send verification code. Please try again.",
   // Payments
   payment_gateway_unavailable: "Payment gateway is temporarily unavailable. Please try again in a moment.",
+  // Judging
+  attempt_penalties_required:
+    "Select which attempt the penalty applies to before applying a +2 or DNF.",
+  invalid_solve_penalties: "The attempt penalties don't match this result's attempts.",
+  reason_required: "Please give a reason for this action.",
+  invalid_action: "That verification action isn't valid.",
+  not_assigned_to_round: "You aren't assigned to judge this round.",
+  // Results
+  invalid_solves: "Those attempt times aren't valid for this round's format.",
+  round_not_open: "This round isn't open for submissions.",
+  already_submitted: "You've already submitted a result for this round.",
+  not_shortlisted: "You didn't advance to this round.",
+  not_registered_for_event: "You aren't registered for this event.",
   // General
   internal_error: "Something went wrong. Please try again.",
   invalid_request: "Invalid request. Please check your input and try again.",
@@ -113,9 +128,20 @@ export interface RoundRef {
   roundNumber: number;
   status: string;
   eventType: string;
+  /** WCA format code: 1=Bo1, 2=Bo2, 3=Bo3, a=Ao5, m=Mo3. */
+  format?: WcaFormat;
+  /** Attempts this round gives a competitor, derived from `format` by the API. */
+  attempts?: number;
+  /** Effective cutoff / time limit — the round's own value, else the event default. */
+  cutoffMs?: number | null;
+  timeLimitMs?: number | null;
+  /** The round's own override, null when it inherits the event default. */
+  ownCutoffMs?: number | null;
+  ownTimeLimitMs?: number | null;
   scrambleLocked?: boolean;
   opensAt?: string | null;
   closesAt?: string | null;
+  durationMinutes?: number | null;
   advancementCount?: number | null;
   advancementCriteria?: AdvancementCriteria | null;
   resultsPublishedAt?: string | null;
@@ -133,7 +159,6 @@ export interface CompetitionSummary {
   registrationDeadline?: string | null;
   startsAt?: string | null;
   endsAt?: string | null;
-  coverUrl?: string;
   bannerUrl?: string;
   mobileBannerUrl?: string;
   featured?: boolean;
@@ -163,17 +188,17 @@ export interface CompetitionDetail {
   status: string;
   description?: string;
   rulesMd?: string;
-  ruleSetId?: string | null;
+  ruleSets?: { id: string; name: string; content: string }[];
   baseFee?: number;
   perEventFee?: number;
   registrationOpensAt?: string | null;
   registrationDeadline?: string | null;
   startsAt?: string | null;
   endsAt?: string | null;
-  coverUrl?: string;
   bannerUrl?: string;
   mobileBannerUrl?: string;
   featured?: boolean;
+  featuredOrder?: number | null;
   createdBy?: string;
   publishedBy?: string | null;
   publishedByName?: string | null;
@@ -589,17 +614,18 @@ export function fetchMyRegistrations(): Promise<RegistrationDto[]> {
 
 // ── Payments ──
 export function createPaymentOrder(
-  registrationId: string,
+  competitionId: string,
+  eventIds: string[],
   promoCode?: string,
-): Promise<{ orderId: string; amount: number; currency: string; paymentId: string; keyId: string | null }> {
-  return sendJson("POST", `/api/v1/payments/order`, { registrationId, promoCode });
+): Promise<{ orderId: string; amount: number; currency: string; paymentId: string; keyId: string | null; registrationId?: string; status?: string }> {
+  return sendJson("POST", `/api/v1/payments/order`, { competitionId, eventIds, promoCode });
 }
 
 export function verifyPayment(
   razorpay_order_id: string,
   razorpay_payment_id: string,
   razorpay_signature: string,
-): Promise<{ status: string }> {
+): Promise<{ status: string; registrationId?: string }> {
   return sendJson("POST", `/api/v1/payments/verify`, {
     razorpay_order_id,
     razorpay_payment_id,
@@ -625,32 +651,52 @@ export function changePassword(
   return sendJson("POST", `/api/v1/auth/change-password`, { currentPassword, newPassword });
 }
 
+/**
+ * One event and its rounds, as sent to either competition endpoint.
+ *
+ * Declared once because the create and update bodies previously spelled it out
+ * separately and drifted apart — the same divergence this whole pass exists to
+ * remove. Mirrors `CompetitionEventInput` on the API.
+ */
+export interface CompetitionEventPayload {
+  eventType: string;
+  roundCount?: number;
+  /** Event-level defaults that seed new rounds. */
+  cutoffMs?: number;
+  timeLimitMs?: number;
+  fee?: number;
+  /** Created but hidden from competitors. */
+  archived?: boolean;
+  durationMinutes?: number;
+  advancementCount?: number;
+  advancementCriteria?: AdvancementCriteria;
+  roundCriteria?: (AdvancementCriteria | undefined)[];
+  roundSchedule?: ({ startTime?: string; durationMinutes?: number } | undefined)[];
+  /** Per-round overrides, parallel to the rounds; empty slots inherit. */
+  roundFormats?: (WcaFormat | undefined)[];
+  roundCutoffMs?: (number | undefined)[];
+  roundTimeLimitMs?: (number | undefined)[];
+  /** Push changed event-level cutoff / time limit onto existing rounds. */
+  applyToExistingRounds?: boolean;
+}
+
 // ── Admin ──
 export function createCompetition(body: {
   title: string;
   type: string;
   description?: string;
   rulesMd?: string;
-  ruleSetId?: string | null;
+  ruleSetIds?: string[];
   baseFee?: number;
   perEventFee?: number;
+  registrationLimit?: number;
   registrationOpensAt?: string;
   registrationDeadline?: string;
   startsAt?: string;
   endsAt?: string;
   eventType?: string;
   roundCount?: number;
-  events?: Array<{
-    eventType: string;
-    roundCount?: number;
-    cutoffMs?: number;
-    timeLimitMs?: number;
-    fee?: number;
-    durationMinutes?: number;
-    advancementCriteria?: AdvancementCriteria;
-    roundCriteria?: (AdvancementCriteria | undefined)[];
-    roundSchedule?: ({ startTime?: string; durationMinutes?: number } | undefined)[];
-  }>;
+  events?: CompetitionEventPayload[];
 }): Promise<{ id: string }> {
   return sendJson("POST", `/api/v1/admin/competitions`, body);
 }
@@ -662,7 +708,7 @@ export function updateCompetition(
     status?: string;
     description?: string;
     rulesMd?: string;
-    ruleSetId?: string | null;
+    ruleSetIds?: string[];
     baseFee?: number;
     perEventFee?: number;
     registrationOpensAt?: string | null;
@@ -674,17 +720,7 @@ export function updateCompetition(
     mobileBannerUrl?: string;
     registrationLimit?: number | null;
     cancellationReason?: string;
-    events?: Array<{
-      eventType: string;
-      roundCount?: number;
-      cutoffMs?: number;
-      timeLimitMs?: number;
-      fee?: number;
-      durationMinutes?: number;
-      advancementCriteria?: AdvancementCriteria;
-      roundCriteria?: (AdvancementCriteria | undefined)[];
-      roundSchedule?: ({ startTime?: string; durationMinutes?: number } | undefined)[];
-    }>;
+    events?: CompetitionEventPayload[];
   },
 ): Promise<{ id: string; title: string; status: string }> {
   return sendJson("PATCH", `/api/v1/admin/competitions/${id}`, body);
@@ -792,8 +828,12 @@ export function updateRound(
     advancementCount?: number;
     advancementCriteria?: AdvancementCriteria | null;
     durationMinutes?: number;
+    /** WCA format code — decides the round's attempt count and ranking metric. */
+    format?: WcaFormat;
+    cutoffMs?: number | null;
+    timeLimitMs?: number | null;
   },
-): Promise<{ id: string; status: string; opensAt: string | null; closesAt: string | null; durationMinutes?: number }> {
+): Promise<{ id: string; status: string; opensAt: string | null; closesAt: string | null; durationMinutes?: number; format?: WcaFormat | null }> {
   return sendJson("PATCH", `/api/v1/admin/rounds/${roundId}`, body);
 }
 
@@ -829,11 +869,14 @@ export function verifyResult(
   action: string,
   reason?: string,
   comment?: string,
+  /** Per-attempt penalties, parallel to the result's solves. null = unchanged. */
+  solvePenalties?: (SolvePenalty | null)[],
 ): Promise<{ id: string; flagStatus: string }> {
   return sendJson("POST", `/api/v1/admin/results/${resultId}/verify`, {
     action,
     reason,
     comment,
+    solvePenalties,
   });
 }
 
@@ -1780,11 +1823,14 @@ export function judgeVerifyResult(
   action: string,
   reason?: string,
   comment?: string,
+  /** Per-attempt penalties, parallel to the result's solves. null = unchanged. */
+  solvePenalties?: (SolvePenalty | null)[],
 ): Promise<{ id: string; flagStatus: string }> {
   return sendJson("POST", `/api/v1/judge/results/${resultId}/verify`, {
     action,
     reason,
     comment,
+    solvePenalties,
   });
 }
 
@@ -1904,6 +1950,8 @@ export interface SchedulingDefaults {
   registrationDurationDays: number;
   gapBetweenEventsMinutes: number;
   defaultRoundDurationMinutes: number;
+  /** Global default shown as the placeholder on a competition's own field. */
+  videoDeadlineMinutes?: number;
 }
 
 export async function fetchSystemSettings(): Promise<SystemSettingsDto> {

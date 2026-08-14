@@ -8,8 +8,17 @@ interface RateLimitConfig {
 
 const inMemoryStore = new Map<string, { count: number; resetAt: number }>();
 
-function getClientIp(req: FastifyRequest): string {
-  return req.ip;
+/**
+ * Bucket a request belongs to.
+ *
+ * Authenticated requests are keyed by user id, not IP. Competitors at a physical
+ * venue share one NAT address, so an IP-keyed submit limiter would have them
+ * throttling each other out of their own competition. IP remains the key for
+ * anonymous traffic, where it is the only stable identifier.
+ */
+function getClientKey(req: FastifyRequest): string {
+  const sub = req.authClaims?.sub;
+  return sub ? `u:${sub}` : `ip:${req.ip}`;
 }
 
 async function checkRedis(
@@ -58,8 +67,7 @@ export function rateLimit(config: RateLimitConfig) {
   const { windowMs, maxRequests } = config;
 
   return async (req: FastifyRequest, reply: FastifyReply): Promise<void> => {
-    const ip = getClientIp(req);
-    const key = `rl:${req.routeOptions.url ?? req.url}:${ip}`;
+    const key = `rl:${req.routeOptions.url ?? req.url}:${getClientKey(req)}`;
 
     const result = await checkRedis(key, windowMs, maxRequests);
 
@@ -82,5 +90,7 @@ export const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, maxRequests: 1
 export const passwordResetLimiter = rateLimit({ windowMs: 60 * 60 * 1000, maxRequests: 5 });
 export const submitLimiter = rateLimit({ windowMs: 60 * 1000, maxRequests: 5 });
 export const scrambleLimiter = rateLimit({ windowMs: 60 * 1000, maxRequests: 10 });
+/** Promo validation confirms code validity — rate limited to blunt enumeration. */
+export const promoLimiter = rateLimit({ windowMs: 60 * 1000, maxRequests: 15 });
 export const apiLimiter = rateLimit({ windowMs: 60 * 1000, maxRequests: 60 });
 export const adminLimiter = rateLimit({ windowMs: 60 * 1000, maxRequests: 100 });

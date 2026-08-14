@@ -45,7 +45,6 @@ create table competitions (
   title                 text not null,
   type                  comp_type not null default 'paid',
   status                comp_status not null default 'draft',
-  cover_url             text,
   banner_url            text,
   mobile_banner_url     text,
   description           text,
@@ -138,11 +137,14 @@ create table results (
 create table payments (
   id                  uuid primary key default gen_random_uuid(),
   user_id             uuid not null references users(id) on delete cascade,
-  registration_id     uuid not null references registrations(id) on delete cascade,
+  registration_id     uuid references registrations(id) on delete cascade,  -- set after payment confirmed
+  competition_id      uuid references competitions(id),                      -- checkout intent
+  event_ids           text,                                                  -- comma-separated competition_event ids
   amount              integer not null,         -- paise
   currency            text not null default 'INR',
   razorpay_order_id   text unique,
   razorpay_payment_id text unique,
+  promo_code_id       uuid references promo_codes(id),
   status              payment_status not null default 'pending',
   gst_invoice_url     text,
   created_at          timestamptz not null default now(),

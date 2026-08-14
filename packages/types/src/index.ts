@@ -3,6 +3,8 @@
  * Mirrors the PostgreSQL enums + core entities in ARCHITECTURE.md §3.
  */
 
+export * from "./wca.js";
+
 // ─────────────────────────── Enums ───────────────────────────
 export type UserRole = "user" | "judge" | "moderator" | "admin" | "super_admin";
 export type AccountStage = "active" | "migrated_stub" | "suspended" | "banned" | "deleted";

@@ -1,11 +1,13 @@
 import { randomUUID, createHmac, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import type { Repository } from "../../db/repo";
-import type { Payment } from "../../db/types";
+import type { Payment, Registration } from "../../db/types";
 import { requireAuth } from "../../auth/plugin";
+import { isAdmin, isAdminOrMod } from "../../auth/ownership";
 import { env } from "../../config/env";
 import { generateInvoicePDF, type InvoiceData } from "../../lib/invoice";
 import { submitLimiter } from "../../lib/rateLimiter";
+import { effectiveCompStatus } from "../../lib/statusUtils";
 
 async function getRazorpay() {
   if (!env.RAZORPAY_KEY_ID || !env.RAZORPAY_KEY_SECRET) return null;
@@ -13,28 +15,111 @@ async function getRazorpay() {
   return new Razorpay({ key_id: env.RAZORPAY_KEY_ID, key_secret: env.RAZORPAY_KEY_SECRET });
 }
 
+/**
+ * Create registration + registration_events after payment is confirmed.
+ * Called from both verify (frontend) and webhook (Razorpay).
+ * Idempotent — if the registration already exists, it returns it.
+ */
+async function fulfillRegistration(
+  repo: Repository,
+  payment: Payment,
+): Promise<Registration> {
+  // Already fulfilled?
+  if (payment.registrationId) {
+    const existing = await repo.registrations.findById(payment.registrationId);
+    if (existing) return existing;
+  }
+
+  const competitionId = payment.competitionId;
+  const eventIdsCsv = payment.eventIds;
+  if (!competitionId || !eventIdsCsv) {
+    throw new Error("Payment missing checkout intent (competitionId/eventIds)");
+  }
+
+  const eventIds = eventIdsCsv.split(",").filter(Boolean);
+
+  // Check for an existing paid registration (idempotent — webhook + verify may race)
+  const existingReg = await repo.registrations.findByUserAndComp(payment.userId, competitionId);
+  if (existingReg && existingReg.paymentStatus === "paid") {
+    // Link payment to existing registration if not already linked
+    if (!payment.registrationId) {
+      await repo.payments.update(payment.id, { registrationId: existingReg.id } as Partial<Payment>);
+    }
+    return existingReg;
+  }
+
+  // Clean up any non-paid leftover registration
+  if (existingReg) {
+    await repo.registrations.removeEvents(existingReg.id);
+    await repo.registrations.delete(existingReg.id);
+  }
+
+  // Create registration
+  const registration: Registration = {
+    id: randomUUID(),
+    userId: payment.userId,
+    competitionId,
+    paymentStatus: "paid",
+    createdAt: new Date().toISOString(),
+  };
+  await repo.registrations.create(registration);
+  for (const eid of eventIds) {
+    await repo.registrations.addEvent(registration.id, eid);
+  }
+
+  // Link payment to new registration
+  await repo.payments.update(payment.id, { registrationId: registration.id } as Partial<Payment>);
+
+  return registration;
+}
+
 export async function registerPaymentRoutes(
   app: FastifyInstance,
   repo: Repository,
 ): Promise<void> {
-  app.post<{ Body: { registrationId?: string; promoCode?: string } }>(
+  // Create a Razorpay order (payment intent).
+  // No registration is created yet — just stores the checkout intent on the payment record.
+  app.post<{ Body: { competitionId?: string; eventIds?: string[]; promoCode?: string } }>(
     "/api/v1/payments/order",
     { preHandler: [submitLimiter, requireAuth] },
     async (req, reply) => {
-      const { registrationId, promoCode } = req.body ?? {};
-      if (!registrationId) return reply.code(400).send({ error: "missing_registration_id" });
+      const { competitionId, eventIds: rawEventIds, promoCode } = req.body ?? {};
+      if (!competitionId) return reply.code(400).send({ error: "missing_competition_id" });
+      if (!Array.isArray(rawEventIds) || rawEventIds.length === 0) {
+        return reply.code(400).send({ error: "no_events_selected" });
+      }
 
-      const registration = await repo.registrations.findById(registrationId);
-      if (!registration) return reply.code(404).send({ error: "registration_not_found" });
+      const comp = await repo.competitions.findById(competitionId);
+      if (!comp) return reply.code(404).send({ error: "competition_not_found" });
+
+      const status = effectiveCompStatus(comp);
+      if (status !== "registration_open") {
+        return reply.code(409).send({ error: "registration_not_open" });
+      }
 
       const user = await repo.users.findById(req.authClaims!.sub);
-      if (!user || registration.userId !== user.id)
-        return reply.code(403).send({ error: "forbidden" });
+      if (!user) return reply.code(403).send({ error: "not_synced" });
 
-      if (registration.paymentStatus === "paid")
+      // Already registered and paid?
+      const existingReg = await repo.registrations.findByUserAndComp(user.id, comp.id);
+      if (existingReg && existingReg.paymentStatus === "paid") {
         return reply.code(409).send({ error: "already_paid" });
+      }
 
-      const pendingPayment = await repo.payments.findByRegistration(registration.id);
+      const eventIds = [...new Set(rawEventIds as string[])];
+
+      // Validate event IDs
+      const compEvents = await repo.competitionEvents.findByCompetition(comp.id);
+      const compEventIds = new Set(compEvents.map((e) => e.id));
+      const compEventMap = new Map(compEvents.map((e) => [e.id, e]));
+      for (const eid of eventIds) {
+        if (!compEventIds.has(eid)) {
+          return reply.code(400).send({ error: "invalid_event_id" });
+        }
+      }
+
+      // Reuse existing pending payment order if one exists
+      const pendingPayment = await repo.payments.findPendingByUserAndComp(user.id, comp.id);
       if (pendingPayment) {
         return reply.send({
           orderId: pendingPayment.razorpayOrderId,
@@ -45,12 +130,12 @@ export async function registerPaymentRoutes(
         });
       }
 
-      const comp = await repo.competitions.findById(registration.competitionId);
-      const regEvents = await repo.registrations.findEvents(registration.id);
-      const eventFeeSum = regEvents.reduce(
-        (sum, ev) => sum + (ev.fee ?? comp?.perEventFee ?? 0), 0,
-      );
-      let amount = (comp?.baseFee ?? 0) + eventFeeSum;
+      // Calculate fee
+      const eventFeeSum = eventIds.reduce((sum, eid) => {
+        const ev = compEventMap.get(eid);
+        return sum + (ev?.fee ?? comp.perEventFee);
+      }, 0);
+      let amount = comp.baseFee + eventFeeSum;
 
       let appliedPromoId: string | undefined;
       if (promoCode) {
@@ -58,34 +143,30 @@ export async function registerPaymentRoutes(
         if (!promo || !promo.active) {
           return reply.code(400).send({ error: "invalid_promo_code" });
         }
-        if (promo.competitionId && promo.competitionId !== registration.competitionId) {
+        if (promo.competitionId && promo.competitionId !== comp.id) {
           return reply.code(400).send({ error: "promo_not_valid_for_competition" });
         }
-        if (promo.competitionEventId && !regEvents.some((e) => e.id === promo.competitionEventId)) {
+        if (promo.competitionEventId && !eventIds.includes(promo.competitionEventId)) {
           return reply.code(400).send({ error: "promo_not_for_selected_events" });
         }
-        // Competition coupons: valid only while registration is open
-        if (promo.type === "competition" && comp) {
-          const regOpen = comp.status === "registration_open" || comp.status === "published";
+        if (promo.type === "competition") {
+          const regOpen = status === "registration_open" || status === "published";
           if (!regOpen) {
             return reply.code(400).send({ error: "promo_registration_closed" });
           }
         }
-        // Welcome coupons: only for users who never paid for a competition
         if (promo.type === "welcome") {
           const hasPaid = await repo.registrations.hasPaidRegistration(user.id);
           if (hasPaid) {
             return reply.code(400).send({ error: "promo_welcome_only" });
           }
         }
-        // Date-based validity (welcome / general / special coupons)
         if (promo.type !== "competition") {
           const now = new Date().toISOString();
           if ((promo.validFrom && now < promo.validFrom) || (promo.validTo && now > promo.validTo)) {
             return reply.code(400).send({ error: "promo_expired" });
           }
         }
-        // Per-user usage limit (welcome coupons: 1 per user)
         if (promo.maxUsesPerUser > 0) {
           const userUses = await repo.promoCodes.userUsageCount(promo.id, user.id);
           if (userUses >= promo.maxUsesPerUser) {
@@ -93,8 +174,8 @@ export async function registerPaymentRoutes(
           }
         }
         if (promo.competitionEventId) {
-          const targetEvent = regEvents.find((e) => e.id === promo.competitionEventId);
-          const eventFee = targetEvent?.fee ?? comp?.perEventFee ?? 0;
+          const targetEvent = compEvents.find((e) => e.id === promo.competitionEventId);
+          const eventFee = targetEvent?.fee ?? comp.perEventFee ?? 0;
           const discount = promo.discountType === "percentage"
             ? Math.round(eventFee * promo.discountValue / 100)
             : Math.min(promo.discountValue, eventFee);
@@ -107,11 +188,13 @@ export async function registerPaymentRoutes(
         appliedPromoId = promo.id;
       }
 
+      // If promo brings amount to 0, register immediately (same as free)
       if (amount === 0) {
         const payment: Payment = {
           id: randomUUID(),
           userId: user.id,
-          registrationId: registration.id,
+          competitionId: comp.id,
+          eventIds: eventIds.join(","),
           amount: 0,
           currency: "INR",
           promoCodeId: appliedPromoId,
@@ -124,10 +207,18 @@ export async function registerPaymentRoutes(
           await repo.promoCodes.recordUsage(appliedPromoId, user.id);
         }
         await repo.payments.create(payment);
-        await repo.registrations.update(registration.id, { paymentStatus: "paid" });
-        return reply.code(201).send({ orderId: null, amount: 0, currency: "INR", paymentId: payment.id, status: "paid" });
+        const reg = await fulfillRegistration(repo, payment);
+        return reply.code(201).send({
+          orderId: null,
+          amount: 0,
+          currency: "INR",
+          paymentId: payment.id,
+          registrationId: reg.id,
+          status: "paid",
+        });
       }
 
+      // Create Razorpay order
       let orderId: string;
       const rzp = await getRazorpay();
       if (rzp) {
@@ -135,11 +226,11 @@ export async function registerPaymentRoutes(
           const order = await rzp.orders.create({
             amount,
             currency: "INR",
-            receipt: registration.id,
+            receipt: `${comp.id}_${user.id}`.slice(0, 40),
           });
           orderId = order.id as string;
         } catch (err) {
-          req.log.error({ err, registrationId: registration.id }, "Razorpay order creation failed");
+          req.log.error({ err, competitionId: comp.id }, "Razorpay order creation failed");
           return reply.code(502).send({ error: "payment_gateway_unavailable" });
         }
       } else {
@@ -149,7 +240,8 @@ export async function registerPaymentRoutes(
       const payment: Payment = {
         id: randomUUID(),
         userId: user.id,
-        registrationId: registration.id,
+        competitionId: comp.id,
+        eventIds: eventIds.join(","),
         amount,
         currency: "INR",
         razorpayOrderId: orderId,
@@ -174,7 +266,7 @@ export async function registerPaymentRoutes(
     },
   );
 
-  // Client-side checkout verification — uses RAZORPAY_KEY_SECRET (not webhook secret).
+  // Client-side checkout verification — creates the registration on success.
   app.post<{
     Body: {
       razorpay_order_id?: string;
@@ -207,23 +299,25 @@ export async function registerPaymentRoutes(
         return reply.code(403).send({ error: "forbidden" });
 
       if (payment.status === "paid")
-        return reply.send({ status: "already_confirmed" });
+        return reply.send({ status: "already_confirmed", registrationId: payment.registrationId });
 
       const now = new Date().toISOString();
       await repo.payments.update(payment.id, { razorpayPaymentId: razorpay_payment_id, status: "paid" });
-      await repo.registrations.update(payment.registrationId, { paymentStatus: "paid" });
+
+      // Create the registration now that payment is confirmed
+      const reg = await fulfillRegistration(repo, { ...payment, status: "paid" });
+
       await repo.auditLog.create({
         id: randomUUID(), adminId: null as unknown as string, action: "payment_confirmed",
         target: payment.id, reason: `checkout verified: order=${razorpay_order_id} payment=${razorpay_payment_id}`,
         createdAt: now,
       });
 
-      return { status: "confirmed" };
+      return { status: "confirmed", registrationId: reg.id };
     },
   );
 
   // Razorpay webhook — verify X-Razorpay-Signature header against raw body.
-  // Capture raw body for webhook signature verification via a scoped plugin.
   app.register(async (scope) => {
     let rawBodyStore = "";
     scope.addHook("preParsing", async (req, _reply, payload) => {
@@ -243,57 +337,60 @@ export async function registerPaymentRoutes(
 
       const headerSig = req.headers["x-razorpay-signature"] as string | undefined;
 
-    if (!env.RAZORPAY_WEBHOOK_SECRET) {
-      return reply.code(500).send({ error: "webhook_secret_not_configured" });
-    }
+      if (!env.RAZORPAY_WEBHOOK_SECRET) {
+        return reply.code(500).send({ error: "webhook_secret_not_configured" });
+      }
 
-    if (!headerSig) return reply.code(400).send({ error: "missing_signature" });
+      if (!headerSig) return reply.code(400).send({ error: "missing_signature" });
 
-    const expected = createHmac("sha256", env.RAZORPAY_WEBHOOK_SECRET)
-      .update(rawBody ?? "")
-      .digest("hex");
-    const whSigBuf = Buffer.from(headerSig);
-    const whExpBuf = Buffer.from(expected);
-    if (whSigBuf.length !== whExpBuf.length || !timingSafeEqual(whExpBuf, whSigBuf))
-      return reply.code(400).send({ error: "invalid_signature" });
+      const expected = createHmac("sha256", env.RAZORPAY_WEBHOOK_SECRET)
+        .update(rawBody ?? "")
+        .digest("hex");
+      const whSigBuf = Buffer.from(headerSig);
+      const whExpBuf = Buffer.from(expected);
+      if (whSigBuf.length !== whExpBuf.length || !timingSafeEqual(whExpBuf, whSigBuf))
+        return reply.code(400).send({ error: "invalid_signature" });
 
-    const event = body.event as string | undefined;
-    const paymentEntity = (body.payload as Record<string, unknown>)?.payment as Record<string, unknown> | undefined;
-    const entity = paymentEntity?.entity as Record<string, unknown> | undefined;
+      const event = body.event as string | undefined;
+      const paymentEntity = (body.payload as Record<string, unknown>)?.payment as Record<string, unknown> | undefined;
+      const entity = paymentEntity?.entity as Record<string, unknown> | undefined;
 
-    if (!entity) return reply.code(400).send({ error: "invalid_payload" });
+      if (!entity) return reply.code(400).send({ error: "invalid_payload" });
 
-    const rzpOrderId = entity.order_id as string | undefined;
-    const rzpPaymentId = entity.id as string | undefined;
+      const rzpOrderId = entity.order_id as string | undefined;
+      const rzpPaymentId = entity.id as string | undefined;
 
-    if (!rzpOrderId || !rzpPaymentId)
-      return reply.code(400).send({ error: "missing_fields" });
+      if (!rzpOrderId || !rzpPaymentId)
+        return reply.code(400).send({ error: "missing_fields" });
 
-    const payment = await repo.payments.findByOrderId(rzpOrderId);
-    if (!payment) return reply.code(404).send({ error: "payment_not_found" });
+      const payment = await repo.payments.findByOrderId(rzpOrderId);
+      if (!payment) return reply.code(404).send({ error: "payment_not_found" });
 
-    if (event === "payment.captured" || event === "order.paid") {
-      if (payment.status === "paid") return { status: "already_confirmed" };
+      if (event === "payment.captured" || event === "order.paid") {
+        if (payment.status === "paid") return { status: "already_confirmed" };
 
-      const now = new Date().toISOString();
-      await repo.payments.update(payment.id, { razorpayPaymentId: rzpPaymentId, status: "paid" });
-      await repo.registrations.update(payment.registrationId, { paymentStatus: "paid" });
-      await repo.auditLog.create({
-        id: randomUUID(), adminId: null as unknown as string, action: "payment_confirmed",
-        target: payment.id, reason: `webhook ${event}: order=${rzpOrderId} payment=${rzpPaymentId}`,
-        createdAt: now,
-      });
-      return { status: "confirmed" };
-    }
+        const now = new Date().toISOString();
+        await repo.payments.update(payment.id, { razorpayPaymentId: rzpPaymentId, status: "paid" });
 
-    if (event === "payment.failed") {
-      if (payment.status === "paid") return { status: "already_paid_ignoring_failure" };
-      await repo.payments.update(payment.id, { razorpayPaymentId: rzpPaymentId, status: "failed" });
-      await repo.registrations.update(payment.registrationId, { paymentStatus: "failed" });
-      return { status: "marked_failed" };
-    }
+        // Create registration (idempotent — safe if verify already did it)
+        await fulfillRegistration(repo, { ...payment, status: "paid" });
 
-    return { status: "ignored", event };
+        await repo.auditLog.create({
+          id: randomUUID(), adminId: null as unknown as string, action: "payment_confirmed",
+          target: payment.id, reason: `webhook ${event}: order=${rzpOrderId} payment=${rzpPaymentId}`,
+          createdAt: now,
+        });
+        return { status: "confirmed" };
+      }
+
+      if (event === "payment.failed") {
+        if (payment.status === "paid") return { status: "already_paid_ignoring_failure" };
+        await repo.payments.update(payment.id, { razorpayPaymentId: rzpPaymentId, status: "failed" });
+        // No registration to update — it was never created
+        return { status: "marked_failed" };
+      }
+
+      return { status: "ignored", event };
     });
   });
 
@@ -311,13 +408,14 @@ export async function registerPaymentRoutes(
       const user = await repo.users.findById(payment.userId);
       if (!user) return reply.code(404).send({ error: "user_not_found" });
 
-      // Only the payer or an admin can download
       const requester = await repo.users.findById(req.authClaims!.sub);
-      if (!requester || (requester.id !== user.id && requester.role !== "admin"))
+      // `role !== "admin"` omitted super_admin, so a super admin could not
+      // download another user's invoice.
+      if (!requester || (requester.id !== user.id && !isAdmin(requester)))
         return reply.code(403).send({ error: "forbidden" });
 
-      const reg = await repo.registrations.findById(payment.registrationId);
-      const comp = reg ? await repo.competitions.findById(reg.competitionId) : null;
+      const reg = payment.registrationId ? await repo.registrations.findById(payment.registrationId) : null;
+      const comp = reg ? await repo.competitions.findById(reg.competitionId) : (payment.competitionId ? await repo.competitions.findById(payment.competitionId) : null);
       const regEvents = reg ? await repo.registrations.findEvents(reg.id) : [];
 
       const hasCustomFees = regEvents.some((e) => e.fee != null);

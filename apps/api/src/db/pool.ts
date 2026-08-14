@@ -9,7 +9,9 @@ export function getPool(): InstanceType<typeof Pool> {
   if (!_pool) {
     _pool = new Pool({
       connectionString: env.DATABASE_URL,
-      max: 60,
+      // Supabase session pooler limits to pool_size (default 15).
+      // Keep max well below that to avoid EMAXCONNSESSION errors.
+      max: 10,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 15_000,
     });

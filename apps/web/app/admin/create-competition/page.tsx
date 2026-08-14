@@ -1,8 +1,33 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { EVENT_IDS } from "@cubers/scramble-core";
+import {
+  CompetitionDetailsFields,
+  CompetitionScheduleFields,
+} from "@/features/admin/competition/CompetitionDetailsFields";
+import { buildCompetitionPayload } from "@/features/admin/competition/buildCompetitionPayload";
+import {
+  computeRoundSchedules,
+  mergeRoundSlots,
+  toLocalDatetime,
+  type RoundSlot,
+} from "@/features/admin/competition/schedule";
+import { ArchivedEventsList } from "@/features/admin/competition/ArchivedEventsList";
+import {
+  RoundScheduleList,
+  type CriteriaMethod,
+  type ScheduleRow,
+} from "@/features/admin/competition/RoundScheduleList";
+import {
+  FIELD_LABELS,
+  IMAGE_ACCEPT,
+  IMAGE_HINTS,
+  MAX_ROUND_COUNT,
+  MIN_ROUND_COUNT,
+  validateCompetitionDetails,
+  type CompetitionDetailsValue,
+} from "@/features/admin/competition/competitionFields";
 import {
   createCompetition,
   updateCompetition,
@@ -14,14 +39,7 @@ import {
   type SchedulingDefaults,
   type RuleSetDto,
 } from "@/lib/api";
-import { eventDisplayName } from "@/lib/eventNames";
-import { EventIcon } from "@/components/EventIcon";
 import { ErrorCard } from "@/components/ui/ErrorCard";
-
-interface RoundSchedule {
-  startTime?: string;
-  durationMinutes?: number;
-}
 
 interface EventSpec {
   eventType: string;
@@ -29,9 +47,14 @@ interface EventSpec {
   cutoffMs?: number;
   timeLimitMs?: number;
   fee?: number;
+  /** Created but hidden from competitors. Create offers Archive in place of a discard. */
+  archived?: boolean;
   durationMinutes?: number;
+  // Per-round format / cutoff / time-limit overrides are supported by the API
+  // but not exposed here — rounds take the event's WCA default format and the
+  // event's cutoff and time limit.
   roundCriteria?: (AdvancementCriteria | undefined)[];
-  roundSchedule?: (RoundSchedule | undefined)[];
+  roundSchedule?: (RoundSlot | undefined)[];
 }
 
 const FALLBACK_EVENT_DURATION: Record<string, number> = {
@@ -44,65 +67,74 @@ const FALLBACK_REG_DAYS = 5;
 
 type ScheduleField = "regOpens" | "regClose" | "compStart" | "compEnd";
 
-function toLocalDatetime(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+/** Identifies one planned round for pinning purposes. */
+const roundKey = (eventIndex: number, roundIndex: number) => `${eventIndex}:${roundIndex}`;
+
+/** Shared form keys → this page's internal cascade field names. */
+const SCHEDULE_KEY_TO_FIELD: Record<string, ScheduleField> = {
+  registrationOpensAt: "regOpens",
+  registrationDeadline: "regClose",
+  startsAt: "compStart",
+  endsAt: "compEnd",
+};
+
+/** Stored criteria → the row's method dropdown value. */
+function rowCriteriaMethod(c: AdvancementCriteria | undefined): CriteriaMethod {
+  return (c?.method as CriteriaMethod) ?? "none";
 }
 
-function computeRoundSchedules(
-  compStart: Date,
-  events: EventSpec[],
-  gapMinutes: number,
-  durationOverrides: Record<string, number>,
-): { schedules: RoundSchedule[][]; endsAt: Date } {
-  if (events.length === 0) return { schedules: [], endsAt: compStart };
-  const maxRounds = Math.max(...events.map((e) => e.roundCount));
-  const schedules: RoundSchedule[][] = events.map(() => []);
-  let lastEnd = new Date(compStart);
-
-  for (let dayOffset = 0; dayOffset < maxRounds; dayOffset++) {
-    const dayBase =
-      dayOffset === 0
-        ? new Date(compStart)
-        : new Date(
-            compStart.getFullYear(),
-            compStart.getMonth(),
-            compStart.getDate() + dayOffset,
-            compStart.getHours(),
-            compStart.getMinutes(),
-          );
-
-    let cursor = new Date(dayBase);
-
-    for (let ei = 0; ei < events.length; ei++) {
-      const ev = events[ei]!;
-      if (dayOffset >= ev.roundCount) continue;
-
-      const dur =
-        durationOverrides[ev.eventType] ??
-        FALLBACK_EVENT_DURATION[ev.eventType] ??
-        FALLBACK_DURATION;
-
-      schedules[ei]![dayOffset] = {
-        startTime: toLocalDatetime(cursor),
-        durationMinutes: dur,
-      };
-
-      const roundEnd = new Date(cursor.getTime() + dur * 60000);
-      if (roundEnd > lastEnd) lastEnd = roundEnd;
-      cursor = new Date(roundEnd.getTime() + gapMinutes * 60000);
-    }
-  }
-
-  return { schedules, endsAt: lastEnd };
+/** Stored criteria → the row's value input (rank as a count, others in seconds). */
+function rowCriteriaValue(c: AdvancementCriteria | undefined): string {
+  if (!c) return "";
+  if (c.method === "rank") return c.rankLimit ? String(c.rankLimit) : "";
+  if (c.method === "time") return c.timeLimitMs ? String(c.timeLimitMs / 1000) : "";
+  if (c.method === "best_single") return c.bestSingleMs ? String(c.bestSingleMs / 1000) : "";
+  return "";
 }
+
+/** Row inputs → stored criteria. Returns undefined for "none" or a blank value. */
+function buildCriteria(method: CriteriaMethod, raw: string): AdvancementCriteria | undefined {
+  const n = Number(raw);
+  if (method === "none" || !raw.trim() || Number.isNaN(n) || n < 1) return undefined;
+  if (method === "rank") return { method: "rank", rankLimit: Math.round(n) };
+  if (method === "time") return { method: "time", timeLimitMs: Math.round(n * 1000) };
+  return { method: "best_single", bestSingleMs: Math.round(n * 1000) };
+}
+
+/** Green "Choose file" button, shared by both admin screens. */
+const FILE_BUTTON =
+  "file:mr-3 file:rounded file:border-0 file:bg-emerald-600 file:px-3 file:py-1 file:text-xs file:font-semibold file:text-white hover:file:bg-emerald-500";
 
 const INPUT =
   "w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none";
-const SMALL_INPUT =
-  "rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100";
-const SELECT =
-  "rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100";
+
+/** File input for an image that is uploaded once the competition exists. */
+function ImagePicker({
+  label,
+  hint,
+  file,
+  onPick,
+}: {
+  label: string;
+  hint: string;
+  file: File | null;
+  onPick: (f: File | null) => void;
+}) {
+  return (
+    <div>
+      <label className="mb-1 block text-xs font-medium text-zinc-500">
+        {label} <span className="text-zinc-400">({hint})</span>
+      </label>
+      {file && <p className="mb-1 text-xs text-emerald-500">Selected: {file.name}</p>}
+      <input
+        type="file"
+        accept={IMAGE_ACCEPT}
+        onChange={(e) => onPick(e.target.files?.[0] ?? null)}
+        className={`${INPUT} ${FILE_BUTTON}`}
+      />
+    </div>
+  );
+}
 
 export default function CreateCompetitionPage() {
   const router = useRouter();
@@ -110,7 +142,7 @@ export default function CreateCompetitionPage() {
   const [description, setDescription] = useState("");
   const [rulesMd, setRulesMd] = useState("");
   const [ruleSets, setRuleSets] = useState<RuleSetDto[]>([]);
-  const [selectedRuleSetId, setSelectedRuleSetId] = useState<string>("");
+  const [ruleSetIds, setRuleSetIds] = useState<string[]>([]);
   const [type, setType] = useState<"free" | "paid">("free");
   const [baseFee, setBaseFee] = useState("");
   const [perEventFee, setPerEventFee] = useState("");
@@ -123,7 +155,10 @@ export default function CreateCompetitionPage() {
   ]);
   const [bannerFile, setBannerFile] = useState<File | null>(null);
   const [mobileBannerFile, setMobileBannerFile] = useState<File | null>(null);
+  const [registrationLimit, setRegistrationLimit] = useState("");
   const [featured, setFeatured] = useState(false);
+  const [featuredOrder, setFeaturedOrder] = useState("");
+  const [videoDeadlineHours, setVideoDeadlineHours] = useState("");
   const [gapMinutes, setGapMinutes] = useState(0);
   const [regDays, setRegDays] = useState(FALLBACK_REG_DAYS);
   const [durationOverrides, setDurationOverrides] = useState<Record<string, number>>({});
@@ -148,29 +183,116 @@ export default function CreateCompetitionPage() {
     fetchRuleSets().then(setRuleSets).catch(() => {});
   }, []);
 
+  /**
+   * Competition-level form state as one value, so the shared
+   * `CompetitionDetailsFields` can render it. The individual `useState`s stay the
+   * source of truth because the schedule cascade below drives them directly.
+   */
+  const details: CompetitionDetailsValue = useMemo(
+    () => ({
+      title, description, rulesMd, ruleSetIds, type,
+      baseFee, perEventFee, registrationLimit, videoDeadlineHours,
+      featured, featuredOrder,
+      registrationOpensAt, registrationDeadline, startsAt, endsAt,
+    }),
+    [title, description, rulesMd, ruleSetIds, type, baseFee, perEventFee,
+     registrationLimit, videoDeadlineHours, featured, featuredOrder,
+     registrationOpensAt, registrationDeadline, startsAt, endsAt],
+  );
+
+  /** Shared client-side validation, so Manage cannot accept what Create rejects. */
+  const fieldErrors = useMemo(() => validateCompetitionDetails(details), [details]);
+
+  const archivedRows = useMemo(
+    () =>
+      events
+        .map((ev, i) => ({ ev, i }))
+        .filter(({ ev }) => ev.archived)
+        .map(({ ev, i }) => ({
+          key: String(i),
+          eventType: ev.eventType,
+          roundCount: ev.roundCount,
+        })),
+    [events],
+  );
+
+  /**
+   * Flatten the planned events into one time-ordered list of rounds.
+   *
+   * Rounds without a start time sort last, grouped by event then round number,
+   * so a partially-scheduled competition still reads sensibly.
+   */
+  const scheduleRows: ScheduleRow[] = useMemo(() => {
+    const rows = events.flatMap((ev, eventIndex) =>
+      ev.archived ? [] :
+      Array.from({ length: ev.roundCount }, (_, ri) => {
+        const slot = ev.roundSchedule?.[ri];
+        const criteria = ev.roundCriteria?.[ri];
+        return {
+          key: `${eventIndex}:${ri}`,
+          eventKey: String(eventIndex),
+          eventType: ev.eventType,
+          roundNumber: ri + 1,
+          isFirstOfEvent: false, // set below, once sorted
+          isLastOfEvent: ri === ev.roundCount - 1,
+          startTime: slot?.startTime ?? "",
+          durationMinutes: slot?.durationMinutes ? String(slot.durationMinutes) : "",
+          criteriaMethod: rowCriteriaMethod(criteria),
+          criteriaValue: rowCriteriaValue(criteria),
+          fee: ev.fee != null ? String(ev.fee) : "",
+          eventIndex,
+        };
+      }),
+    );
+
+    rows.sort((a, b) => {
+      if (a.startTime && b.startTime) return a.startTime.localeCompare(b.startTime);
+      if (a.startTime) return -1;
+      if (b.startTime) return 1;
+      return a.eventIndex - b.eventIndex || a.roundNumber - b.roundNumber;
+    });
+
+    // Event-level controls belong to whichever of an event's rows comes first.
+    const seen = new Set<string>();
+    for (const row of rows) {
+      if (!seen.has(row.eventKey)) {
+        row.isFirstOfEvent = true;
+        seen.add(row.eventKey);
+      }
+    }
+    return rows;
+  }, [events]);
+
+  const setDetails = useCallback((patch: Partial<CompetitionDetailsValue>) => {
+    if (patch.title !== undefined) setTitle(patch.title);
+    if (patch.description !== undefined) setDescription(patch.description);
+    if (patch.rulesMd !== undefined) setRulesMd(patch.rulesMd);
+    if (patch.ruleSetIds !== undefined) setRuleSetIds(patch.ruleSetIds);
+    if (patch.type !== undefined) setType(patch.type);
+    if (patch.baseFee !== undefined) setBaseFee(patch.baseFee);
+    if (patch.perEventFee !== undefined) setPerEventFee(patch.perEventFee);
+    if (patch.registrationLimit !== undefined) setRegistrationLimit(patch.registrationLimit);
+    if (patch.videoDeadlineHours !== undefined) setVideoDeadlineHours(patch.videoDeadlineHours);
+    if (patch.featured !== undefined) setFeatured(patch.featured);
+    if (patch.featuredOrder !== undefined) setFeaturedOrder(patch.featuredOrder);
+  }, []);
+
   const buildBody = useCallback(() => {
-    const toISO = (v: string) => (v ? new Date(v).toISOString() : undefined);
     return {
-      title: title.trim(),
-      type,
-      description: description.trim() || undefined,
-      rulesMd: rulesMd.trim() || undefined,
-      ruleSetId: selectedRuleSetId || undefined,
-      baseFee: type === "paid" ? Math.round(Number(baseFee) * 100) : 0,
-      perEventFee: type === "paid" ? Math.round(Number(perEventFee) * 100) : 0,
-      registrationOpensAt: toISO(registrationOpensAt),
-      registrationDeadline: toISO(registrationDeadline),
-      startsAt: toISO(startsAt),
-      endsAt: toISO(endsAt),
+      // Competition-level fields come from the shared builder, so Create and
+      // Manage cannot produce different requests from the same values.
+      ...buildCompetitionPayload(details),
       events: events.map((ev) => ({
         ...ev,
         fee: ev.fee != null ? Math.round(ev.fee * 100) : undefined,
+        cutoffMs: ev.cutoffMs || undefined,
+        timeLimitMs: ev.timeLimitMs || undefined,
         roundSchedule: ev.roundSchedule?.map((rs) =>
           rs ? { ...rs, startTime: rs.startTime ? new Date(rs.startTime).toISOString() : undefined } : undefined,
         ),
-      })),
+      })) as Parameters<typeof createCompetition>[0]["events"],
     } as Parameters<typeof createCompetition>[0];
-  }, [title, type, description, rulesMd, selectedRuleSetId, baseFee, perEventFee, registrationOpensAt, registrationDeadline, startsAt, endsAt, events]);
+  }, [details, events]);
 
   const doAutoSave = useCallback(async () => {
     if (!title.trim()) return;
@@ -194,7 +316,7 @@ export default function CreateCompetitionPage() {
     setAutoSaveStatus("idle");
     autoSaveTimer.current = setTimeout(() => { doAutoSave(); }, 3000);
     return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current); };
-  }, [title, description, rulesMd, selectedRuleSetId, type, baseFee, perEventFee, registrationOpensAt, registrationDeadline, startsAt, endsAt, events, featured, doAutoSave]);
+  }, [title, description, rulesMd, ruleSetIds, type, baseFee, perEventFee, registrationOpensAt, registrationDeadline, startsAt, endsAt, events, featured, registrationLimit, doAutoSave]);
 
   useEffect(() => {
     const handler = (e: BeforeUnloadEvent) => {
@@ -213,6 +335,12 @@ export default function CreateCompetitionPage() {
 
   // Track which schedule fields the admin has manually set
   const userSetRef = useRef<Set<ScheduleField>>(new Set());
+  /**
+   * Round slots the admin typed by hand. The cascade leaves these alone and
+   * recomputes everything else, so archiving an event closes the gap around
+   * them rather than rewriting the whole day.
+   */
+  const roundPinnedRef = useRef<Set<string>>(new Set());
 
   // Cascade: derive all downstream fields that the user hasn't manually set.
   // changedField = the field the user just edited (anchor point).
@@ -224,9 +352,9 @@ export default function CreateCompetitionPage() {
       currentEvents: EventSpec[],
       gap: number,
       durOverrides: Record<string, number>,
-    ): RoundSchedule[][] | null => {
+    ): RoundSlot[][] | null => {
       const pinned = userSetRef.current;
-      let roundSchedulesOut: RoundSchedule[][] | null = null;
+      let roundSchedulesOut: RoundSlot[][] | null = null;
 
       // ── Forward cascade (downstream) ──
 
@@ -265,7 +393,7 @@ export default function CreateCompetitionPage() {
           new Date(vals.compStart),
           currentEvents,
           gap,
-          durOverrides,
+          (type) => durOverrides[type] ?? FALLBACK_EVENT_DURATION[type] ?? FALLBACK_DURATION,
         );
         roundSchedulesOut = schedules;
         // compEnd always follows round schedules unless admin explicitly set it
@@ -302,6 +430,26 @@ export default function CreateCompetitionPage() {
     }
   };
 
+  /** Unpin everything and re-derive the schedule from the registration open date. */
+  const resetScheduleToAuto = useCallback(() => {
+    userSetRef.current.clear();
+    userSetRef.current.add("regOpens");
+    roundPinnedRef.current.clear();
+    if (!registrationOpensAt) return;
+    const schedules = cascade(
+      "regOpens",
+      { regOpens: registrationOpensAt, regClose: "", compStart: "", compEnd: "" },
+      events,
+      gapMinutes,
+      durationOverrides,
+    );
+    if (schedules) {
+      setEvents((prev) =>
+        prev.map((ev, i) => ({ ...ev, roundSchedule: schedules[i] ?? ev.roundSchedule })),
+      );
+    }
+  }, [registrationOpensAt, cascade, events, gapMinutes, durationOverrides]);
+
   // Recalculate compEnd from the actual round schedule entries
   const recalcCompEnd = useCallback(
     (evts: EventSpec[]) => {
@@ -329,14 +477,15 @@ export default function CreateCompetitionPage() {
         new Date(startsAt),
         newEvents,
         gap,
-        durOverrides,
+        (type) => durOverrides[type] ?? FALLBACK_EVENT_DURATION[type] ?? FALLBACK_DURATION,
       );
       setEvents((prev) =>
         prev.map((ev, i) => {
           const computed = schedules[i];
           if (!computed) return ev;
-          const existing = ev.roundSchedule ?? [];
-          const merged = computed.map((cs, ri) => existing[ri] ?? cs);
+          const merged = mergeRoundSlots(computed, ev.roundSchedule ?? [], (ri) =>
+            roundPinnedRef.current.has(roundKey(i, ri)),
+          );
           return { ...ev, roundSchedule: merged };
         }),
       );
@@ -351,19 +500,85 @@ export default function CreateCompetitionPage() {
     setEvents(next);
     recascadeRounds(next, gapMinutes, durationOverrides);
   };
-  const removeEvent = (i: number) => {
-    const next = events.filter((_, idx) => idx !== i);
-    setEvents(next);
-    recascadeRounds(next, gapMinutes, durationOverrides);
-  };
   const updateEvent = (i: number, patch: Partial<EventSpec>) => {
     const next = events.map((e, idx) => (idx === i ? { ...e, ...patch } : e));
     setEvents(next);
-    if ("roundCount" in patch || "eventType" in patch) {
+    if ("roundCount" in patch || "eventType" in patch || "archived" in patch) {
       recascadeRounds(next, gapMinutes, durationOverrides);
     } else if ("roundSchedule" in patch) {
       recalcCompEnd(next);
     }
+  };
+
+  /**
+   * Drop an archived event from the form entirely.
+   *
+   * Nothing is saved yet on this screen, so deleting is simply removing it from
+   * the list — and archive-then-delete is how you discard an event added by
+   * mistake, since the rows themselves offer Archive rather than Remove.
+   */
+  const removeEvent = (i: number) => {
+    const next = events.filter((_, idx) => idx !== i);
+    setEvents(next);
+    // Round pins are keyed by event index, so they no longer line up.
+    roundPinnedRef.current.clear();
+    recascadeRounds(next, gapMinutes, durationOverrides);
+  };
+
+  /** +/− on the event's first row. Rounds are clamped to the WCA range. */
+  const changeRoundCount = (i: number, delta: number) => {
+    const ev = events[i];
+    if (!ev) return;
+    const next = Math.max(MIN_ROUND_COUNT, Math.min(ev.roundCount + delta, MAX_ROUND_COUNT));
+    if (next === ev.roundCount) return;
+    updateEvent(i, { roundCount: next });
+  };
+
+  /**
+   * Apply a row edit back onto the event's parallel per-round arrays.
+   *
+   * Create has no round records — a round is an index into these arrays, so a
+   * change has to be written positionally rather than by id.
+   */
+  const applyRoundPatch = (
+    eventIndex: number,
+    roundIndex: number,
+    patch: Partial<ScheduleRow>,
+  ) => {
+    const ev = events[eventIndex];
+    if (!ev) return;
+
+    /** Grow a sparse per-round array to the event's round count before writing. */
+    const sized = <T,>(arr: (T | undefined)[] | undefined): (T | undefined)[] => {
+      const out = [...(arr ?? [])];
+      while (out.length < ev.roundCount) out.push(undefined);
+      return out;
+    };
+
+    const next: Partial<EventSpec> = {};
+
+    if (patch.startTime !== undefined || patch.durationMinutes !== undefined) {
+      // Typing a time pins the slot so later recascades keep it.
+      roundPinnedRef.current.add(roundKey(eventIndex, roundIndex));
+      const schedule = sized<RoundSlot>(ev.roundSchedule);
+      const slot = { ...(schedule[roundIndex] ?? {}) };
+      if (patch.startTime !== undefined) slot.startTime = patch.startTime || undefined;
+      if (patch.durationMinutes !== undefined) {
+        slot.durationMinutes = patch.durationMinutes ? Number(patch.durationMinutes) : undefined;
+      }
+      schedule[roundIndex] = slot;
+      next.roundSchedule = schedule;
+    }
+
+    if (patch.criteriaMethod !== undefined || patch.criteriaValue !== undefined) {
+      const criteria = sized<AdvancementCriteria>(ev.roundCriteria);
+      const method = patch.criteriaMethod ?? rowCriteriaMethod(criteria[roundIndex]);
+      const raw = patch.criteriaValue ?? rowCriteriaValue(criteria[roundIndex]);
+      criteria[roundIndex] = buildCriteria(method, raw);
+      next.roundCriteria = criteria;
+    }
+
+    if (Object.keys(next).length > 0) updateEvent(eventIndex, next);
   };
 
   const onSubmit = async (status: "draft" | "published") => {
@@ -382,17 +597,16 @@ export default function CreateCompetitionPage() {
       } else {
         await updateCompetition(id, body as Parameters<typeof updateCompetition>[1]);
       }
-      const updates: Record<string, unknown> = {};
-      if (status !== "draft") updates.status = status;
-      if (featured) updates.featured = true;
-      if (Object.keys(updates).length > 0) {
-        await updateCompetition(
-          id,
-          updates as Parameters<typeof updateCompetition>[1],
-        );
-      }
+      // Upload images BEFORE the status change — the server requires a banner
+      // to publish.
       if (bannerFile) await uploadCompetitionBanner(id, bannerFile);
       if (mobileBannerFile) await uploadCompetitionMobileBanner(id, mobileBannerFile);
+
+      // `featured` now travels in the main body like every other field, so this
+      // second call is only ever about publishing.
+      if (status !== "draft") {
+        await updateCompetition(id, { status } as Parameters<typeof updateCompetition>[1]);
+      }
       router.push("/admin");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -420,7 +634,7 @@ export default function CreateCompetitionPage() {
   };
 
   return (
-    <div className="mx-auto max-w-4xl px-6 py-8">
+    <div className="mx-auto max-w-[1400px] px-8 py-10">
       <h1 className="mb-6 text-2xl font-bold text-zinc-900 dark:text-zinc-100">
         Create Competition
       </h1>
@@ -439,378 +653,69 @@ export default function CreateCompetitionPage() {
       )}
 
       <div className="space-y-6">
-        {/* Title */}
-        <div>
-          <label className="mb-1 block text-xs font-medium text-zinc-500">
-            Title
-          </label>
-          <input
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            placeholder="Midweek Madness"
-            className={INPUT}
-          />
-        </div>
+        <CompetitionDetailsFields
+          value={details}
+          onChange={setDetails}
+          errors={fieldErrors}
+          ruleSets={ruleSets}
+          imageSlot={
+            <div className="grid gap-4 md:grid-cols-2">
+              <ImagePicker
+                label={FIELD_LABELS.desktopBanner}
+                hint={IMAGE_HINTS.desktopBanner}
+                file={bannerFile}
+                onPick={setBannerFile}
+              />
+              <ImagePicker
+                label={FIELD_LABELS.mobileBanner}
+                hint={IMAGE_HINTS.mobileBanner}
+                file={mobileBannerFile}
+                onPick={setMobileBannerFile}
+              />
+            </div>
+          }
+        />
 
-        {/* Description */}
-        <div>
-          <label className="mb-1 block text-xs font-medium text-zinc-500">
-            Description
-          </label>
-          <textarea
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            placeholder="Short description for competitors..."
-            rows={3}
-            className={INPUT}
-          />
-        </div>
+        <CompetitionScheduleFields
+          value={details}
+          errors={fieldErrors}
+          onReset={resetScheduleToAuto}
+          onChange={(patch) => {
+            for (const [key, val] of Object.entries(patch)) {
+              const field = SCHEDULE_KEY_TO_FIELD[key as keyof typeof SCHEDULE_KEY_TO_FIELD];
+              if (field) handleScheduleChange(field, val as string);
+            }
+          }}
+        />
+        <p className="text-xs text-zinc-500">
+          Dates auto-fill as you go. Override any field and everything downstream adjusts.
+          Durations and gaps are configured in{" "}
+          <a href="/admin/settings" className="text-emerald-400 hover:underline">System Settings</a>.
+        </p>
 
-        {/* Rules */}
-        <div>
-          <label className="mb-1 block text-xs font-medium text-zinc-500">
-            Rules
-          </label>
-          <div className="flex items-center gap-3">
-            <select
-              value={selectedRuleSetId}
-              onChange={(e) => {
-                const id = e.target.value;
-                setSelectedRuleSetId(id);
-                if (id) {
-                  const rs = ruleSets.find((r) => r.id === id);
-                  if (rs) setRulesMd(rs.content);
-                }
-              }}
-              className={`flex-1 ${INPUT}`}
-            >
-              <option value="">— Select a rule set or write custom —</option>
-              {ruleSets.map((rs) => (
-                <option key={rs.id} value={rs.id}>{rs.name}</option>
-              ))}
-            </select>
-          </div>
-          <textarea
-            value={rulesMd}
-            onChange={(e) => setRulesMd(e.target.value)}
-            placeholder={selectedRuleSetId ? "Rules loaded from selected set. Edit below to customize." : "Write custom rules (Markdown)..."}
-            rows={4}
-            className={`mt-2 font-mono ${INPUT}`}
-          />
-          {selectedRuleSetId && (
-            <p className="mt-1 text-[11px] text-zinc-500">
-              Editing the text above won&apos;t change the saved rule set. To edit rule sets, go to Settings.
-            </p>
-          )}
-        </div>
+        <RoundScheduleList
+          rows={scheduleRows}
+          isPaid={type === "paid"}
+          takenEventTypes={events.map((e) => e.eventType)}
+          onAddEvent={addEvent}
+          onAddRound={(eventKey) => changeRoundCount(Number(eventKey), +1)}
+          onRemoveRound={(eventKey) => changeRoundCount(Number(eventKey), -1)}
+          onEventChange={(eventKey, patch) => {
+            const i = Number(eventKey);
+            const next: Partial<EventSpec> = {};
+            if (patch.eventType !== undefined) next.eventType = patch.eventType;
+            if (patch.fee !== undefined) next.fee = patch.fee ? Number(patch.fee) : undefined;
+            if (patch.archived !== undefined) next.archived = patch.archived;
+            updateEvent(i, next);
+          }}
+          onRoundChange={(row, patch) => applyRoundPatch(Number(row.eventKey), row.roundNumber - 1, patch)}
+        />
+        <ArchivedEventsList
+          rows={archivedRows}
+          onRestore={(key) => updateEvent(Number(key), { archived: false })}
+          onDelete={(key) => removeEvent(Number(key))}
+        />
 
-        {/* Banners */}
-        <div className="grid gap-4 md:grid-cols-2">
-          <div>
-            <label className="mb-1 block text-xs font-medium text-zinc-500">
-              Desktop Banner <span className="text-zinc-400">(1200×400 recommended)</span>
-            </label>
-            {bannerFile && (
-              <p className="mb-1 text-xs text-emerald-500">Selected: {bannerFile.name}</p>
-            )}
-            <input
-              type="file"
-              accept="image/png,image/jpeg,image/gif,image/webp"
-              onChange={(e) => setBannerFile(e.target.files?.[0] ?? null)}
-              className={INPUT + " file:mr-3 file:rounded file:border-0 file:bg-emerald-600 file:px-3 file:py-1 file:text-xs file:font-semibold file:text-white"}
-            />
-          </div>
-          <div>
-            <label className="mb-1 block text-xs font-medium text-zinc-500">
-              Mobile Banner <span className="text-zinc-400">(600×400 recommended)</span>
-            </label>
-            {mobileBannerFile && (
-              <p className="mb-1 text-xs text-emerald-500">Selected: {mobileBannerFile.name}</p>
-            )}
-            <input
-              type="file"
-              accept="image/png,image/jpeg,image/gif,image/webp"
-              onChange={(e) => setMobileBannerFile(e.target.files?.[0] ?? null)}
-              className={INPUT + " file:mr-3 file:rounded file:border-0 file:bg-zinc-600 file:px-3 file:py-1 file:text-xs file:font-semibold file:text-white"}
-            />
-          </div>
-        </div>
-
-        {/* Type + fees + featured */}
-        <div className="flex flex-wrap items-end gap-4">
-          <div>
-            <label className="mb-1 block text-xs font-medium text-zinc-500">
-              Type
-            </label>
-            <select
-              value={type}
-              onChange={(e) => setType(e.target.value as "free" | "paid")}
-              className={SELECT}
-            >
-              <option value="free">Free</option>
-              <option value="paid">Paid</option>
-            </select>
-          </div>
-          <div>
-            <label className="mb-1 block text-xs font-medium text-zinc-500">
-              Featured
-            </label>
-            <select
-              value={featured ? "yes" : "no"}
-              onChange={(e) => setFeatured(e.target.value === "yes")}
-              className={SELECT}
-            >
-              <option value="no">No</option>
-              <option value="yes">Yes</option>
-            </select>
-          </div>
-          {type === "paid" && (
-            <>
-              <div>
-                <label className="mb-1 block text-xs font-medium text-zinc-500">
-                  Base Fee (₹)
-                </label>
-                <input
-                  type="number"
-                  min={0}
-                  value={baseFee}
-                  onChange={(e) => setBaseFee(e.target.value)}
-                  className={`w-28 ${INPUT}`}
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-xs font-medium text-zinc-500">
-                  Per-Event Fee (₹)
-                </label>
-                <input
-                  type="number"
-                  min={0}
-                  value={perEventFee}
-                  onChange={(e) => setPerEventFee(e.target.value)}
-                  className={`w-28 ${INPUT}`}
-                />
-              </div>
-            </>
-          )}
-        </div>
-
-        {/* Schedule */}
-        <div>
-          <div className="mb-2 flex items-center justify-between">
-            <label className="text-xs font-medium uppercase tracking-wide text-zinc-500">
-              Schedule
-            </label>
-            <button
-              type="button"
-              onClick={() => {
-                userSetRef.current.clear();
-                userSetRef.current.add("regOpens");
-                if (registrationOpensAt) {
-                  const vals = {
-                    regOpens: registrationOpensAt,
-                    regClose: "",
-                    compStart: "",
-                    compEnd: "",
-                  };
-                  const schedules = cascade("regOpens", vals, events, gapMinutes, durationOverrides);
-                  if (schedules) {
-                    setEvents((prev) =>
-                      prev.map((ev, i) => ({
-                        ...ev,
-                        roundSchedule: schedules[i] ?? ev.roundSchedule,
-                      })),
-                    );
-                  }
-                }
-              }}
-              className="text-xs text-indigo-400 transition hover:text-indigo-300"
-            >
-              Reset to auto
-            </button>
-          </div>
-
-          <div className="grid gap-3 sm:grid-cols-2">
-            {(
-              [
-                { label: "Registration opens", field: "regOpens" as ScheduleField, value: registrationOpensAt },
-                { label: "Registration closes", field: "regClose" as ScheduleField, value: registrationDeadline },
-                { label: "Competition starts", field: "compStart" as ScheduleField, value: startsAt },
-                { label: "Competition ends", field: "compEnd" as ScheduleField, value: endsAt },
-              ] as const
-            ).map(({ label, field, value }) => (
-              <div key={field}>
-                <label className="mb-1 flex items-center gap-1.5 text-xs text-zinc-500">
-                  {label}
-                  {field !== "regOpens" && userSetRef.current.has(field) && (
-                    <span className="rounded bg-indigo-900/30 px-1.5 py-0.5 text-[10px] text-indigo-400">
-                      manual
-                    </span>
-                  )}
-                  {field !== "regOpens" && !userSetRef.current.has(field) && value && (
-                    <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-500">
-                      auto
-                    </span>
-                  )}
-                </label>
-                <input
-                  type="datetime-local"
-                  value={value}
-                  onChange={(e) => handleScheduleChange(field, e.target.value)}
-                  className={INPUT}
-                />
-              </div>
-            ))}
-          </div>
-
-          <p className="mt-3 text-xs text-zinc-500">
-            Dates auto-fill as you go. Override any field and everything downstream adjusts.
-            Durations and gaps are configured in <a href="/admin/settings" className="text-emerald-400 hover:underline">System Settings</a>.
-          </p>
-        </div>
-
-        {/* Events */}
-        <div>
-          <div className="mb-2 flex items-center justify-between">
-            <label className="text-xs font-medium text-zinc-500">Events</label>
-            <button
-              onClick={addEvent}
-              className="rounded border border-zinc-300 px-2 py-1 text-xs text-zinc-600 transition hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
-            >
-              + Add event
-            </button>
-          </div>
-          <div className="overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
-            <table className="w-full text-left text-xs">
-              <thead>
-                <tr className="border-b border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900/60">
-                  <th className="px-3 py-2 font-medium text-zinc-500">Event</th>
-                  <th className="px-3 py-2 font-medium text-zinc-500">Rounds</th>
-                  {type === "paid" && <th className="px-3 py-2 font-medium text-zinc-500">Fee (₹)</th>}
-                  <th className="px-3 py-2 font-medium text-zinc-500">Round Schedule</th>
-                  <th className="px-3 py-2 font-medium text-zinc-500 w-16" />
-                </tr>
-              </thead>
-              <tbody>
-                {events.map((ev, i) => {
-                  const updateRoundCriteriaFor = (ri: number, c: AdvancementCriteria | undefined) => {
-                    const arr = [...(ev.roundCriteria ?? new Array(ev.roundCount).fill(undefined))];
-                    while (arr.length < ev.roundCount) arr.push(undefined);
-                    arr[ri] = c;
-                    updateEvent(i, { roundCriteria: arr });
-                  };
-                  const updateRoundScheduleFor = (ri: number, patch: Partial<RoundSchedule>) => {
-                    const arr = [...(ev.roundSchedule ?? new Array(ev.roundCount).fill(undefined))];
-                    while (arr.length < ev.roundCount) arr.push(undefined);
-                    arr[ri] = { ...(arr[ri] ?? {}), ...patch };
-                    updateEvent(i, { roundSchedule: arr });
-                  };
-                  return (
-                    <tr key={i} className="border-b border-zinc-100 dark:border-zinc-800/60">
-                      <td className="px-3 py-2 align-top">
-                        <div className="flex items-center gap-2">
-                          <EventIcon eventId={ev.eventType} size={18} />
-                          <select
-                            value={ev.eventType}
-                            onChange={(e) => updateEvent(i, { eventType: e.target.value })}
-                            className={SMALL_INPUT}
-                          >
-                            {EVENT_IDS.map((id) => (
-                              <option key={id} value={id}>{eventDisplayName(id)}</option>
-                            ))}
-                          </select>
-                        </div>
-                      </td>
-                      <td className="px-3 py-2 align-top">
-                        <input
-                          type="number"
-                          min={1}
-                          max={10}
-                          value={ev.roundCount}
-                          onChange={(e) => updateEvent(i, { roundCount: Number(e.target.value) })}
-                          className={`w-16 ${SMALL_INPUT}`}
-                        />
-                      </td>
-                      {type === "paid" && (
-                        <td className="px-3 py-2 align-top">
-                          <input
-                            type="number"
-                            min={0}
-                            value={ev.fee ?? ""}
-                            placeholder="default"
-                            onChange={(e) => updateEvent(i, { fee: e.target.value ? Number(e.target.value) : undefined })}
-                            className={`w-24 ${SMALL_INPUT}`}
-                          />
-                        </td>
-                      )}
-                      <td className="px-3 py-2 align-top">
-                        <div className="space-y-1.5">
-                          {Array.from({ length: ev.roundCount }, (_, ri) => {
-                            const isLast = ri === ev.roundCount - 1;
-                            const criteria = ev.roundCriteria?.[ri];
-                            const schedule = ev.roundSchedule?.[ri];
-                            return (
-                              <div key={ri} className="flex flex-wrap items-center gap-2">
-                                <span className="w-16 text-[11px] font-medium text-zinc-400">
-                                  R{ri + 1}{isLast ? " (F)" : ""}
-                                </span>
-                                <input
-                                  type="datetime-local"
-                                  value={schedule?.startTime ?? ""}
-                                  onChange={(e) => updateRoundScheduleFor(ri, { startTime: e.target.value || undefined })}
-                                  className={SMALL_INPUT}
-                                />
-                                <input
-                                  type="number"
-                                  min={1}
-                                  value={schedule?.durationMinutes ?? ""}
-                                  onChange={(e) => updateRoundScheduleFor(ri, { durationMinutes: e.target.value ? Number(e.target.value) : undefined })}
-                                  placeholder="min"
-                                  className={`w-16 ${SMALL_INPUT}`}
-                                />
-                                {ev.roundCount > 1 && (
-                                  <>
-                                    <select
-                                      value={criteria?.method ?? "none"}
-                                      onChange={(e) => {
-                                        const m = e.target.value;
-                                        if (m === "none") updateRoundCriteriaFor(ri, undefined);
-                                        else updateRoundCriteriaFor(ri, { method: m as "rank" | "time" | "best_single" });
-                                      }}
-                                      className={SMALL_INPUT}
-                                    >
-                                      <option value="none">No shortlist</option>
-                                      <option value="rank">Top N</option>
-                                      <option value="time">ao5 ≤ X</option>
-                                      <option value="best_single">Best Single ≤ X</option>
-                                    </select>
-                                    {criteria?.method === "rank" && (
-                                      <input type="number" min={1} value={criteria.rankLimit ?? ""} onChange={(e) => updateRoundCriteriaFor(ri, { method: "rank", rankLimit: Number(e.target.value) })} placeholder="N" className={`w-14 ${SMALL_INPUT}`} />
-                                    )}
-                                    {criteria?.method === "time" && (
-                                      <input type="number" min={1} value={criteria.timeLimitMs ? criteria.timeLimitMs / 1000 : ""} onChange={(e) => updateRoundCriteriaFor(ri, { method: "time", timeLimitMs: Number(e.target.value) * 1000 })} placeholder="sec" className={`w-16 ${SMALL_INPUT}`} />
-                                    )}
-                                    {criteria?.method === "best_single" && (
-                                      <input type="number" min={1} value={criteria.bestSingleMs ? criteria.bestSingleMs / 1000 : ""} onChange={(e) => updateRoundCriteriaFor(ri, { method: "best_single", bestSingleMs: Number(e.target.value) * 1000 })} placeholder="sec" className={`w-16 ${SMALL_INPUT}`} />
-                                    )}
-                                  </>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </td>
-                      <td className="px-3 py-2 align-top">
-                        {events.length > 1 && (
-                          <button onClick={() => removeEvent(i)} className="text-xs text-zinc-400 transition hover:text-red-400">✕</button>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
 
         {/* Actions */}
         <div className="sticky bottom-0 z-10 -mx-6 flex items-center gap-3 border-t border-zinc-200 bg-white/95 px-6 py-4 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/95">

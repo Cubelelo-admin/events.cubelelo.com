@@ -1,7 +1,10 @@
 import type { FastifyInstance } from "fastify";
 import type { Repository } from "../../db/repo";
 import { resolveUser, requireAuth } from "../../auth/plugin";
+import { isAdmin as isAdminRole, isAdminOrMod } from "../../auth/ownership";
 import { effectiveCompStatus, effectiveRoundStatus } from "../../lib/statusUtils";
+import { FORMAT_ATTEMPTS } from "@cubers/types";
+import { formatForRound, cutoffForRound, timeLimitForRound } from "../../lib/roundFormat";
 
 export async function registerCompetitionRoutes(
   app: FastifyInstance,
@@ -25,7 +28,7 @@ export async function registerCompetitionRoutes(
         id: c.id, title: c.title, type: c.type,
         status: effectiveCompStatus(c),
         description: c.description,
-        coverUrl: c.coverUrl, coverCaption: c.coverCaption, bannerUrl: c.bannerUrl, mobileBannerUrl: c.mobileBannerUrl,
+        bannerUrl: c.bannerUrl, mobileBannerUrl: c.mobileBannerUrl,
         registrationOpensAt: c.registrationOpensAt ?? null,
         registrationDeadline: c.registrationDeadline ?? null,
         startsAt: c.startsAt ?? null,
@@ -39,7 +42,7 @@ export async function registerCompetitionRoutes(
     "/api/v1/competitions",
     async (req) => {
       const caller = await resolveUser(repo, req);
-      const isFullAdmin = caller?.role === "admin" || caller?.role === "super_admin";
+      const isFullAdmin = isAdminRole(caller);
       const isMod = caller?.role === "moderator";
       const isAdmin = isFullAdmin || isMod;
 
@@ -99,7 +102,7 @@ export async function registerCompetitionRoutes(
         registrationDeadline: c.registrationDeadline ?? null,
         startsAt: c.startsAt ?? null,
         endsAt: c.endsAt ?? null,
-        coverUrl: c.coverUrl, bannerUrl: c.bannerUrl, mobileBannerUrl: c.mobileBannerUrl,
+        bannerUrl: c.bannerUrl, mobileBannerUrl: c.mobileBannerUrl,
         featured: c.featured,
         featuredOrder: c.featuredOrder,
         createdAt: c.createdAt,
@@ -120,7 +123,7 @@ export async function registerCompetitionRoutes(
       if (!competition) return reply.code(404).send({ error: "competition_not_found" });
 
       const caller = await resolveUser(repo, req);
-      const isAdmin = caller?.role === "admin" || caller?.role === "super_admin" || caller?.role === "moderator";
+      const isAdmin = isAdminOrMod(caller);
       const effStatus = effectiveCompStatus(competition);
 
       // Non-admins cannot see draft competitions
@@ -128,12 +131,21 @@ export async function registerCompetitionRoutes(
         return reply.code(404).send({ error: "competition_not_found" });
       }
 
-      const [events, rounds, regCount, publisher] = await Promise.all([
+      const [events, rounds, regCount, publisher, ruleSetIds] = await Promise.all([
         repo.competitionEvents.findByCompetition(competition.id),
         repo.rounds.findByCompetition(competition.id),
         repo.competitions.countRegistrations(competition.id),
         competition.publishedBy ? repo.users.findById(competition.publishedBy) : null,
+        repo.competitionRuleSets.findByCompetition(competition.id),
       ]);
+
+      // Rule set content is resolved at read time rather than copied into the
+      // competition, so editing a rule set updates every competition using it.
+      const ruleSetMap = await repo.ruleSets.findByIds(ruleSetIds);
+      const ruleSets = ruleSetIds
+        .map((rsId) => ruleSetMap.get(rsId))
+        .filter((rs): rs is NonNullable<typeof rs> => rs !== undefined)
+        .map((rs) => ({ id: rs.id, name: rs.name, content: rs.content }));
 
       // Batch fetch all scramble sets for this competition's rounds (eliminates N+1)
       const scrambleMap = await repo.scrambleSets.findByRounds(rounds.map((r) => r.id));
@@ -144,17 +156,20 @@ export async function registerCompetitionRoutes(
         type: competition.type,
         status: effStatus,
         description: competition.description,
+        // `rulesMd` is the admin's own additional text; `ruleSets` are the
+        // selected sets, resolved and in the order chosen.
         rulesMd: competition.rulesMd,
+        ruleSets,
         baseFee: competition.baseFee,
         perEventFee: competition.perEventFee,
         registrationOpensAt: competition.registrationOpensAt ?? null,
         registrationDeadline: competition.registrationDeadline ?? null,
         startsAt: competition.startsAt ?? null,
         endsAt: competition.endsAt ?? null,
-        coverUrl: competition.coverUrl,
         bannerUrl: competition.bannerUrl,
         mobileBannerUrl: competition.mobileBannerUrl,
         featured: competition.featured,
+        featuredOrder: competition.featuredOrder ?? null,
         createdBy: competition.createdBy,
         publishedBy: competition.publishedBy ?? null,
         publishedByName: publisher?.name ?? null,
@@ -181,8 +196,21 @@ export async function registerCompetitionRoutes(
               roundNumber: r.roundNumber,
               status: effectiveRoundStatus(r),
               eventType: e.eventType,
+              // WCA format drives the attempt count the terminal offers; without
+              // it the client would fall back to assuming every round is an Ao5.
+              format: formatForRound(r, e.eventType),
+              attempts: FORMAT_ATTEMPTS[formatForRound(r, e.eventType)],
+              // Effective value (round's own, else the event default) — what the
+              // terminal and submit validation actually use.
+              cutoffMs: cutoffForRound(r, e) ?? null,
+              timeLimitMs: timeLimitForRound(r, e) ?? null,
+              // The round's own override, null when it inherits. The admin UI
+              // needs both to distinguish "inherits 20s" from "overrides to 20s".
+              ownCutoffMs: r.cutoffMs ?? null,
+              ownTimeLimitMs: r.timeLimitMs ?? null,
               opensAt: r.opensAt ?? null,
               closesAt: r.closesAt ?? null,
+              durationMinutes: r.durationMinutes ?? null,
               advancementCount: r.advancementCount ?? null,
               advancementCriteria: r.advancementCriteria ?? null,
               scrambleLocked: Boolean(scrambleMap.get(r.id)?.lockedAt),
@@ -587,12 +615,20 @@ export async function registerCompetitionRoutes(
     },
   );
 
-  // Participant list for a competition
+  // Participant list for a competition.
+  // Authenticated: this is a roster of real people with their city and country.
+  // Organisers additionally see registration times; everyone else does not.
   app.get<{ Params: { id: string } }>(
     "/api/v1/competitions/:id/participants",
+    { preHandler: requireAuth },
     async (req, reply) => {
       const competition = await repo.competitions.findById(req.params.id);
       if (!competition) return reply.code(404).send({ error: "competition_not_found" });
+
+      const caller = await resolveUser(repo, req);
+      const isOrganiser =
+        isAdminRole(caller) ||
+        (caller?.role === "moderator" && competition.createdBy === caller.id);
 
       const regs = (await repo.registrations.findByCompetition(competition.id))
         .filter((r) => r.paymentStatus === "paid" || competition.type === "free" || competition.type === "practice");
@@ -611,7 +647,7 @@ export async function registerCompetitionRoutes(
           city: u?.city ?? null,
           country: u?.country ?? null,
           eventTypes: (eventsByReg.get(reg.id) ?? []).map((e) => e.eventType),
-          registeredAt: reg.createdAt,
+          ...(isOrganiser ? { registeredAt: reg.createdAt } : {}),
         };
       });
 

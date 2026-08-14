@@ -84,7 +84,8 @@ describe("admin competition lifecycle", () => {
     expect((await get(`/api/v1/rounds/${round1}`)).body.status).toBe("open");
     const scramble = await get(`/api/v1/rounds/${round1}/scramble`, admin);
     expect(scramble.status).toBe(200);
-    expect(scramble.body.scrambles).toHaveLength(5);
+    // Ao5 round: 5 attempts + 2 WCA extras (E1, E2) reserved for extra attempts.
+    expect(scramble.body.scrambles).toHaveLength(7);
   });
 
   it("updates competition status", async () => {

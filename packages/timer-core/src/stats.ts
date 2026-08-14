@@ -3,6 +3,22 @@ import type { Solve, SolveStats } from "@cubers/types";
 /** Internal sentinel for a DNF when reducing to comparable numbers. */
 const DNF = Number.POSITIVE_INFINITY;
 
+/** Averages above this are rounded to the nearest second, not centisecond (WCA 9f2). */
+const TEN_MINUTES_MS = 600_000;
+
+/**
+ * Round an average or mean per WCA Regulation 9f2: to the nearest centisecond,
+ * or — for results over ten minutes — to the nearest second.
+ *
+ * Raw attempt times are untouched; only the derived average is rounded. Rounding
+ * to the nearest millisecond, as this previously did, produces averages that
+ * cannot be represented in official results.
+ */
+export function roundAverage(ms: number): number {
+  if (ms > TEN_MINUTES_MS) return Math.round(ms / 1000) * 1000;
+  return Math.round(ms / 10) * 10;
+}
+
 /** Effective time of a solve: either DNF → Infinity, or raw + inspection +2 + manual +2. */
 export function effectiveTime(solve: Solve): number {
   const insp = solve.inspectionPenalty ?? "none";
@@ -25,7 +41,7 @@ export function mean(solves: Solve[]): number | null {
   if (solves.length === 0) return null;
   const times = solves.map(effectiveTime);
   if (times.some((t) => t === DNF)) return null;
-  return Math.round(times.reduce((a, b) => a + b, 0) / times.length);
+  return roundAverage(times.reduce((a, b) => a + b, 0) / times.length);
 }
 
 /** Median of valid solves (DNFs excluded), or null if none are valid. */
@@ -64,7 +80,7 @@ export function average(solves: Solve[], count: number): number | null {
   if (dnfCount > trim) return null; // DNF average
   const sorted = [...window].sort((a, b) => a - b);
   const counting = sorted.slice(trim, count - trim);
-  return Math.round(counting.reduce((a, b) => a + b, 0) / counting.length);
+  return roundAverage(counting.reduce((a, b) => a + b, 0) / counting.length);
 }
 
 export const ao5 = (solves: Solve[]): number | null => average(solves, 5);

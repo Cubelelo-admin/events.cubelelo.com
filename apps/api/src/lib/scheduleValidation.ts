@@ -5,6 +5,25 @@ export interface ScheduleValidationResult {
   errors: string[];
 }
 
+/**
+ * The gate a competition must clear before it goes public.
+ *
+ * Both publish paths run this. `POST /admin/competitions` with
+ * `saveAsDraft: false` used to flip the status directly, skipping the banner
+ * requirement and the full schedule check that the PATCH path enforced — so a
+ * competition could go live with no banner and an incoherent schedule.
+ */
+export function validateForPublish(
+  comp: Partial<Competition>,
+  rounds: Round[],
+  events?: CompetitionEvent[],
+): ScheduleValidationResult {
+  if (!comp.bannerUrl) {
+    return { valid: false, errors: ["Desktop banner is required before publishing"] };
+  }
+  return validateCompetitionSchedule(comp, rounds, true, events);
+}
+
 export function validateCompetitionSchedule(
   comp: Partial<Competition>,
   rounds: Round[],

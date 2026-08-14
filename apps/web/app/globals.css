@@ -126,6 +126,26 @@ body.no-bg {
   background-color: var(--bg-page);
 }
 
+/* Focused workspace — hide navbar, footer, sidebar; remove top padding */
+body.focused-workspace {
+  padding-top: 0 !important;
+}
+body.focused-workspace nav[data-layout="navbar"] {
+  display: none !important;
+}
+body.focused-workspace footer {
+  display: none !important;
+}
+body.focused-workspace aside {
+  display: none !important;
+}
+body.focused-workspace button[title="Expand sidebar"] {
+  display: none !important;
+}
+body.focused-workspace aside + div {
+  margin-left: 0 !important;
+}
+
 body.competition-mode {
   background-color: #ffffff;
 }
@@ -264,4 +284,40 @@ body.competition-mode [data-layout="footer"] {
   .live-dot {
     animation: none;
   }
+}
+
+/*
+ * Native date/time picker icon in dark mode.
+ *
+ * The browser draws the calendar and clock indicators as dark glyphs, which are
+ * near-invisible on our dark inputs. `color-scheme: dark` is the whole fix: it
+ * tells the browser to render its own widgets for a dark surface, so the icon
+ * comes out white and the picker popup opens dark too.
+ *
+ * Do not add `filter: invert(1)` here. Chrome has already made the icon white by
+ * this point, so inverting turns it black again — which is the bug this replaced.
+ */
+.dark input[type="date"],
+.dark input[type="time"],
+.dark input[type="datetime-local"],
+.dark input[type="month"],
+.dark input[type="week"] {
+  color-scheme: dark;
+}
+
+.dark input[type="date"]::-webkit-calendar-picker-indicator,
+.dark input[type="time"]::-webkit-calendar-picker-indicator,
+.dark input[type="datetime-local"]::-webkit-calendar-picker-indicator,
+.dark input[type="month"]::-webkit-calendar-picker-indicator,
+.dark input[type="week"]::-webkit-calendar-picker-indicator {
+  opacity: 0.85;
+  cursor: pointer;
+}
+
+.dark input[type="date"]::-webkit-calendar-picker-indicator:hover,
+.dark input[type="time"]::-webkit-calendar-picker-indicator:hover,
+.dark input[type="datetime-local"]::-webkit-calendar-picker-indicator:hover,
+.dark input[type="month"]::-webkit-calendar-picker-indicator:hover,
+.dark input[type="week"]::-webkit-calendar-picker-indicator:hover {
+  opacity: 1;
 }

@@ -45,7 +45,7 @@ export async function buildApp(
       ? process.env.CORS_ORIGINS.split(",")
       : true,
   });
-  await app.register(multipart, { limits: { fileSize: 2 * 1024 * 1024 } });
+  await app.register(multipart, { limits: { fileSize: 5 * 1024 * 1024 } });
   await app.register(staticPlugin, {
     root: join(process.cwd(), "uploads"),
     prefix: "/uploads/",
@@ -64,8 +64,16 @@ export async function buildApp(
       return reply.code(status).send({ error: "internal_error" });
     }
     // For 4xx thrown via Object.assign(new Error("code"), { statusCode: N }),
-    // use the message as the error code (it's already a snake_case code).
-    return reply.code(status).send({ error: error.message });
+    // the message *is* the error code. Anything else that reaches here — a
+    // library throwing a 4xx with a prose message — would otherwise publish that
+    // prose in the `error` field where clients expect a machine code, so only
+    // snake_case codes are passed through.
+    const message = error.message ?? "";
+    if (/^[a-z][a-z0-9_]*$/.test(message)) {
+      return reply.code(status).send({ error: message });
+    }
+    app.log.warn({ err: error }, "4xx with a non-code message");
+    return reply.code(status).send({ error: "invalid_request" });
   });
 
   app.get("/health", async (_req, reply) => {
@@ -91,8 +99,11 @@ export async function buildApp(
         sms: process.env.TWILIO_ACCOUNT_SID ? "twilio" : "none",
       };
     } catch (err) {
+      // Stringifying the exception into the response leaked connection strings
+      // and internal hostnames on an unauthenticated endpoint. Log it instead.
+      app.log.error(err, "Health check failed");
       reply.code(503);
-      return { status: "error", db: null, redis: null, error: String(err) };
+      return { status: "error", db: null, redis: null };
     }
   });
 

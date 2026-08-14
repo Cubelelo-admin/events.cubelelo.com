@@ -92,6 +92,7 @@ describe("Supabase OAuth account linking", () => {
       payload: { eventType: "333" },
       headers: bearer(googleToken),
     });
-    expect(practice.statusCode).toBe(200);
+    // Creates return 201, matching every other create in the API.
+    expect(practice.statusCode).toBe(201);
   });
 });

@@ -97,8 +97,19 @@ export interface Repository {
     /** Result counts per user, one query (verification queue context). */
     countByUsers(userIds: string[]): Promise<Map<string, number>>;
     create(result: Result): Promise<void>;
+    /**
+     * Create a result unless this user already has one in the round. Returns
+     * false when a result was already present.
+     *
+     * The submit route used to reach past the repository for this, issuing raw
+     * SQL under an advisory lock in Postgres and a plain create in memory — two
+     * code paths with different duplicate-detection semantics. The race-safety
+     * belongs here, behind one contract both backends honour.
+     */
+    createIfAbsent(result: Result): Promise<boolean>;
     update(id: string, fields: Partial<Result>): Promise<Result | null>;
-    updateRanks(rankings: { id: string; rank: number }[]): Promise<void>;
+    /** `rank: null` means unranked — disqualified results, which sort last. */
+    updateRanks(rankings: { id: string; rank: number | null }[]): Promise<void>;
   };
 
   registrations: {
@@ -125,6 +136,8 @@ export interface Repository {
     findById(id: string): Promise<Payment | null>;
     findByOrderId(orderId: string): Promise<Payment | null>;
     findByRegistration(registrationId: string): Promise<Payment | null>;
+    /** Find a pending payment order for a user + competition (checkout intent). */
+    findPendingByUserAndComp(userId: string, competitionId: string): Promise<Payment | null>;
     /** Latest payment for each registration, keyed by registration id. */
     findByRegistrationIds(registrationIds: string[]): Promise<Map<string, Payment>>;
     create(payment: Payment): Promise<void>;
@@ -261,6 +274,7 @@ export interface Repository {
   };
 
   judgeAssignments: {
+    findById(id: string): Promise<JudgeAssignment | null>;
     findByRound(roundId: string): Promise<JudgeAssignment[]>;
     findByJudge(judgeId: string): Promise<JudgeAssignment[]>;
     create(assignment: JudgeAssignment): Promise<void>;
@@ -270,9 +284,26 @@ export interface Repository {
   ruleSets: {
     findAll(): Promise<RuleSet[]>;
     findById(id: string): Promise<RuleSet | null>;
+    findByIds(ids: string[]): Promise<Map<string, RuleSet>>;
     create(ruleSet: RuleSet): Promise<void>;
     update(id: string, fields: Partial<RuleSet>): Promise<RuleSet | null>;
     delete(id: string): Promise<void>;
+  };
+
+  /**
+   * Which rule sets a competition uses, in the order the admin chose.
+   *
+   * A competition can use several, so this is a join rather than a column on
+   * `competitions`. The rule sets' text is resolved at read time — editing a
+   * rule set therefore updates every competition using it.
+   */
+  competitionRuleSets: {
+    /** Rule set ids for one competition, ordered by position. */
+    findByCompetition(competitionId: string): Promise<string[]>;
+    /** Rule set ids for several competitions at once, keyed by competition id. */
+    findByCompetitions(competitionIds: string[]): Promise<Map<string, string[]>>;
+    /** Replace the whole selection. An empty array clears it. */
+    replace(competitionId: string, ruleSetIds: string[]): Promise<void>;
   };
 
   systemSettings: {

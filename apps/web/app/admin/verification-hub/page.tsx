@@ -567,6 +567,7 @@ function CompetitionRow({
                     <EventSection
                       key={ev.competitionEventId}
                       event={ev}
+                      compTitle={comp.title}
                       assigningRoundId={assigningRoundId}
                       availableJudges={availableJudges}
                       busy={busy}
@@ -590,6 +591,7 @@ function CompetitionRow({
 
 function EventSection({
   event,
+  compTitle,
   assigningRoundId,
   availableJudges,
   busy,
@@ -599,6 +601,7 @@ function EventSection({
   onToggleVideo,
 }: {
   event: HubEvent;
+  compTitle: string;
   assigningRoundId: string | null;
   availableJudges: AvailableJudgeDto[];
   busy: string | null;
@@ -624,6 +627,7 @@ function EventSection({
           <RoundRow
             key={round.id}
             round={round}
+            compTitle={compTitle}
             isAssigning={assigningRoundId === round.id}
             availableJudges={availableJudges}
             busy={busy}
@@ -642,6 +646,7 @@ function EventSection({
 
 function RoundRow({
   round,
+  compTitle,
   isAssigning,
   availableJudges,
   busy,
@@ -651,6 +656,7 @@ function RoundRow({
   onToggleVideo,
 }: {
   round: HubRound;
+  compTitle: string;
   isAssigning: boolean;
   availableJudges: AvailableJudgeDto[];
   busy: string | null;
@@ -718,7 +724,7 @@ function RoundRow({
             {isAssigning ? "Close" : `Judges (${round.judges.length})`}
           </button>
           <Link
-            href={`/admin/verification-hub/workspace?roundId=${round.id}`}
+            href={`/admin/verification-hub/workspace?roundId=${round.id}&comp=${encodeURIComponent(compTitle)}`}
             className="rounded-md bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-600 hover:bg-emerald-100 dark:bg-emerald-900/20 dark:text-emerald-400 dark:hover:bg-emerald-900/40"
           >
             Open Workspace →

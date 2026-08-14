@@ -25,15 +25,15 @@ export const EVENTS = {
   pyram: { id: "pyram", name: "Pyraminx", wcaEvent: "pyram", puzzle: "pyraminx", priority: "must" },
   skewb: { id: "skewb", name: "Skewb", wcaEvent: "skewb", puzzle: "skewb", priority: "must" },
   minx: { id: "minx", name: "Megaminx", wcaEvent: "minx", puzzle: "megaminx", priority: "must" },
-  "333oh": { id: "333oh", name: "3x3 One-Handed", wcaEvent: "333", puzzle: "3x3x3", priority: "must" },
-  "333bf": { id: "333bf", name: "3x3 Blindfolded", wcaEvent: "333", puzzle: "3x3x3", priority: "must" },
+  "333oh": { id: "333oh", name: "3x3 One-Handed", wcaEvent: "333oh", puzzle: "3x3x3", priority: "must" },
+  "333bf": { id: "333bf", name: "3x3 Blindfolded", wcaEvent: "333bf", puzzle: "3x3x3", priority: "must" },
   sq1: { id: "sq1", name: "Square-1", wcaEvent: "sq1", puzzle: "square1", priority: "should" },
   clock: { id: "clock", name: "Clock", wcaEvent: "clock", puzzle: "clock", priority: "should" },
-  "444bf": { id: "444bf", name: "4x4 Blindfolded", wcaEvent: "444", puzzle: "4x4x4", priority: "should" },
-  "555bf": { id: "555bf", name: "5x5 Blindfolded", wcaEvent: "555", puzzle: "5x5x5", priority: "should" },
-  "333mbf": { id: "333mbf", name: "Multi-Blind", wcaEvent: "333", puzzle: "3x3x3", priority: "should" },
+  "444bf": { id: "444bf", name: "4x4 Blindfolded", wcaEvent: "444bf", puzzle: "4x4x4", priority: "should" },
+  "555bf": { id: "555bf", name: "5x5 Blindfolded", wcaEvent: "555bf", puzzle: "5x5x5", priority: "should" },
+  "333mbf": { id: "333mbf", name: "Multi-Blind", wcaEvent: "333mbf", puzzle: "3x3x3", priority: "should" },
   fto: { id: "fto", name: "FTO", wcaEvent: "fto", puzzle: "fto", priority: "should" },
-  "333fm": { id: "333fm", name: "Fewest Moves", wcaEvent: "333", puzzle: "3x3x3", priority: "should" },
+  "333fm": { id: "333fm", name: "Fewest Moves", wcaEvent: "333fm", puzzle: "3x3x3", priority: "should" },
 } as const satisfies Record<string, CubeEvent>;
 
 export type EventId = keyof typeof EVENTS;

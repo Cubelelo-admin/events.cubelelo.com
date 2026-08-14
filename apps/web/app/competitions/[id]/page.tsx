@@ -83,7 +83,7 @@ function getNavItems(
 
 export default function CompetitionDetailPage() {
   const params = useParams<{ id: string }>();
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
 
   const [comp, setComp] = useState<CompetitionDetail | null>(null);
   const [myReg, setMyReg] = useState<RegistrationDto | null>(null);
@@ -92,14 +92,21 @@ export default function CompetitionDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState("overview");
 
+  // Wait for auth to finish loading before fetching — the auth token must be
+  // set so the API knows whether this user is an admin (required to view drafts).
   useEffect(() => {
-    if (!params.id) return;
+    if (!params.id || authLoading) return;
+    let cancelled = false;
     setLoading(true);
+    setError(null);
     fetchCompetition(params.id)
-      .then(setComp)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setLoading(false));
-  }, [params.id]);
+      .then((data) => { if (!cancelled) setComp(data); })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [params.id, authLoading]);
 
   useEffect(() => {
     if (!user || !params.id) return;
@@ -188,6 +195,7 @@ export default function CompetitionDetailPage() {
       ? "Free entry"
       : `₹${((comp.baseFee ?? 0) / 100).toFixed(2)} base + ₹${((comp.perEventFee ?? 0) / 100).toFixed(2)}/event`;
 
+  const hasLiveEvent = comp.events.some((ev) => ev.rounds?.some((r) => r.status === "open"));
   const showUsersRankings = !isCancelled;
   const hasPrizes = !!(comp as any).prizes;
   const showPrizes = hasPrizes || (isUpcoming && !isCancelled);
@@ -207,7 +215,12 @@ export default function CompetitionDetailPage() {
                 : "text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-900"
               }`}
           >
-            {item.label}
+            <span className="flex items-center gap-1.5">
+              {item.label}
+              {item.id === "events" && hasLiveEvent && (
+                <span className="live-dot h-2 w-2 rounded-full bg-emerald-500" />
+              )}
+            </span>
           </button>
         ))}
       </nav>
@@ -216,31 +229,10 @@ export default function CompetitionDetailPage() {
         <main className="mx-auto max-w-6xl px-6 py-10">
           {/* ══ Section: Overview ══ */}
           <section id="section-overview" className="scroll-mt-20">
-            {/* Cover hero */}
-            {comp.coverUrl && (
-              <div
-                className="relative mb-6 h-56 overflow-hidden rounded-2xl bg-cover bg-center md:h-64"
-                style={{ backgroundImage: `url(${assetUrl(comp.coverUrl)})` }}
-              >
-                <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/20 to-transparent" />
-                <div className="absolute inset-x-0 bottom-0 p-6">
-                  <div className="mb-2 flex items-center gap-3">
-                    <UserStatusBadge comp={comp} isRegistered={!!myReg} />
-                    {isLive && (
-                      <span className="flex items-center gap-1.5 rounded-full bg-red-600 px-2.5 py-0.5 text-xs font-bold text-white">
-                        <span className="live-dot h-2 w-2 rounded-full bg-white" />
-                        LIVE
-                      </span>
-                    )}
-                    <span className="text-xs text-zinc-200">{comp.type}</span>
-                  </div>
-                  <h1 className="text-3xl font-bold text-white">{comp.title}</h1>
-                </div>
-              </div>
-            )}
-
-            {/* Banner hero (when no cover image) */}
-            {!comp.coverUrl && (comp.bannerUrl || comp.mobileBannerUrl) && (
+            {/* Banner hero. The banner is the only hero image — a separate
+                cover image existed but was never settable from either admin
+                screen, so it has been removed. */}
+            {(comp.bannerUrl || comp.mobileBannerUrl) && (
               <div className="mb-6 w-full overflow-hidden rounded-2xl">
                 {comp.bannerUrl && (
                   <img
@@ -259,22 +251,17 @@ export default function CompetitionDetailPage() {
               </div>
             )}
 
-            {/* Header (no cover or banner) */}
-            {!comp.coverUrl && (
-              <>
-                <div className="mb-4 flex items-center gap-3">
-                  <UserStatusBadge comp={comp} isRegistered={!!myReg} />
-                  {isLive && (
-                    <span className="flex items-center gap-1.5 rounded-full bg-red-600 px-2.5 py-0.5 text-xs font-bold text-white">
-                      <span className="live-dot h-2 w-2 rounded-full bg-white" />
-                      LIVE
-                    </span>
-                  )}
-                  <span className="text-xs text-zinc-500">{comp.type}</span>
-                </div>
-                <h1 className="mb-2 text-3xl font-bold text-zinc-900 dark:text-zinc-100">{comp.title}</h1>
-              </>
-            )}
+            <div className="mb-4 flex items-center gap-3">
+              <UserStatusBadge comp={comp} isRegistered={!!myReg} />
+              {isLive && (
+                <span className="flex items-center gap-1.5 rounded-full bg-red-600 px-2.5 py-0.5 text-xs font-bold text-white">
+                  <span className="live-dot h-2 w-2 rounded-full bg-white" />
+                  LIVE
+                </span>
+              )}
+              <span className="text-xs text-zinc-500">{comp.type}</span>
+            </div>
+            <h1 className="mb-2 text-3xl font-bold text-zinc-900 dark:text-zinc-100">{comp.title}</h1>
             {comp.description && <p className="mb-6 text-zinc-500 dark:text-zinc-400">{comp.description}</p>}
 
             {/* Cancellation notice */}
@@ -875,16 +862,44 @@ function EventCardsSection({
 /* ── Rules tab ── */
 
 function RulesTab({ comp }: { comp: CompetitionDetail }) {
-  if (!comp.rulesMd) {
+  // A competition's rules are the rule sets it uses, in the order the organiser
+  // chose, followed by any additional text specific to this competition.
+  const ruleSets = comp.ruleSets ?? [];
+
+  if (ruleSets.length === 0 && !comp.rulesMd) {
     return (
       <div className="rounded-xl border border-dashed border-zinc-300 p-10 text-center text-zinc-500 dark:border-zinc-700">
         No rules have been posted for this competition yet.
       </div>
     );
   }
+
   return (
-    <div className="prose prose-sm prose-zinc dark:prose-invert max-w-none rounded-xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900/40">
-      <Markdown>{comp.rulesMd}</Markdown>
+    <div className="space-y-4">
+      {ruleSets.map((rs) => (
+        <div
+          key={rs.id}
+          className="rounded-xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900/40"
+        >
+          <h3 className="mb-3 text-sm font-semibold text-zinc-900 dark:text-zinc-100">{rs.name}</h3>
+          <div className="prose prose-sm prose-zinc dark:prose-invert max-w-none">
+            <Markdown>{rs.content}</Markdown>
+          </div>
+        </div>
+      ))}
+
+      {comp.rulesMd && (
+        <div className="rounded-xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900/40">
+          {ruleSets.length > 0 && (
+            <h3 className="mb-3 text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+              Additional rules for this competition
+            </h3>
+          )}
+          <div className="prose prose-sm prose-zinc dark:prose-invert max-w-none">
+            <Markdown>{comp.rulesMd}</Markdown>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

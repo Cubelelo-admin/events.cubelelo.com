@@ -373,7 +373,7 @@ function RoundRow({ round }: { round: JudgeRoundDto }) {
       )}
 
       <Link
-        href={`/admin/verification-hub/workspace?roundId=${round.roundId}`}
+        href={`/admin/verification-hub/workspace?roundId=${round.roundId}&comp=${encodeURIComponent(round.competitionTitle)}`}
         className="ml-auto rounded-md bg-emerald-50 px-3 py-1.5 text-[11px] font-semibold text-emerald-600 hover:bg-emerald-100 dark:bg-emerald-900/20 dark:text-emerald-400 dark:hover:bg-emerald-900/40"
       >
         Open Workspace →

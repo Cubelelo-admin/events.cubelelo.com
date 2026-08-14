@@ -2,10 +2,14 @@ import type { FastifyInstance } from "fastify";
 import type { Repository } from "../../db/repo";
 import type { Realtime } from "../../sockets/realtime";
 import { requireRole, requireAuth } from "../../auth/plugin";
+import { createOwnershipChecks } from "../../auth/ownership";
 import type { RoundStatus } from "@cubers/types";
+import { isWcaFormat, scrambleCountForFormat, FORMAT_ATTEMPTS } from "@cubers/types";
 import type { Round } from "../../db/types";
+import { formatForRound, cutoffForRound, timeLimitForRound } from "../../lib/roundFormat";
 import { effectiveRoundStatus } from "../../lib/statusUtils";
 import { validateRoundTimes } from "../../lib/scheduleValidation";
+import { parseAdvancementCriteria } from "../../lib/advancementCriteria";
 import { recordScrambleFetch } from "../../lib/scrambleTiming";
 import { scrambleLimiter, adminLimiter } from "../../lib/rateLimiter";
 import { ensureScramblesGenerated } from "../../lib/roundLifecycle";
@@ -19,24 +23,7 @@ export async function registerRoundRoutes(
   const adminOnly = { preHandler: requireRole(repo, "admin") };
   const adminOrMod = { preHandler: requireRole(repo, "admin", "moderator") };
 
-  /** Ownership check: admin always passes; moderator must have created the competition. */
-  async function ownedCompByRound(
-    req: import("fastify").FastifyRequest,
-    reply: import("fastify").FastifyReply,
-    roundId: string,
-  ): Promise<boolean> {
-    const round = await repo.rounds.findById(roundId);
-    if (!round) { reply.code(404).send({ error: "round_not_found" }); return false; }
-    const ev = await repo.competitionEvents.findById(round.competitionEventId);
-    if (!ev) { reply.code(404).send({ error: "event_not_found" }); return false; }
-    const comp = await repo.competitions.findById(ev.competitionId);
-    if (!comp) { reply.code(404).send({ error: "competition_not_found" }); return false; }
-    const user = await repo.users.findById(req.authClaims!.sub);
-    if (!user) { reply.code(403).send({ error: "forbidden" }); return false; }
-    if (user.role === "admin" || user.role === "super_admin") return true;
-    if (user.role === "moderator" && comp.createdBy === user.id) return true;
-    reply.code(403).send({ error: "forbidden" }); return false;
-  }
+  const { ownedCompByRound } = createOwnershipChecks(repo);
 
   // Round detail.
   app.get<{ Params: { id: string } }>(
@@ -79,6 +66,10 @@ export async function registerRoundRoutes(
           opensAt: round.opensAt ?? null,
           closesAt: round.closesAt ?? null,
           eventType: event?.eventType ?? null,
+          format: formatForRound(round, event?.eventType),
+          attempts: FORMAT_ATTEMPTS[formatForRound(round, event?.eventType)],
+          cutoffMs: cutoffForRound(round, event) ?? null,
+          timeLimitMs: timeLimitForRound(round, event) ?? null,
         },
         competition: {
           id: competition?.id ?? null,
@@ -127,7 +118,9 @@ export async function registerRoundRoutes(
         const event = await repo.competitionEvents.findByRound(round.id);
         if (event) {
           const registered = await repo.registrations.isRegisteredForEvent(user.id, event.id);
-          if (!registered) return reply.code(403).send({ error: "not_registered_for_event" });
+          if (!registered) {
+            return reply.code(403).send({ error: "not_registered_for_event" });
+          }
         }
       }
 
@@ -189,7 +182,10 @@ export async function registerRoundRoutes(
       if (!checkEvent(event.eventType)) return reply.code(400).send({ error: "invalid_event_type" });
 
       const now = new Date().toISOString();
-      const scrambles = await generateScrambleSet(event.eventType, 5);
+      const scrambles = await generateScrambleSet(
+        event.eventType,
+        scrambleCountForFormat(formatForRound(round, event.eventType)),
+      );
       await repo.scrambleSets.upsert({
         id: existing?.id ?? (await import("node:crypto")).randomUUID(),
         roundId: round.id,
@@ -269,34 +265,35 @@ export async function registerRoundRoutes(
       opensAt?: string | null;
       closesAt?: string | null;
       durationMinutes?: number;
+      format?: string;
+      cutoffMs?: number | null;
+      timeLimitMs?: number | null;
     };
   }>("/api/v1/admin/rounds/:id", adminOrMod, async (req, reply) => {
     if (!(await ownedCompByRound(req, reply, req.params.id))) return;
-    const { advancementCount, advancementCriteria, opensAt, closesAt, durationMinutes } = req.body ?? {};
+    const { advancementCount, advancementCriteria, opensAt, closesAt, durationMinutes, format, cutoffMs, timeLimitMs } = req.body ?? {};
     const fields: Parameters<typeof repo.rounds.update>[1] = {};
     if (typeof advancementCount === "number") fields.advancementCount = advancementCount;
 
+    if (format !== undefined) {
+      if (!isWcaFormat(format)) return reply.code(400).send({ error: "invalid_format" });
+      fields.format = format;
+    }
+    if (cutoffMs !== undefined) {
+      if (cutoffMs !== null && (typeof cutoffMs !== "number" || cutoffMs < 1))
+        return reply.code(400).send({ error: "invalid_cutoff" });
+      fields.cutoffMs = cutoffMs ?? undefined;
+    }
+    if (timeLimitMs !== undefined) {
+      if (timeLimitMs !== null && (typeof timeLimitMs !== "number" || timeLimitMs < 1))
+        return reply.code(400).send({ error: "invalid_time_limit" });
+      fields.timeLimitMs = timeLimitMs ?? undefined;
+    }
+
     if (advancementCriteria !== undefined) {
-      if (advancementCriteria === null) {
-        fields.advancementCriteria = undefined;
-      } else {
-        const method = advancementCriteria.method;
-        if (method === "rank") {
-          if (!advancementCriteria.rankLimit || advancementCriteria.rankLimit < 1)
-            return reply.code(400).send({ error: "rank_limit_required" });
-          fields.advancementCriteria = { method: "rank", rankLimit: advancementCriteria.rankLimit };
-        } else if (method === "time") {
-          if (!advancementCriteria.timeLimitMs || advancementCriteria.timeLimitMs < 1)
-            return reply.code(400).send({ error: "time_limit_required" });
-          fields.advancementCriteria = { method: "time", timeLimitMs: advancementCriteria.timeLimitMs };
-        } else if (method === "best_single") {
-          if (!advancementCriteria.bestSingleMs || advancementCriteria.bestSingleMs < 1)
-            return reply.code(400).send({ error: "best_single_limit_required" });
-          fields.advancementCriteria = { method: "best_single", bestSingleMs: advancementCriteria.bestSingleMs };
-        } else {
-          return reply.code(400).send({ error: "invalid_advancement_method" });
-        }
-      }
+      const parsed = parseAdvancementCriteria(advancementCriteria);
+      if (!parsed.ok) return reply.code(400).send({ error: parsed.code });
+      fields.advancementCriteria = parsed.criteria;
     }
     if (opensAt !== undefined) fields.opensAt = opensAt ?? undefined;
     if (closesAt !== undefined) fields.closesAt = closesAt ?? undefined;
@@ -343,6 +340,9 @@ export async function registerRoundRoutes(
       opensAt: updated.opensAt, closesAt: updated.closesAt,
       durationMinutes: updated.durationMinutes,
       videoRequired: updated.videoRequired ?? false,
+      format: updated.format ?? null,
+      cutoffMs: updated.cutoffMs ?? null,
+      timeLimitMs: updated.timeLimitMs ?? null,
     };
   });
 
@@ -375,7 +375,7 @@ export async function registerRoundRoutes(
     async (req, reply) => {
       const { videoRequired } = req.body ?? {};
       if (typeof videoRequired !== "boolean") {
-        return reply.code(400).send({ error: "videoRequired must be a boolean" });
+        return reply.code(400).send({ error: "invalid_video_required" });
       }
       if (!(await ownedCompByRound(req, reply, req.params.id))) return;
       const round = await repo.rounds.findById(req.params.id);

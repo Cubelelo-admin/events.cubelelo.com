@@ -47,8 +47,9 @@ describe("ao5 (WCA trimming)", () => {
     expect(ao5([s(10_000, "dnf"), s(12_000), s(11_000), s(9_000, "dnf"), s(13_000)])).toBeNull();
   });
   it("applies +2 before trimming", () => {
-    // 9s+2 = 11s; set {10,11,11,12,13} → trim 10 & 13 → mean(11,11,12)=11333
-    expect(ao5([s(10_000), s(12_000), s(11_000), s(9_000, "plus2"), s(13_000)])).toBe(11_333);
+    // 9s+2 = 11s; set {10,11,11,12,13} → trim 10 & 13 → mean(11,11,12)=11333.3,
+    // rounded to the nearest centisecond per WCA 9f2 → 11.33 s.
+    expect(ao5([s(10_000), s(12_000), s(11_000), s(9_000, "plus2"), s(13_000)])).toBe(11_330);
   });
   it("returns null with fewer than 5 solves", () => {
     expect(ao5([s(10_000), s(11_000)])).toBeNull();
@@ -79,5 +80,30 @@ describe("average uses only the last N solves", () => {
   it("rolls over the most recent 5", () => {
     const solves = [s(99_000), s(10_000), s(12_000), s(11_000), s(9_000), s(13_000)];
     expect(average(solves, 5)).toBe(11_000); // ignores the leading 99s
+  });
+});
+
+describe("WCA 9f2 rounding", () => {
+  it("rounds an average to the nearest centisecond, not millisecond", () => {
+    // mean(11_000, 11_000, 12_000) = 11333.33… → 11.33 s
+    expect(ao5([s(10_000), s(12_000), s(11_000), s(11_000), s(13_000)])).toBe(11_330);
+  });
+
+  it("rounds .005 s up to the next centisecond", () => {
+    // mean(10_000, 10_000, 10_017) = 10005.67… → 10.01 s
+    expect(mean([s(10_000), s(10_000), s(10_017)])).toBe(10_010);
+  });
+
+  it("rounds averages over ten minutes to the nearest second", () => {
+    // mean(700_400, 700_400, 700_400) = 700400 → 700 s
+    expect(mean([s(700_400), s(700_400), s(700_400)])).toBe(700_000);
+  });
+
+  it("leaves an average of exactly ten minutes on the centisecond rule", () => {
+    expect(mean([s(600_000), s(600_000), s(600_000)])).toBe(600_000);
+  });
+
+  it("does not round raw singles", () => {
+    expect(bestSingle([s(11_333), s(12_000)])).toBe(11_333);
   });
 });

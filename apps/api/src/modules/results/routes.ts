@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import { ao5, computeStats } from "@cubers/timer-core";
+import { ao5, computeStats, effectiveTime } from "@cubers/timer-core";
 import type { Solve, SolvePenalty, FlagStatus } from "@cubers/types";
 import type { Repository } from "../../db/repo";
 import type { Result } from "../../db/types";
@@ -11,24 +11,30 @@ import { getScrambleFetchTime } from "../../lib/scrambleTiming";
 import { submitLimiter } from "../../lib/rateLimiter";
 import { recomputeRanks, recomputePersonalBest } from "../../lib/resultStats";
 import { ANTICHEAT_THRESHOLDS, DEFAULT_ANTICHEAT_THRESHOLD } from "../../lib/eventConfig";
+import {
+  attemptsForRound,
+  cutoffAttemptsForRound,
+  cutoffForRound,
+  timeLimitForRound,
+} from "../../lib/roundFormat";
 import { computeFlags } from "../../lib/flagEngine";
-import { withAdvisoryLock } from "../../db/pool";
-import { env } from "../../config/env";
 import { setLeaderboardCache, getLeaderboardCache, type CachedLeaderboardEntry } from "../../lib/leaderboardCache";
 
 const PENALTIES: SolvePenalty[] = ["none", "plus2", "dnf"];
 
 const MIN_SOLVE_MS = 300;
 
-const MEAN_OF_3_EVENTS = new Set(["666", "777", "333bf", "444bf", "555bf", "333mbf"]);
-
-function solveCountForEvent(eventType: string): number {
-  return MEAN_OF_3_EVENTS.has(eventType) ? 3 : 5;
-}
-
-function parseSolves(input: unknown, expectedCount: number): Solve[] | null {
+/**
+ * Parse a submitted attempt set.
+ *
+ * `maxCount` is the round format's attempt count. Fewer attempts are accepted:
+ * a competitor who fails a cutoff (Reg 9g) stops early and legitimately submits
+ * a short set, as does one whose round closed mid-attempt. Requiring an exact
+ * length previously threw those results away entirely.
+ */
+function parseSolves(input: unknown, maxCount: number): Solve[] | null {
   if (!Array.isArray(input)) return null;
-  if (input.length !== expectedCount) return null;
+  if (input.length < 1 || input.length > maxCount) return null;
   const solves: Solve[] = [];
   for (const raw of input) {
     if (
@@ -83,7 +89,9 @@ export async function registerResultRoutes(
         if (!advanced) return reply.code(403).send({ error: "not_shortlisted" });
       } else if (event) {
         const registered = await repo.registrations.isRegisteredForEvent(user.id, event.id);
-        if (!registered) return reply.code(403).send({ error: "not_registered_for_event" });
+        if (!registered) {
+          return reply.code(403).send({ error: "not_registered_for_event" });
+        }
       }
 
       const existingResults = await repo.results.findByRound(round.id);
@@ -91,9 +99,37 @@ export async function registerResultRoutes(
       if (existingResults.some((r) => r.userId === user.id)) {
         return reply.code(409).send({ error: "already_submitted" });
       }
-      const expectedCount = solveCountForEvent(event?.eventType ?? "333");
-      const solves = parseSolves(req.body?.solves, expectedCount);
-      if (!solves) return reply.code(400).send({ error: "invalid_solves" });
+      const maxAttempts = attemptsForRound(round, event?.eventType);
+      const parsed = parseSolves(req.body?.solves, maxAttempts);
+      if (!parsed) return reply.code(400).send({ error: "invalid_solves" });
+
+      // ── WCA round constraints, enforced server-side ────────────────────────
+      // The terminal applies these too, but a submission posted directly to the
+      // API would otherwise bypass them entirely.
+      const timeLimitMs = timeLimitForRound(round, event);
+      const cutoffMs = cutoffForRound(round, event);
+      const cutoffAttempts = cutoffAttemptsForRound(round, event?.eventType);
+
+      // Reg A1a4: an attempt reaching the time limit is a DNF. Coerce rather
+      // than reject — that is what the result *is*, so rejecting would discard a
+      // legitimate submission over a client that failed to mark it.
+      const solves = timeLimitMs
+        ? parsed.map((s) =>
+            s.penalty !== "dnf" && s.inspectionPenalty !== "dnf" && s.time_ms >= timeLimitMs
+              ? { ...s, penalty: "dnf" as const }
+              : s,
+          )
+        : parsed;
+
+      // Reg 9g1: a competitor continues past the cutoff only if one of the
+      // cutoff attempts is strictly better than it. Submitting more attempts
+      // than that without having beaten the cutoff is not a valid result.
+      if (cutoffMs && cutoffAttempts > 0 && solves.length > cutoffAttempts) {
+        const beatCutoff = solves
+          .slice(0, cutoffAttempts)
+          .some((s) => effectiveTime(s) < cutoffMs);
+        if (!beatCutoff) return reply.code(400).send({ error: "cutoff_not_met" });
+      }
 
       const videoUrl = req.body?.videoUrl?.trim() || null;
       if (videoUrl) {
@@ -186,36 +222,10 @@ export async function registerResultRoutes(
         flagReasons,
         submittedAt: new Date().toISOString(),
       };
-      // Use advisory lock in PG mode for race-safe duplicate check;
-      // fall back to repo-only path for mem-repo (tests / CI).
-      if (env.DATABASE_URL) {
-        const inserted = await withAdvisoryLock(`round:${round.id}`, async (client) => {
-          const { rows: dupeCheck } = await client.query(
-            "SELECT 1 FROM results WHERE round_id = $1 AND user_id = $2 LIMIT 1",
-            [round.id, user.id],
-          );
-          if (dupeCheck.length > 0) return false;
-
-          await client.query(
-            `INSERT INTO results
-               (id, round_id, user_id, solves_json, best_single_ms, ao5_ms, mean_ms,
-                median_ms, std_ms, rank, video_url, flag_status, flag_reasons, verified_by, verified_at,
-                submitted_at)
-             VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16)`,
-            [result.id, result.roundId, result.userId, JSON.stringify(result.solves),
-             result.bestSingleMs, result.ao5Ms, result.meanMs, result.medianMs, result.stdMs,
-             result.rank, result.videoUrl, result.flagStatus, JSON.stringify(result.flagReasons ?? []),
-             null, null, result.submittedAt],
-          );
-          return true;
-        });
-
-        if (!inserted) {
-          return reply.code(409).send({ error: "already_submitted" });
-        }
-      } else {
-        // mem-repo path: dupe already checked above (existingResults), just create
-        await repo.results.create(result);
+      // Race-safe insert. Both backends implement the same contract, so the
+      // route no longer branches on DATABASE_URL or reaches past the repository.
+      if (!(await repo.results.createIfAbsent(result))) {
+        return reply.code(409).send({ error: "already_submitted" });
       }
 
       const board = await recomputeRanks(repo, round.id);
@@ -230,7 +240,7 @@ export async function registerResultRoutes(
         const u = usersMap.get(r.userId);
         return {
           id: r.id, userId: r.userId, userName: u?.name ?? r.userId, userClId: u?.clId ?? r.userId,
-          ao5Ms: r.ao5Ms, bestSingleMs: r.bestSingleMs, rank: r.rank, flagStatus: r.flagStatus,
+          ao5Ms: r.ao5Ms, meanMs: r.meanMs, bestSingleMs: r.bestSingleMs, rank: r.rank, flagStatus: r.flagStatus,
         };
       });
       await setLeaderboardCache(round.id, enriched);
@@ -304,7 +314,7 @@ export async function registerResultRoutes(
         const u = usersMap.get(r.userId);
         return {
           id: r.id, userId: r.userId, userName: u?.name ?? r.userId, userClId: u?.clId ?? r.userId,
-          ao5Ms: r.ao5Ms, bestSingleMs: r.bestSingleMs, rank: r.rank, flagStatus: r.flagStatus,
+          ao5Ms: r.ao5Ms, meanMs: r.meanMs, bestSingleMs: r.bestSingleMs, rank: r.rank, flagStatus: r.flagStatus,
         };
       });
       await setLeaderboardCache(req.params.id, enriched);
@@ -325,9 +335,27 @@ export async function registerResultRoutes(
         );
       const userIds = [...new Set(filtered.map((r) => r.userId))];
       const usersMap = await repo.users.findByIds(userIds);
+      // Explicit field list. Spreading the whole Result published internal
+      // moderation data — verifiedBy, verificationComment and flagReasons — on a
+      // public endpoint.
       return filtered.map((r) => {
         const u = usersMap.get(r.userId);
-        return { ...r, userName: u?.name ?? r.userId, userClId: u?.clId ?? r.userId };
+        return {
+          id: r.id,
+          roundId: r.roundId,
+          userId: r.userId,
+          userName: u?.name ?? r.userId,
+          userClId: u?.clId ?? r.userId,
+          solves: r.solves,
+          bestSingleMs: r.bestSingleMs,
+          ao5Ms: r.ao5Ms,
+          meanMs: r.meanMs,
+          medianMs: r.medianMs,
+          rank: r.rank,
+          videoUrl: r.videoUrl,
+          flagStatus: r.flagStatus,
+          submittedAt: r.submittedAt,
+        };
       });
     },
   );

@@ -17,5 +17,6 @@ export {
   ao5,
   ao12,
   computeStats,
+  roundAverage,
 } from "./stats.js";
 export { formatTime, formatSolve } from "./format.js";

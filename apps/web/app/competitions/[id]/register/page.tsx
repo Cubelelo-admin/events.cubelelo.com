@@ -160,9 +160,19 @@ function RegisterContent() {
     setBusy(true);
     setError(null);
     try {
-      const reg = await registerForCompetition(comp.id, [...selected]);
-      if (!isFree && reg.paymentStatus === "pending") {
-        const order = await createPaymentOrder(reg.registrationId, promoApplied?.code);
+      if (isFree) {
+        // Free: register directly
+        await registerForCompetition(comp.id, [...selected]);
+        setSuccess(true);
+      } else {
+        // Paid: create payment order first (no registration yet)
+        const order = await createPaymentOrder(comp.id, [...selected], promoApplied?.code);
+
+        // If promo brought amount to 0, backend already registered
+        if (order.status === "paid") {
+          setSuccess(true);
+          return;
+        }
 
         if (order.keyId) {
           await loadRazorpayScript();
@@ -171,6 +181,7 @@ function RegisterContent() {
             amount: order.amount,
             keyId: order.keyId,
           });
+          // Verify payment — this creates the registration
           await verifyPayment(
             checkout.razorpay_order_id,
             checkout.razorpay_payment_id,
@@ -180,8 +191,6 @@ function RegisterContent() {
         } else {
           setPendingFallback({ orderId: order.orderId, amount: order.amount });
         }
-      } else {
-        setSuccess(true);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong. Please try again.");

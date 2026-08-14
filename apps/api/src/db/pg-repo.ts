@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type pg from "pg";
 import type { Repository } from "./repo";
+import { withAdvisoryLock, withTransaction } from "./pool";
 import { getRedis } from "../lib/redis";
 import type {
   User,
@@ -83,12 +84,10 @@ function toComp(r: Row): Competition {
     registrationDeadline: r.registration_deadline ? ts(r.registration_deadline) : undefined,
     startsAt: r.starts_at ? ts(r.starts_at) : undefined,
     endsAt: r.ends_at ? ts(r.ends_at) : undefined,
-    coverUrl: (r.cover_url as string) ?? undefined,
     bannerUrl: (r.banner_url as string) ?? undefined,
     mobileBannerUrl: (r.mobile_banner_url as string) ?? undefined,
     featured: (r.featured as boolean) ?? false,
     featuredOrder: (r.featured_order as number) ?? undefined,
-    coverCaption: (r.cover_caption as string) ?? undefined,
     cancellationReason: (r.cancellation_reason as string) ?? undefined,
     videoDeadlineMinutes: (r.video_deadline_minutes as number) ?? 1440,
     registrationLimit: (r.registration_limit as number) ?? undefined,
@@ -149,6 +148,9 @@ function toRound(r: Row): Round {
     competitionEventId: r.competition_event_id as string,
     roundNumber: r.round_number as number,
     status: r.status as Round["status"],
+    format: (r.format as Round["format"]) ?? undefined,
+    cutoffMs: (r.cutoff_ms as number) ?? undefined,
+    timeLimitMs: (r.time_limit_ms as number) ?? undefined,
     advancementCount: (r.advancement_count as number) ?? undefined,
     advancementCriteria: r.advancement_criteria
       ? (typeof r.advancement_criteria === "string"
@@ -192,6 +194,11 @@ function toResult(r: Row): Result {
     flagReasons: (rawReasons
       ? (typeof rawReasons === "string" ? JSON.parse(rawReasons) : rawReasons)
       : []) as Result["flagReasons"],
+    judgeOverrides: r.judge_overrides
+      ? ((typeof r.judge_overrides === "string"
+          ? JSON.parse(r.judge_overrides)
+          : r.judge_overrides) as Result["judgeOverrides"])
+      : undefined,
     verifiedBy: (r.verified_by as string) ?? undefined,
     verifiedAt: r.verified_at ? ts(r.verified_at) : undefined,
     verificationComment: (r.verification_comment as string) ?? undefined,
@@ -223,7 +230,9 @@ function toPayment(r: Row): Payment {
   return {
     id: r.id as string,
     userId: r.user_id as string,
-    registrationId: r.registration_id as string,
+    registrationId: (r.registration_id as string) ?? null,
+    competitionId: (r.competition_id as string) ?? null,
+    eventIds: (r.event_ids as string) ?? null,
     amount: r.amount as number,
     currency: r.currency as string,
     razorpayOrderId: (r.razorpay_order_id as string) ?? undefined,
@@ -422,20 +431,26 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
       },
       async create(comp) {
         await pool.query(
+          // video_deadline_minutes and featured_order were missing from this
+          // column list while present in the UPDATE map below, so any value set
+          // for them at create time was silently dropped.
           `INSERT INTO competitions
-             (id, title, type, status, cover_url, banner_url, mobile_banner_url, description, rules_md,
+             (id, title, type, status, banner_url, mobile_banner_url, description, rules_md,
               base_fee, per_event_fee, registration_opens_at, registration_deadline,
-              starts_at, ends_at, featured, created_by, cancellation_reason, published_by,
+              starts_at, ends_at, featured, featured_order, video_deadline_minutes,
+              created_by, cancellation_reason, published_by,
               registration_limit, rule_set_id, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$22)`,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$23)`,
           [
             comp.id, comp.title, comp.type, comp.status,
-            comp.coverUrl ?? null, comp.bannerUrl ?? null, comp.mobileBannerUrl ?? null,
+            comp.bannerUrl ?? null, comp.mobileBannerUrl ?? null,
             comp.description ?? null, comp.rulesMd ?? null,
             comp.baseFee, comp.perEventFee,
             comp.registrationOpensAt ?? null, comp.registrationDeadline ?? null,
             comp.startsAt ?? null, comp.endsAt ?? null,
-            comp.featured ?? false, comp.createdBy ?? null,
+            comp.featured ?? false, comp.featuredOrder ?? null,
+            comp.videoDeadlineMinutes ?? null,
+            comp.createdBy ?? null,
             comp.cancellationReason ?? null, comp.publishedBy ?? null,
             comp.registrationLimit ?? null, comp.ruleSetId ?? null, comp.createdAt,
           ],
@@ -463,13 +478,13 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
       },
       async update(id, fields) {
         const COL: Record<string, string> = {
-          title: "title", status: "status", description: "description",
+          title: "title", type: "type", status: "status", description: "description",
           rulesMd: "rules_md", baseFee: "base_fee", perEventFee: "per_event_fee",
           registrationOpensAt: "registration_opens_at",
           registrationDeadline: "registration_deadline",
           startsAt: "starts_at", endsAt: "ends_at",
-          coverUrl: "cover_url", bannerUrl: "banner_url", mobileBannerUrl: "mobile_banner_url",
-          featured: "featured", featuredOrder: "featured_order", coverCaption: "cover_caption",
+          bannerUrl: "banner_url", mobileBannerUrl: "mobile_banner_url",
+          featured: "featured", featuredOrder: "featured_order",
           cancellationReason: "cancellation_reason", videoDeadlineMinutes: "video_deadline_minutes",
           registrationLimit: "registration_limit", ruleSetId: "rule_set_id", publishedBy: "published_by",
         };
@@ -618,8 +633,8 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
       async create(round) {
         await pool.query(
           `INSERT INTO rounds
-             (id, competition_event_id, round_number, advancement_count, status, opens_at, closes_at, duration_minutes, advancement_criteria, video_required)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+             (id, competition_event_id, round_number, advancement_count, status, opens_at, closes_at, duration_minutes, advancement_criteria, video_required, format, cutoff_ms, time_limit_ms)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
           [
             round.id, round.competitionEventId, round.roundNumber,
             round.advancementCount ?? null, round.status,
@@ -627,6 +642,9 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
             round.durationMinutes ?? null,
             round.advancementCriteria ? JSON.stringify(round.advancementCriteria) : null,
             round.videoRequired ?? false,
+            round.format ?? "a",
+            round.cutoffMs ?? null,
+            round.timeLimitMs ?? null,
           ],
         );
       },
@@ -636,6 +654,7 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
           advancementCount: "advancement_count", durationMinutes: "duration_minutes",
           advancementCriteria: "advancement_criteria", resultsPublishedAt: "results_published_at",
           videoRequired: "video_required",
+          format: "format", cutoffMs: "cutoff_ms", timeLimitMs: "time_limit_ms",
         };
         const raw = fields as Record<string, unknown>;
         if (raw.advancementCriteria !== undefined) {
@@ -773,6 +792,37 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
           ],
         );
       },
+      async createIfAbsent(result) {
+        // Advisory lock on the round serialises concurrent submissions, so the
+        // duplicate check and the insert cannot interleave.
+        return withAdvisoryLock(`round:${result.roundId}`, async (client) => {
+          const { rows } = await client.query(
+            "SELECT 1 FROM results WHERE round_id = $1 AND user_id = $2 LIMIT 1",
+            [result.roundId, result.userId],
+          );
+          if (rows.length > 0) return false;
+
+          await client.query(
+            `INSERT INTO results
+               (id, round_id, user_id, solves_json, best_single_ms, ao5_ms, mean_ms,
+                median_ms, std_ms, rank, video_url, flag_status, flag_reasons,
+                judge_overrides, verified_by, verified_at, submitted_at)
+             VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15,$16,$17)`,
+            [
+              result.id, result.roundId, result.userId,
+              JSON.stringify(result.solves),
+              result.bestSingleMs, result.ao5Ms, result.meanMs,
+              result.medianMs, result.stdMs, result.rank,
+              result.videoUrl, result.flagStatus,
+              JSON.stringify(result.flagReasons ?? []),
+              result.judgeOverrides ? JSON.stringify(result.judgeOverrides) : null,
+              result.verifiedBy ?? null, result.verifiedAt ?? null,
+              result.submittedAt,
+            ],
+          );
+          return true;
+        });
+      },
       async update(id, fields) {
         const COL: Record<string, string> = {
           flagStatus: "flag_status", verifiedBy: "verified_by", verifiedAt: "verified_at",
@@ -780,11 +830,16 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
           rank: "rank", videoUrl: "video_url", userId: "user_id",
           bestSingleMs: "best_single_ms", ao5Ms: "ao5_ms",
           meanMs: "mean_ms", medianMs: "median_ms", stdMs: "std_ms",
-          flagReasons: "flag_reasons",
+          flagReasons: "flag_reasons", judgeOverrides: "judge_overrides",
         };
-        // Serialise flagReasons to JSON before passing to buildSet
+        // Serialise jsonb columns before passing to buildSet
         if (fields.flagReasons !== undefined) {
           (fields as Record<string, unknown>).flagReasons = JSON.stringify(fields.flagReasons);
+        }
+        if ("judgeOverrides" in fields) {
+          const overrides = (fields as Record<string, unknown>).judgeOverrides;
+          (fields as Record<string, unknown>).judgeOverrides =
+            overrides === undefined || overrides === null ? null : JSON.stringify(overrides);
         }
         const { sets, vals, next } = buildSet(COL, fields as Record<string, unknown>);
         if (sets.length === 0) return this.findById(id);
@@ -798,7 +853,7 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
       async updateRanks(rankings) {
         if (rankings.length === 0) return;
         const ids = rankings.map((r) => r.id);
-        const ranks = rankings.map((r) => Math.trunc(r.rank));
+        const ranks = rankings.map((r) => (r.rank === null ? null : Math.trunc(r.rank)));
         await pool.query(
           `UPDATE results SET rank = u.rank
            FROM (SELECT unnest($1::uuid[]) AS id, unnest($2::integer[]) AS rank) u
@@ -952,6 +1007,13 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
         );
         return rows[0] ? toPayment(rows[0]) : null;
       },
+      async findPendingByUserAndComp(userId, competitionId) {
+        const { rows } = await pool.query(
+          "SELECT * FROM payments WHERE user_id = $1 AND competition_id = $2 AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+          [userId, competitionId],
+        );
+        return rows[0] ? toPayment(rows[0]) : null;
+      },
       async findByRegistrationIds(registrationIds) {
         const map = new Map<string, Payment>();
         if (registrationIds.length === 0) return map;
@@ -964,20 +1026,22 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
         );
         for (const r of rows) {
           const p = toPayment(r);
-          map.set(p.registrationId, p);
+          if (p.registrationId) map.set(p.registrationId, p);
         }
         return map;
       },
       async create(payment) {
         await pool.query(
           `INSERT INTO payments
-             (id, user_id, registration_id, amount, currency,
-              razorpay_order_id, razorpay_payment_id, status, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)`,
+             (id, user_id, registration_id, competition_id, event_ids, amount, currency,
+              razorpay_order_id, razorpay_payment_id, promo_code_id, status, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)`,
           [
-            payment.id, payment.userId, payment.registrationId,
+            payment.id, payment.userId, payment.registrationId ?? null,
+            payment.competitionId ?? null, payment.eventIds ?? null,
             payment.amount, payment.currency,
             payment.razorpayOrderId ?? null, payment.razorpayPaymentId ?? null,
+            payment.promoCodeId ?? null,
             payment.status, payment.createdAt,
           ],
         );
@@ -985,6 +1049,7 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
       async update(id, fields) {
         const COL: Record<string, string> = {
           razorpayPaymentId: "razorpay_payment_id",
+          registrationId: "registration_id",
           status: "status",
           userId: "user_id",
         };
@@ -1803,6 +1868,24 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
         const r = rows[0];
         return { id: r.id as string, name: r.name as string, content: r.content as string, createdAt: ts(r.created_at), updatedAt: ts(r.updated_at) };
       },
+      async findByIds(ids) {
+        const map = new Map<string, RuleSet>();
+        if (ids.length === 0) return map;
+        const { rows } = await pool.query(
+          "SELECT * FROM rule_sets WHERE id = ANY($1::uuid[])",
+          [ids],
+        );
+        for (const r of rows) {
+          map.set(r.id as string, {
+            id: r.id as string,
+            name: r.name as string,
+            content: r.content as string,
+            createdAt: ts(r.created_at),
+            updatedAt: ts(r.updated_at),
+          });
+        }
+        return map;
+      },
       async create(ruleSet) {
         await pool.query(
           "INSERT INTO rule_sets (id, name, content, created_at, updated_at) VALUES ($1,$2,$3,$4,$5)",
@@ -1829,6 +1912,46 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
       },
       async delete(id) {
         await pool.query("DELETE FROM rule_sets WHERE id = $1", [id]);
+      },
+    },
+
+    competitionRuleSets: {
+      async findByCompetition(competitionId) {
+        const { rows } = await pool.query(
+          "SELECT rule_set_id FROM competition_rule_sets WHERE competition_id = $1 ORDER BY position",
+          [competitionId],
+        );
+        return rows.map((r: Row) => r.rule_set_id as string);
+      },
+      async findByCompetitions(competitionIds) {
+        const map = new Map<string, string[]>();
+        if (competitionIds.length === 0) return map;
+        const { rows } = await pool.query(
+          `SELECT competition_id, rule_set_id FROM competition_rule_sets
+           WHERE competition_id = ANY($1::uuid[])
+           ORDER BY competition_id, position`,
+          [competitionIds],
+        );
+        for (const r of rows) {
+          const compId = r.competition_id as string;
+          if (!map.has(compId)) map.set(compId, []);
+          map.get(compId)!.push(r.rule_set_id as string);
+        }
+        return map;
+      },
+      async replace(competitionId, ruleSetIds) {
+        // Delete-then-insert in one transaction so a failed insert cannot leave
+        // the competition with no rule sets.
+        await withTransaction(async (client) => {
+          await client.query("DELETE FROM competition_rule_sets WHERE competition_id = $1", [competitionId]);
+          for (const [position, ruleSetId] of ruleSetIds.entries()) {
+            await client.query(
+              `INSERT INTO competition_rule_sets (competition_id, rule_set_id, position)
+               VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+              [competitionId, ruleSetId, position],
+            );
+          }
+        });
       },
     },
 
@@ -1892,6 +2015,10 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
 
     // ── judge assignments ────────────────────────────────────────────────
     judgeAssignments: {
+      async findById(id) {
+        const { rows } = await pool.query("SELECT * FROM judge_assignments WHERE id = $1", [id]);
+        return rows[0] ? toJudgeAssignment(rows[0]) : null;
+      },
       async findByRound(roundId) {
         const { rows } = await pool.query(
           "SELECT * FROM judge_assignments WHERE round_id = $1",

@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { RoundStatus } from "@cubers/types";
 import { generateScrambleSet, isEventId } from "@cubers/scramble-core";
+import { scrambleCountForFormat, FORMAT_AVERAGE_STAT, type WcaFormat } from "@cubers/types";
+import { formatForRound } from "./roundFormat";
+import { compareForRanking, isTied, type RankableResult } from "./resultStats";
 import type { Repository } from "../db/repo";
 import type { Round, RoundAdvancement, AdvancementCriteria } from "../db/types";
 import type { Realtime } from "../sockets/realtime";
@@ -8,7 +11,14 @@ import { withTransaction } from "../db/pool";
 import { recomputeRanks } from "./resultStats";
 import { getRedis } from "./redis";
 
-const DEFAULT_SCRAMBLE_COUNT = 5;
+/**
+ * Scrambles per round = one per attempt of the round's format, plus the WCA
+ * extras (E1, E2) reserved for extra attempts under Regulation A5. Previously
+ * fixed at 5, which over-generated for Mo3/Bo3 rounds and left no extras.
+ */
+function scrambleCountForRound(round: Round, eventType: string | undefined): number {
+  return scrambleCountForFormat(formatForRound(round, eventType));
+}
 
 /**
  * Generates and locks a round's scrambles if they don't exist yet.
@@ -26,7 +36,10 @@ export async function ensureScramblesGenerated(
   if (!event || !isEventId(event.eventType)) return;
 
   const now = new Date().toISOString();
-  const scrambles = await generateScrambleSet(event.eventType, DEFAULT_SCRAMBLE_COUNT);
+  const scrambles = await generateScrambleSet(
+    event.eventType,
+    scrambleCountForRound(round, event.eventType),
+  );
   await repo.scrambleSets.upsert({
     id: existing?.id ?? randomUUID(),
     roundId: round.id,
@@ -56,26 +69,26 @@ export async function shortlistRound(
 
   if (!criteria && !legacyCount) return;
 
-  const results = await repo.results.findByRound(round.id);
-  const key = (n: number | null) => (n === null ? Number.POSITIVE_INFINITY : n);
+  const [results, event] = await Promise.all([
+    repo.results.findByRound(round.id),
+    repo.competitionEvents.findByRound(round.id),
+  ]);
+  const format = formatForRound(round, event?.eventType);
 
   const eligible = results.filter(
     (r) => r.flagStatus !== "flagged" && r.flagStatus !== "disqualified",
   );
 
-  const sorted = [...eligible].sort(
-    (a, b) => key(a.ao5Ms) - key(b.ao5Ms) || key(a.bestSingleMs) - key(b.bestSingleMs),
-  );
+  const shortlisted = computeShortlist(eligible, criteria, legacyCount, format);
 
-  let shortlisted: typeof eligible;
-
-  if (criteria) {
-    shortlisted = applyMethod(criteria, sorted);
-  } else {
-    shortlisted = sorted.slice(0, legacyCount!);
+  if (shortlisted.length === 0) {
+    if (eligible.length >= MIN_COMPETITORS_TO_ADVANCE) {
+      console.warn(
+        `⚠ Round ${round.id}: advancement criteria selected nobody from ${eligible.length} eligible results`,
+      );
+    }
+    return;
   }
-
-  if (shortlisted.length === 0) return;
 
   const advanced: RoundAdvancement[] = shortlisted.map((r, i) => ({
     roundId: round.id,
@@ -157,22 +170,104 @@ async function checkCompetitionCompletion(
   console.log(`⏱ Competition ${comp.id} auto-completed (all final rounds resolved)`);
 }
 
-function applyMethod<T extends { ao5Ms: number | null; bestSingleMs: number | null }>(
+/**
+ * WCA 9p1: at most 75% of the competitors in a round may advance. Applied to
+ * every method, so a `rankLimit` larger than three quarters of the field is
+ * clamped rather than advancing everyone.
+ */
+export const MAX_ADVANCEMENT_RATIO = 0.75;
+
+/**
+ * A round below this many competitors is effectively a final — advancing from it
+ * is meaningless, and 9p1's ratio leaves almost nobody behind.
+ */
+export const MIN_COMPETITORS_TO_ADVANCE = 2;
+
+/** The most competitors that may advance from a field of this size (9p1). */
+export function advancementCap(fieldSize: number): number {
+  return Math.floor(fieldSize * MAX_ADVANCEMENT_RATIO);
+}
+
+/**
+ * Apply the 75% cap without splitting a tie.
+ *
+ * WCA 9p3: competitors tied at the advancement boundary either all advance or
+ * all do not. Truncating at the cap could otherwise separate two competitors
+ * with identical results based on nothing but array order — so when the cap
+ * lands inside a tie, the whole tied group is dropped.
+ */
+function capWithoutSplittingTies<T extends RankableResult>(
+  shortlisted: T[],
+  fieldSize: number,
+  format: WcaFormat,
+): T[] {
+  const cap = advancementCap(fieldSize);
+  if (shortlisted.length <= cap) return shortlisted;
+
+  let cut = cap;
+  // Walk back while the last advancing competitor ties the first excluded one.
+  while (cut > 0) {
+    const last = shortlisted[cut - 1];
+    const next = shortlisted[cut];
+    if (!last || !next || !isTied(last, next, format)) break;
+    cut--;
+  }
+  return shortlisted.slice(0, cut);
+}
+
+function applyMethod<T extends RankableResult>(
   criteria: AdvancementCriteria,
   sorted: T[],
+  format: WcaFormat,
 ): T[] {
   if (criteria.method === "rank" && criteria.rankLimit) {
-    return sorted.slice(0, criteria.rankLimit);
+    const limit = criteria.rankLimit;
+    // Include everyone tied with the competitor on the limit line, then let the
+    // 75% cap decide whether that whole group fits.
+    let end = Math.min(limit, sorted.length);
+    while (end < sorted.length) {
+      const last = sorted[end - 1];
+      const next = sorted[end];
+      if (!last || !next || !isTied(last, next, format)) break;
+      end++;
+    }
+    return sorted.slice(0, end);
   }
   if (criteria.method === "time" && criteria.timeLimitMs) {
     const limit = criteria.timeLimitMs;
-    return sorted.filter((r) => r.ao5Ms !== null && r.ao5Ms <= limit);
+    const avgStat = FORMAT_AVERAGE_STAT[format];
+    // Compare against the format's own average — reading ao5Ms for a Mo3 round
+    // meant nobody ever cleared the threshold.
+    return sorted.filter((r) => {
+      const average = avgStat === "mean" ? r.meanMs : avgStat === "ao5" ? r.ao5Ms : null;
+      return average !== null && average <= limit;
+    });
   }
   if (criteria.method === "best_single" && criteria.bestSingleMs) {
     const limit = criteria.bestSingleMs;
     return sorted.filter((r) => r.bestSingleMs !== null && r.bestSingleMs <= limit);
   }
   return [];
+}
+
+/**
+ * The shortlist for a round: sort by the format's ranking rules, apply the
+ * configured criteria, then enforce the WCA 9p limits.
+ */
+export function computeShortlist<T extends RankableResult>(
+  eligible: T[],
+  criteria: AdvancementCriteria | undefined,
+  legacyCount: number | undefined,
+  format: WcaFormat,
+): T[] {
+  if (eligible.length < MIN_COMPETITORS_TO_ADVANCE) return [];
+
+  const sorted = [...eligible].sort(compareForRanking(format));
+  const selected = criteria
+    ? applyMethod(criteria, sorted, format)
+    : sorted.slice(0, legacyCount ?? 0);
+
+  return capWithoutSplittingTies(selected, eligible.length, format);
 }
 
 /**
@@ -191,19 +286,17 @@ export async function reshortlistAdvancedRound(
   const legacyCount = round.advancementCount;
   if (!criteria && !legacyCount) return;
 
-  const results = await repo.results.findByRound(round.id);
-  const key = (n: number | null) => (n === null ? Number.POSITIVE_INFINITY : n);
+  const [results, event] = await Promise.all([
+    repo.results.findByRound(round.id),
+    repo.competitionEvents.findByRound(round.id),
+  ]);
+  const format = formatForRound(round, event?.eventType);
 
   const eligible = results.filter(
     (r) => r.flagStatus !== "flagged" && r.flagStatus !== "disqualified",
   );
-  const sorted = [...eligible].sort(
-    (a, b) => key(a.ao5Ms) - key(b.ao5Ms) || key(a.bestSingleMs) - key(b.bestSingleMs),
-  );
 
-  const shortlisted = criteria
-    ? applyMethod(criteria, sorted)
-    : sorted.slice(0, legacyCount!);
+  const shortlisted = computeShortlist(eligible, criteria, legacyCount, format);
 
   const advanced: RoundAdvancement[] = shortlisted.map((r, i) => ({
     roundId: round.id,
@@ -222,7 +315,6 @@ export async function reshortlistAdvancedRound(
   });
 
   // If the DQ'd user submitted results in the next round, disqualify them
-  const event = await repo.competitionEvents.findByRound(round.id);
   if (event) {
     const allRounds = await repo.rounds.findByCompetition(event.competitionId);
     const nextRound = allRounds.find(

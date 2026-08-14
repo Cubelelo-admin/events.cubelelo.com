@@ -6,7 +6,9 @@ import type {
   PaymentStatus,
   AccountStage,
   Solve,
+  SolvePenalty,
   UserRole,
+  WcaFormat,
 } from "@cubers/types";
 
 export function sanitizeUser<T extends { passwordHash?: unknown }>(u: T): Omit<T, "passwordHash"> & { hasPassword: boolean } {
@@ -57,12 +59,10 @@ export interface Competition {
   registrationDeadline?: string;   // = registration closes at
   startsAt?: string;
   endsAt?: string;
-  coverUrl?: string;
   bannerUrl?: string;
   mobileBannerUrl?: string;
   featured: boolean;
   featuredOrder?: number;
-  coverCaption?: string;
   cancellationReason?: string;
   videoDeadlineMinutes: number;
   registrationLimit?: number;
@@ -95,6 +95,16 @@ export interface Round {
   competitionEventId: string;
   roundNumber: number;
   status: RoundStatus;
+  /**
+   * WCA format code (Regulation 9b) — decides attempt count, ranking metric and
+   * cutoff attempt count. Optional on the type so pre-migration rows still load;
+   * use `formatForRound()` rather than reading this directly.
+   */
+  format?: WcaFormat;
+  /** Cutoff for a combined round (Reg 9g). Falls back to the competition event's value. */
+  cutoffMs?: number;
+  /** Per-attempt time limit (Reg A1a4). Falls back to the competition event's value. */
+  timeLimitMs?: number;
   advancementCount?: number;
   advancementCriteria?: AdvancementCriteria;
   opensAt?: string;
@@ -138,6 +148,12 @@ export interface Result {
   flagStatus: FlagStatus;
   /** Structured reasons why this result was flagged (empty when clean/verified). */
   flagReasons: FlagReason[];
+  /**
+   * Judge's per-attempt penalty overrides, parallel to `solves`; null where the
+   * judge changed nothing. Raw solves are never mutated, so clearing these
+   * (a "verified" verdict) restores the competitor's original stats.
+   */
+  judgeOverrides?: (SolvePenalty | null)[];
   verifiedBy?: string;
   verifiedAt?: string;
   verificationComment?: string;
@@ -169,7 +185,9 @@ export interface RegistrationEvent {
 export interface Payment {
   id: string;
   userId: string;
-  registrationId: string;
+  registrationId?: string | null;
+  competitionId?: string | null;
+  eventIds?: string | null;       // comma-separated competition_event ids (checkout intent)
   amount: number;
   currency: string;
   razorpayOrderId?: string;

@@ -39,17 +39,18 @@ export async function registerRegistrationRoutes(
       // Check registration capacity
       if (comp.registrationLimit != null && comp.registrationLimit > 0) {
         const currentRegs = await repo.registrations.findByCompetition(comp.id);
-        const activeCount = currentRegs.filter((r) => r.paymentStatus !== "failed").length;
+        const activeCount = currentRegs.filter((r) => r.paymentStatus === "paid").length;
         if (activeCount >= comp.registrationLimit) {
           return reply.code(409).send({ error: "registration_full" });
         }
       }
 
       const existing = await repo.registrations.findByUserAndComp(user.id, comp.id);
-      if (existing && existing.paymentStatus !== "failed") {
+      if (existing && existing.paymentStatus === "paid") {
         return reply.code(409).send({ error: "already_registered" });
       }
-      if (existing && existing.paymentStatus === "failed") {
+      // Clean up any non-paid registration (failed or legacy pending)
+      if (existing) {
         await repo.registrations.removeEvents(existing.id);
         await repo.registrations.delete(existing.id);
       }
@@ -78,11 +79,25 @@ export async function registerRegistrationRoutes(
       const totalFee = comp.baseFee + eventFeeSum;
       const isFree = totalFee === 0;
 
+      if (!isFree) {
+        // Paid competitions: don't create registration yet — return fee info
+        // so the frontend can proceed to payment. Registration is created
+        // only after payment is verified (standard payment flow).
+        return reply.code(200).send({
+          registrationId: null,
+          totalFee,
+          paymentStatus: "requires_payment",
+          competitionId: comp.id,
+          eventIds,
+        });
+      }
+
+      // Free competition: register immediately
       const registration: Registration = {
         id: randomUUID(),
         userId: user.id,
         competitionId: comp.id,
-        paymentStatus: isFree ? "paid" : "pending",
+        paymentStatus: "paid",
         createdAt: new Date().toISOString(),
       };
       await repo.registrations.create(registration);
@@ -92,8 +107,8 @@ export async function registerRegistrationRoutes(
 
       return reply.code(201).send({
         registrationId: registration.id,
-        totalFee,
-        paymentStatus: registration.paymentStatus,
+        totalFee: 0,
+        paymentStatus: "paid",
       });
     },
   );

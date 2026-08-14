@@ -102,7 +102,7 @@ export async function registerAuthRoutes(
 
   app.get("/api/v1/users/me", { preHandler: requireAuth }, async (req, reply) => {
     const user = await repo.users.findById(req.authClaims!.sub);
-    if (!user) return reply.code(404).send({ error: "not_synced" });
+    if (!user) return reply.code(403).send({ error: "not_synced" });
     return sanitizeUser(user);
   });
 
@@ -251,7 +251,7 @@ export async function registerAuthRoutes(
         return reply.code(400).send({ error: "type_and_value_required" });
       }
       const user = await repo.users.findById(req.authClaims!.sub);
-      if (!user) return reply.code(404).send({ error: "not_synced" });
+      if (!user) return reply.code(403).send({ error: "not_synced" });
 
       const otp = generateOtp();
 
@@ -319,7 +319,7 @@ export async function registerAuthRoutes(
         return reply.code(400).send({ error: "type_value_code_required" });
       }
       const user = await repo.users.findById(req.authClaims!.sub);
-      if (!user) return reply.code(404).send({ error: "not_synced" });
+      if (!user) return reply.code(403).send({ error: "not_synced" });
 
       const normalized = type === "email" ? value.trim().toLowerCase() : normalizeMobile(value.trim());
       const otpType = type === "email" ? "otp_email" : "otp_mobile";
@@ -376,7 +376,7 @@ export async function registerAuthRoutes(
     { preHandler: requireAuth },
     async (req, reply) => {
       const user = await repo.users.findById(req.authClaims!.sub);
-      if (!user) return reply.code(404).send({ error: "not_synced" });
+      if (!user) return reply.code(403).send({ error: "not_synced" });
       if (user.emailVerified) return reply.code(409).send({ error: "already_verified" });
       if (!user.email) return reply.code(400).send({ error: "no_email_set" });
 
@@ -460,7 +460,7 @@ export async function registerAuthRoutes(
         return reply.code(400).send({ error: "new_password_too_short" });
       }
       const user = await repo.users.findById(req.authClaims!.sub);
-      if (!user) return reply.code(404).send({ error: "not_synced" });
+      if (!user) return reply.code(403).send({ error: "not_synced" });
 
       if (user.passwordHash) {
         if (!currentPassword) {
@@ -517,7 +517,7 @@ export async function registerAuthRoutes(
       }
 
       const current = await repo.users.findById(req.authClaims!.sub);
-      if (!current) return reply.code(404).send({ error: "not_synced" });
+      if (!current) return reply.code(403).send({ error: "not_synced" });
 
       const stub = legacyClId
         ? await repo.users.findByClId(legacyClId)
