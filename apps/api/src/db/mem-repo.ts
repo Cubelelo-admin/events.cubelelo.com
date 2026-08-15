@@ -19,6 +19,7 @@ import type {
   RoundAdvancement,
   PromoCode,
   Appeal,
+  WithdrawalRequest,
   RankTier,
   Banner,
   FaqEntry,
@@ -53,6 +54,7 @@ export function createMemRepo(): Repository {
   const dailyChallenges = new Map<string, DailyChallenge>();
   const dailyChallengeResults: DailyChallengeResult[] = [];
   const appeals = new Map<string, Appeal>();
+  const withdrawalRequests = new Map<string, WithdrawalRequest>();
   const rankTiers = new Map<string, RankTier>();
   const promoCodes = new Map<string, PromoCode>();
   const bannerStore = new Map<string, Banner>();
@@ -362,11 +364,10 @@ export function createMemRepo(): Repository {
         }
         return map;
       },
-      async hasPaidRegistration(userId) {
-        return [...registrations.values()].some((r) => r.userId === userId && r.paymentStatus === "paid");
-      },
+      // Mirrors the pg-repo query, which is `isActiveRegistration`
+      // (lib/registrationStatus.ts) expressed in SQL.
       async isRegisteredForEvent(userId, competitionEventId) {
-        const userRegs = [...registrations.values()].filter((r) => r.userId === userId && r.paymentStatus === "paid");
+        const userRegs = [...registrations.values()].filter((r) => r.userId === userId && r.status === "active");
         return userRegs.some((r) =>
           registrationEvents.some((re) => re.registrationId === r.id && re.competitionEventId === competitionEventId),
         );
@@ -386,6 +387,9 @@ export function createMemRepo(): Repository {
         return [...payments.values()].find(
           (p) => p.userId === userId && p.competitionId === competitionId && p.status === "pending",
         ) ?? null;
+      },
+      async hasCompletedPayment(userId) {
+        return [...payments.values()].some((p) => p.userId === userId && p.status === "paid");
       },
       async findByRegistrationIds(registrationIds) {
         const set = new Set(registrationIds);
@@ -618,6 +622,30 @@ export function createMemRepo(): Repository {
         if (!existing) return null;
         const updated = { ...existing, ...fields };
         appeals.set(id, updated);
+        return updated;
+      },
+    },
+
+    withdrawalRequests: {
+      async findAll() { return [...withdrawalRequests.values()]; },
+      async findById(id) { return withdrawalRequests.get(id) ?? null; },
+      async findPendingByRegistration(registrationId) {
+        return [...withdrawalRequests.values()].find(
+          (w) => w.registrationId === registrationId && w.status === "pending",
+        ) ?? null;
+      },
+      async findByUser(userId) {
+        return [...withdrawalRequests.values()].filter((w) => w.userId === userId);
+      },
+      async create(request) { withdrawalRequests.set(request.id, request); },
+      async update(id, fields) {
+        const existing = withdrawalRequests.get(id);
+        if (!existing) return null;
+        const updated = { ...existing, ...fields };
+        if (fields.status === "approved" || fields.status === "rejected") {
+          updated.resolvedAt = updated.resolvedAt ?? new Date().toISOString();
+        }
+        withdrawalRequests.set(id, updated);
         return updated;
       },
     },

@@ -109,6 +109,21 @@ export function createRealtime(): AttachableRealtime {
   // Last emitted fingerprint per round — skip broadcast if unchanged
   const lastBoardFingerprint = new Map<string, string>();
 
+  // Round → competition, so a status change can also reach viewers watching the
+  // whole competition. Resolved lazily and cached: a round never changes owner.
+  const compIdByRound = new Map<string, string>();
+  let repoRef: Repository | null = null;
+
+  async function competitionIdOf(roundId: string): Promise<string | null> {
+    const cached = compIdByRound.get(roundId);
+    if (cached) return cached;
+    if (!repoRef) return null;
+    const ev = await repoRef.competitionEvents.findByRound(roundId);
+    if (!ev) return null;
+    compIdByRound.set(roundId, ev.competitionId);
+    return ev.competitionId;
+  }
+
   // Roster debounce: coalesce rapid check-ins into a single broadcast
   const ROSTER_DEBOUNCE_MS = 300;
   const rosterPending = new Map<string, ReturnType<typeof setTimeout>>();
@@ -168,7 +183,16 @@ export function createRealtime(): AttachableRealtime {
     },
 
     emitRoundStatus(roundId, status, opensAt) {
-      io?.to(roomOf(roundId)).emit("round:status", { roundId, status, opensAt });
+      const payload = { roundId, status, opensAt };
+      io?.to(roomOf(roundId)).emit("round:status", payload);
+
+      // The competition page shows every round at once, and a socket may join
+      // only MAX_ROOMS_PER_SOCKET rooms — joining one room per round silently
+      // stops working past the tenth. Fanning the same event out to the
+      // competition room lets that page watch all of them with one join.
+      void competitionIdOf(roundId).then((compId) => {
+        if (compId) io?.to(`comp:${compId}`).emit("round:status", payload);
+      });
     },
 
     emitCompStatus(compId, status) {
@@ -187,6 +211,7 @@ export function createRealtime(): AttachableRealtime {
     },
 
     async attach(app, repo) {
+      repoRef = repo;
       const corsOrigin = process.env.CORS_ORIGINS
         ? process.env.CORS_ORIGINS.split(",")
         : true;

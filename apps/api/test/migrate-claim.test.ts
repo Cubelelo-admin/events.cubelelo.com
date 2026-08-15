@@ -60,6 +60,7 @@ async function createStub(clId: string, email: string) {
     userId: stubId,
     competitionId: SEED_DEMO_COMP_ID,
     paymentStatus: "paid",
+    status: "active",
     createdAt: now,
   });
   await repo.payments.create({

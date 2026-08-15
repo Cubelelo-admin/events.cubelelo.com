@@ -18,6 +18,7 @@ import type {
   RoundAdvancement,
   PromoCode,
   Appeal,
+  WithdrawalRequest,
   RankTier,
   Banner,
   FaqEntry,
@@ -127,7 +128,6 @@ export interface Repository {
     findEvents(registrationId: string): Promise<CompetitionEvent[]>;
     /** Events for many registrations at once, keyed by registration id. */
     findEventsForAll(registrationIds: string[]): Promise<Map<string, CompetitionEvent[]>>;
-    hasPaidRegistration(userId: string): Promise<boolean>;
     isRegisteredForEvent(userId: string, competitionEventId: string): Promise<boolean>;
   };
 
@@ -140,6 +140,18 @@ export interface Repository {
     findPendingByUserAndComp(userId: string, competitionId: string): Promise<Payment | null>;
     /** Latest payment for each registration, keyed by registration id. */
     findByRegistrationIds(registrationIds: string[]): Promise<Map<string, Payment>>;
+    /**
+     * Has this user ever completed a checkout?
+     *
+     * The welcome promo is a first-order benefit, so it has to be asked of
+     * payments. Asking registrations instead treated joining a *free*
+     * competition as a purchase, because free registrations are written with
+     * `payment_status = 'paid'`.
+     *
+     * Fully-discounted orders count: they create a paid payment of zero, and
+     * someone who already spent their welcome promo has had the benefit.
+     */
+    hasCompletedPayment(userId: string): Promise<boolean>;
     create(payment: Payment): Promise<void>;
     update(id: string, fields: Partial<Payment>): Promise<void>;
   };
@@ -225,6 +237,16 @@ export interface Repository {
     findByUser(userId: string): Promise<Appeal[]>;
     create(appeal: Appeal): Promise<void>;
     update(id: string, fields: Partial<Appeal>): Promise<Appeal | null>;
+  };
+
+  withdrawalRequests: {
+    findAll(): Promise<WithdrawalRequest[]>;
+    findById(id: string): Promise<WithdrawalRequest | null>;
+    /** The open request for a registration, if one exists. */
+    findPendingByRegistration(registrationId: string): Promise<WithdrawalRequest | null>;
+    findByUser(userId: string): Promise<WithdrawalRequest[]>;
+    create(request: WithdrawalRequest): Promise<void>;
+    update(id: string, fields: Partial<WithdrawalRequest>): Promise<WithdrawalRequest | null>;
   };
 
   rankTiers: {

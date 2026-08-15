@@ -5,6 +5,7 @@ import Link from "next/link";
 import { CompetitionDetailsFields } from "@/features/admin/competition/CompetitionDetailsFields";
 import { shiftRoundsAroundEvent } from "@/features/admin/competition/schedule";
 import { ArchivedEventsList } from "@/features/admin/competition/ArchivedEventsList";
+import { ImageField } from "@/features/admin/competition/ImageField";
 import {
   RoundScheduleList,
   type CriteriaMethod,
@@ -17,7 +18,6 @@ import {
 import {
   EMPTY_COMPETITION_DETAILS,
   FIELD_LABELS,
-  IMAGE_ACCEPT,
   IMAGE_HINTS,
   MAX_ROUND_COUNT,
   MIN_ROUND_COUNT,
@@ -32,6 +32,8 @@ import {
   type WcaFormat,
 } from "@cubers/types";
 import {
+  assetUrl,
+  removeParticipant,
   createPracticeEvent,
   downloadCertificatesZip,
   downloadCsvCertificates,
@@ -225,43 +227,6 @@ function cascadeSchedule(
  * Image field that uploads as soon as a file is chosen — the Manage screen's
  * behaviour, since the competition already exists.
  */
-function ImageUploader({
-  label,
-  hint,
-  currentUrl,
-  busy,
-  onUpload,
-}: {
-  label: string;
-  hint: string;
-  currentUrl?: string | null;
-  busy: boolean;
-  onUpload: (file: File) => void;
-}) {
-  return (
-    <div>
-      <label className="mb-1 block text-xs font-medium text-zinc-500">
-        {label} <span className="text-zinc-400">({hint})</span>
-      </label>
-      {currentUrl ? (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img src={currentUrl} alt="" className="mb-2 h-16 w-full rounded object-cover" />
-      ) : null}
-      <input
-        type="file"
-        accept={IMAGE_ACCEPT}
-        disabled={busy}
-        onChange={(e) => {
-          const file = e.target.files?.[0];
-          if (file) onUpload(file);
-        }}
-        className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 file:mr-3 file:rounded file:border-0 file:bg-emerald-600 file:px-3 file:py-1 file:text-xs file:font-semibold file:text-white hover:file:bg-emerald-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
-      />
-      {busy ? <p className="mt-1 text-[11px] text-zinc-500">Uploading…</p> : null}
-    </div>
-  );
-}
-
 export function AdminCompetition({ id }: { id: string }) {
   const [detail, setDetail] = useState<CompetitionDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -271,6 +236,7 @@ export function AdminCompetition({ id }: { id: string }) {
   const [cancelReason, setCancelReason] = useState("");
   const [publishModal, setPublishModal] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<EventDetail | null>(null);
+  const [removeTarget, setRemoveTarget] = useState<AdminParticipantEntry | null>(null);
 
   // Competition-level form state, shared in shape with the Create screen.
   const [detailsForm, setDetailsForm] = useState<CompetitionDetailsValue>(EMPTY_COMPETITION_DETAILS);
@@ -299,6 +265,20 @@ export function AdminCompetition({ id }: { id: string }) {
   const [participantsLoading, setParticipantsLoading] = useState(false);
   const [showParticipants, setShowParticipants] = useState(false);
   const [participantsError, setParticipantsError] = useState<string | null>(null);
+
+  /** Shared by the Show toggle and by removal, so the table refreshes in place. */
+  const loadParticipants = useCallback(async () => {
+    setParticipantsLoading(true);
+    setParticipantsError(null);
+    try {
+      const res = await fetchAdminParticipants(id);
+      setAdminParticipants(res.participants);
+    } catch (e) {
+      console.error("Failed to fetch participants:", e);
+      setParticipantsError(e instanceof Error ? e.message : String(e));
+    }
+    setParticipantsLoading(false);
+  }, [id]);
 
   const load = useCallback(() => {
     fetchCompetition(id)
@@ -849,19 +829,21 @@ export function AdminCompetition({ id }: { id: string }) {
             globalVideoDeadlineMinutes={schedDefaults?.videoDeadlineMinutes}
             imageSlot={
               <div className="grid gap-4 md:grid-cols-2">
-                <ImageUploader
+                <ImageField
                   label={FIELD_LABELS.desktopBanner}
                   hint={IMAGE_HINTS.desktopBanner}
                   currentUrl={detail.bannerUrl}
                   busy={busy === "banner"}
-                  onUpload={(f) => run("banner", () => uploadCompetitionBanner(id, f))}
+                  required
+                  // Manage saves as you go, so a pick uploads straight away.
+                  onPick={(f) => f && run("banner", () => uploadCompetitionBanner(id, f))}
                 />
-                <ImageUploader
+                <ImageField
                   label={FIELD_LABELS.mobileBanner}
                   hint={IMAGE_HINTS.mobileBanner}
                   currentUrl={detail.mobileBannerUrl}
                   busy={busy === "mobileBanner"}
-                  onUpload={(f) => run("mobileBanner", () => uploadCompetitionMobileBanner(id, f))}
+                  onPick={(f) => f && run("mobileBanner", () => uploadCompetitionMobileBanner(id, f))}
                 />
               </div>
             }
@@ -975,18 +957,7 @@ export function AdminCompetition({ id }: { id: string }) {
             )}
             <button
               onClick={async () => {
-                if (!showParticipants) {
-                  setParticipantsLoading(true);
-                  setParticipantsError(null);
-                  try {
-                    const res = await fetchAdminParticipants(id);
-                    setAdminParticipants(res.participants);
-                  } catch (e) {
-                    console.error("Failed to fetch participants:", e);
-                    setParticipantsError(e instanceof Error ? e.message : String(e));
-                  }
-                  setParticipantsLoading(false);
-                }
+                if (!showParticipants) await loadParticipants();
                 setShowParticipants((v) => !v);
               }}
               className="w-[90px] text-xs font-medium text-emerald-600 hover:text-emerald-500 dark:text-emerald-400 dark:hover:text-emerald-300"
@@ -1016,14 +987,22 @@ export function AdminCompetition({ id }: { id: string }) {
                     <th className="px-4 py-3">Email</th>
                     <th className="px-4 py-3">Phone</th>
                     <th className="px-4 py-3">Events</th>
+                    <th className="px-4 py-3">Status</th>
                     <th className="px-4 py-3">Payment</th>
                     <th className="px-4 py-3 text-right">Amount</th>
+                    <th className="px-4 py-3">Razorpay</th>
                     <th className="px-4 py-3">Registered</th>
+                    <th className="px-4 py-3" />
                   </tr>
                 </thead>
                 <tbody>
                   {adminParticipants.map((p) => (
-                    <tr key={p.userId} className="border-b border-zinc-100 hover:bg-zinc-50 dark:border-zinc-800/50 dark:hover:bg-zinc-900/40">
+                    <tr
+                      key={p.userId}
+                      className={`border-b border-zinc-100 hover:bg-zinc-50 dark:border-zinc-800/50 dark:hover:bg-zinc-900/40 ${
+                        p.status === "active" ? "" : "opacity-50"
+                      }`}
+                    >
                       <td className="px-4 py-2.5 font-medium text-zinc-800 dark:text-zinc-200">{p.name}</td>
                       <td className="px-4 py-2.5 font-mono text-xs text-emerald-500">{p.clId}</td>
                       <td className="px-4 py-2.5 text-zinc-500">{p.email}</td>
@@ -1034,6 +1013,15 @@ export function AdminCompetition({ id }: { id: string }) {
                             <span key={et} className="rounded bg-zinc-200 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">{et}</span>
                           ))}
                         </div>
+                      </td>
+                      <td className="px-4 py-2.5">
+                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                          p.status === "active"
+                            ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400"
+                            : "bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
+                        }`}>
+                          {p.status}
+                        </span>
                       </td>
                       <td className="px-4 py-2.5">
                         <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
@@ -1049,8 +1037,26 @@ export function AdminCompetition({ id }: { id: string }) {
                       <td className="px-4 py-2.5 text-right font-mono text-zinc-700 dark:text-zinc-300">
                         {p.paymentAmount ? `₹${(p.paymentAmount / 100).toFixed(0)}` : "—"}
                       </td>
+                      {/* The refund is issued by hand, so the ids have to be here. */}
+                      <td
+                        className="max-w-[10rem] truncate px-4 py-2.5 font-mono text-[11px] text-zinc-500"
+                        title={[p.razorpayOrderId, p.razorpayPaymentId].filter(Boolean).join(" / ")}
+                      >
+                        {p.razorpayPaymentId ?? p.razorpayOrderId ?? "—"}
+                      </td>
                       <td className="px-4 py-2.5 text-xs text-zinc-500">
                         {new Date(p.registeredAt).toLocaleDateString()}
+                      </td>
+                      <td className="px-4 py-2.5 text-right">
+                        {p.status === "active" && (
+                          <button
+                            type="button"
+                            onClick={() => setRemoveTarget(p)}
+                            className="text-xs text-zinc-400 transition hover:text-red-400"
+                          >
+                            Remove
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -1184,6 +1190,29 @@ export function AdminCompetition({ id }: { id: string }) {
           <Button variant="secondary" onClick={dismissError}>Dismiss</Button>
         </div>
       </Modal>
+
+      <ConfirmModal
+        open={!!removeTarget}
+        onClose={() => setRemoveTarget(null)}
+        onConfirm={() => {
+          if (!removeTarget) return;
+          const target = removeTarget;
+          setRemoveTarget(null);
+          run(`remove-${target.registrationId}`, async () => {
+            await removeParticipant(id, target.registrationId);
+            await loadParticipants();
+          });
+        }}
+        title="Remove Participant"
+        description={
+          <>
+            Remove <strong>{removeTarget?.name}</strong> from this competition? Their slot is freed
+            and they stop appearing as a participant. The registration is kept on record, and this
+            is refused if they have already submitted results.
+          </>
+        }
+        confirmLabel="Remove"
+      />
 
       <ConfirmModal
         open={!!deleteTarget}

@@ -9,6 +9,10 @@ const nextConfig = {
     return [
       { source: "/health", destination: `${API_URL}/health` },
       { source: "/api/v1/:path*", destination: `${API_URL}/api/v1/:path*` },
+      // Local file storage returns relative `/uploads/...` URLs, which resolve
+      // against this origin. Without this rewrite every locally-stored banner
+      // 404s silently — the image simply never appears.
+      { source: "/uploads/:path*", destination: `${API_URL}/uploads/:path*` },
     ];
   },
   experimental: {

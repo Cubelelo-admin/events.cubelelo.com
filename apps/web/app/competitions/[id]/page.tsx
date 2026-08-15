@@ -27,6 +27,8 @@ import { StatusBadge } from "@/features/competitions/StatusBadge";
 import { formatTime } from "@cubers/timer-core";
 import { Button } from "@/components/ui/Button";
 import { ErrorCard } from "@/components/ui/ErrorCard";
+import { useCompetitionRoundStatus } from "@/features/realtime/useCompetitionRoundStatus";
+import { WithdrawControl } from "@/features/competitions/detail/WithdrawControl";
 import { Modal } from "@/components/ui/Modal";
 import { Skeleton } from "@/components/Skeleton";
 import { Countdown } from "@/components/Countdown";
@@ -112,7 +114,10 @@ export default function CompetitionDetailPage() {
     if (!user || !params.id) return;
     fetchMyRegistrations()
       .then((regs) => {
-        const reg = regs.find((r) => r.competitionId === params.id) ?? null;
+        // Only an active registration means "you are in this competition" —
+        // a withdrawn one is history, not membership.
+        const reg =
+          regs.find((r) => r.competitionId === params.id && r.status === "active") ?? null;
         setMyReg(reg);
       })
       .catch(() => { });
@@ -313,7 +318,16 @@ export default function CompetitionDetailPage() {
             {!isCancelled && !isCompleted && (
               <div className="mb-8 flex flex-wrap items-center gap-4 rounded-xl border border-zinc-200 bg-white px-5 py-4 dark:border-zinc-800 dark:bg-zinc-900/40">
                 {myReg ? (
-                  <RegistrationSteps paymentStatus={myReg.paymentStatus} />
+                  <>
+                    <RegistrationSteps paymentStatus={myReg.paymentStatus} />
+                    <WithdrawControl
+                      registrationId={myReg.id}
+                      competitionId={comp.id}
+                      isPaid={(comp.baseFee ?? 0) > 0 || (comp.perEventFee ?? 0) > 0}
+                      canWithdraw={isRegOpen}
+                      onWithdrawn={() => setMyReg(null)}
+                    />
+                  </>
                 ) : isRegOpen ? (
                   user ? (
                     <>
@@ -736,12 +750,19 @@ function EventCardsSection({
   myProgress: RoundProgress[];
   isRegistered: boolean;
 }) {
+  // The page fetches once, so without this a round that opens while someone is
+  // reading never shows as live — the reported "Events tab doesn't show what's
+  // active". One competition room covers every round.
+  const liveStatuses = useCompetitionRoundStatus(comp.id);
+  const statusOf = (round: { id: string; status: string }) =>
+    liveStatuses.get(round.id) ?? round.status;
+
   return (
     <div className="grid gap-4 sm:grid-cols-2">
       {comp.events.map((ev) => {
         const latestRound = [...ev.rounds]
           .reverse()
-          .find((r) => r.status !== "pending") ?? ev.rounds[0];
+          .find((r) => statusOf(r) !== "pending") ?? ev.rounds[0];
 
         return (
           <div
@@ -757,7 +778,7 @@ function EventCardsSection({
                   <span className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
                     {eventDisplayName(ev.eventType)}
                   </span>
-                  {latestRound && <StatusBadge status={latestRound.status} />}
+                  {latestRound && <StatusBadge status={statusOf(latestRound)} />}
                 </div>
                 <div className="flex items-center gap-2 text-xs text-zinc-500">
                   <span>{ev.roundCount} round{ev.roundCount > 1 ? "s" : ""}</span>
@@ -770,8 +791,9 @@ function EventCardsSection({
             {/* Rounds chips */}
             <div className="mb-3 flex flex-wrap gap-1.5">
               {ev.rounds.map((r) => {
-                const isOpen = r.status === "open";
-                const isClosed = r.status === "closed" || r.status === "advanced";
+                const status = statusOf(r);
+                const isOpen = status === "open";
+                const isClosed = status === "closed" || status === "advanced";
                 const userRound = myProgress.find((p) => p.roundId === r.id);
                 const submitted = userRound?.userStatus === "submitted";
                 return (
@@ -786,7 +808,7 @@ function EventCardsSection({
                     }`}
                   >
                     {isOpen && <span className="live-dot h-1.5 w-1.5 rounded-full bg-emerald-500" />}
-                    R{r.roundNumber} — {r.status === "open" ? "Open" : r.status === "pending" ? "Pending" : r.status === "advanced" ? "Advanced" : "Closed"}
+                    R{r.roundNumber} — {status === "open" ? "Open" : status === "pending" ? "Pending" : status === "advanced" ? "Advanced" : "Closed"}
                     {submitted && " ✓"}
                   </span>
                 );

@@ -7,25 +7,45 @@ let instance: Socket | null = null;
 let refCount = 0;
 let connectedWithToken: string | null = null;
 
+// Rooms this client is in, refcounted so overlapping subscribers do not evict
+// each other. Competitions are tracked alongside rounds because the competition
+// page watches every round through one `comp:` room.
 const joinedRooms = new Map<string, number>();
+const joinedComps = new Map<string, number>();
 
 function rejoinRooms(socket: Socket): void {
   for (const roundId of joinedRooms.keys()) {
     socket.emit("join", { roundId });
   }
+  for (const compId of joinedComps.keys()) {
+    socket.emit("join", { compId });
+  }
+}
+
+function bump(map: Map<string, number>, key: string): void {
+  map.set(key, (map.get(key) ?? 0) + 1);
+}
+
+function drop(map: Map<string, number>, key: string): void {
+  const count = map.get(key) ?? 0;
+  if (count <= 1) map.delete(key);
+  else map.set(key, count - 1);
 }
 
 export function trackJoin(roundId: string): void {
-  joinedRooms.set(roundId, (joinedRooms.get(roundId) ?? 0) + 1);
+  bump(joinedRooms, roundId);
 }
 
 export function trackLeave(roundId: string): void {
-  const count = joinedRooms.get(roundId) ?? 0;
-  if (count <= 1) {
-    joinedRooms.delete(roundId);
-  } else {
-    joinedRooms.set(roundId, count - 1);
-  }
+  drop(joinedRooms, roundId);
+}
+
+export function trackCompJoin(compId: string): void {
+  bump(joinedComps, compId);
+}
+
+export function trackCompLeave(compId: string): void {
+  drop(joinedComps, compId);
 }
 
 export function acquireSocket(): Socket {
@@ -64,6 +84,7 @@ export function releaseSocket(): void {
     connectedWithToken = null;
     refCount = 0;
     joinedRooms.clear();
+    joinedComps.clear();
   }
 }
 

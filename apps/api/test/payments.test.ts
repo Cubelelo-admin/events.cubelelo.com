@@ -10,6 +10,8 @@ let app: FastifyInstance;
 let repo: Repository;
 let userToken: string;
 let registrationId: string;
+let eventId: string;
+let adminTokenValue: string;
 
 beforeAll(async () => {
   repo = createMemRepo();
@@ -18,6 +20,7 @@ beforeAll(async () => {
 
   // Sync admin first
   const admin = await adminToken(app);
+  adminTokenValue = admin;
   await app.inject({ method: "POST", url: "/api/v1/auth/sync", headers: bearer(admin) });
 
   // Make the demo competition paid via admin PATCH
@@ -31,19 +34,24 @@ beforeAll(async () => {
   userToken = await devToken(app, "payer@test.com", "Payer");
   await syncVerifiedUser(app, repo, userToken);
 
-  // Register for the demo competition
   const detail = await app.inject({
     method: "GET",
     url: `/api/v1/competitions/${SEED_DEMO_COMP_ID}`,
   });
-  const eventId = detail.json().events[0].id;
+  eventId = detail.json().events[0].id;
+
+  // Since migration 040 the flow is payment-first: registering for a paid
+  // competition creates nothing and simply quotes the fee. The registration is
+  // created when the payment is fulfilled.
   const reg = await app.inject({
     method: "POST",
     url: `/api/v1/competitions/${SEED_DEMO_COMP_ID}/register`,
     payload: { eventIds: [eventId] },
     headers: bearer(userToken),
   });
-  registrationId = reg.json().registrationId;
+  expect(reg.statusCode).toBe(200);
+  expect(reg.json().registrationId).toBeNull();
+  expect(reg.json().paymentStatus).toBe("requires_payment");
 });
 
 describe("payment flow", () => {
@@ -53,7 +61,7 @@ describe("payment flow", () => {
     const res = await app.inject({
       method: "POST",
       url: "/api/v1/payments/order",
-      payload: { registrationId },
+      payload: { competitionId: SEED_DEMO_COMP_ID, eventIds: [eventId] },
       headers: bearer(userToken),
     });
     expect(res.statusCode).toBe(201);
@@ -63,19 +71,52 @@ describe("payment flow", () => {
     paymentId = body.paymentId;
   });
 
-  it("confirms payment via repo and updates registration status", async () => {
-    // In tests without Razorpay configured, we confirm the payment directly via
-    // the repo (the webhook/verify endpoints require a signing secret).
-    await repo.payments.update(paymentId, { status: "paid", razorpayPaymentId: "pay_test_123" });
-    await repo.registrations.update(registrationId, { paymentStatus: "paid" });
+  it("creates no registration while the payment is unpaid", async () => {
+    const payer = await repo.users.findByEmail("payer@test.com");
+    const reg = await repo.registrations.findByUserAndComp(payer!.id, SEED_DEMO_COMP_ID);
+    expect(reg).toBeNull();
 
-    // Verify via the registrations API
+    // And nothing claims the user is registered.
+    const progress = await app.inject({
+      method: "GET",
+      url: `/api/v1/competitions/${SEED_DEMO_COMP_ID}/my-progress`,
+      headers: bearer(userToken),
+    });
+    expect(progress.json().registered).toBe(false);
+  });
+
+  it("creates the registration once the payment is fulfilled", async () => {
+    // Razorpay is not configured in tests, so the verify/webhook endpoints
+    // (which need a signing secret) cannot run. The admin manual-confirm route
+    // performs the same fulfilment and is the offline-payment path in its own
+    // right, so it is what this exercises.
+    const confirm = await app.inject({
+      method: "POST",
+      url: `/api/v1/admin/payments/${paymentId}/confirm`,
+      payload: { reason: "test" },
+      headers: bearer(adminTokenValue),
+    });
+    expect(confirm.statusCode).toBe(200);
+
     const regs = await app.inject({
       method: "GET",
       url: "/api/v1/me/registrations",
       headers: bearer(userToken),
     });
-    const reg = regs.json().find((r: { id: string }) => r.id === registrationId);
+    const reg = regs.json().find(
+      (r: { competitionId: string }) => r.competitionId === SEED_DEMO_COMP_ID,
+    );
     expect(reg?.paymentStatus).toBe("paid");
+    registrationId = reg.id;
+
+    // The gate and the flag now agree.
+    const payer = await repo.users.findByEmail("payer@test.com");
+    expect(await repo.registrations.isRegisteredForEvent(payer!.id, eventId)).toBe(true);
+    const progress = await app.inject({
+      method: "GET",
+      url: `/api/v1/competitions/${SEED_DEMO_COMP_ID}/my-progress`,
+      headers: bearer(userToken),
+    });
+    expect(progress.json().registered).toBe(true);
   });
 });

@@ -15,6 +15,11 @@ import {
   isSuperAdmin,
 } from "../../auth/ownership";
 import { effectiveCompStatus, effectiveRoundStatus } from "../../lib/statusUtils";
+import {
+  isActiveRegistration,
+  isPaidCompetition,
+  hasResultsInCompetition,
+} from "../../lib/registrationStatus";
 import { shortlistRound, reshortlistAdvancedRound, ensureScramblesGenerated } from "../../lib/roundLifecycle";
 import { validateCompetitionSchedule, validateScheduleFields, validateForPublish } from "../../lib/scheduleValidation";
 import {
@@ -437,8 +442,13 @@ export async function registerAdminRoutes(
       for await (const chunk of data.file) chunks.push(chunk as Buffer);
       const buffer = Buffer.concat(chunks);
 
-      if (buffer.length > 5 * 1024 * 1024)
-        return reply.code(400).send({ error: "file_too_large_max_5mb" });
+      // @fastify/multipart enforces its 5 MB limit by *truncating* the stream,
+      // not by throwing. Checking `buffer.length` therefore never fires — the
+      // buffer is capped at the limit — and an oversized photo used to be stored
+      // as a corrupt, half-written image with a 200 response. `truncated` is the
+      // only signal that the file was cut short.
+      if (data.file.truncated)
+        return reply.code(413).send({ error: "file_too_large_max_5mb" });
 
       const { getStorage } = await import("../../lib/storage");
       const filename = `competitions/${comp.id}_banner_${randomUUID().slice(0, 8)}.${ext}`;
@@ -469,8 +479,13 @@ export async function registerAdminRoutes(
       for await (const chunk of data.file) chunks.push(chunk as Buffer);
       const buffer = Buffer.concat(chunks);
 
-      if (buffer.length > 5 * 1024 * 1024)
-        return reply.code(400).send({ error: "file_too_large_max_5mb" });
+      // @fastify/multipart enforces its 5 MB limit by *truncating* the stream,
+      // not by throwing. Checking `buffer.length` therefore never fires — the
+      // buffer is capped at the limit — and an oversized photo used to be stored
+      // as a corrupt, half-written image with a 200 response. `truncated` is the
+      // only signal that the file was cut short.
+      if (data.file.truncated)
+        return reply.code(413).send({ error: "file_too_large_max_5mb" });
 
       const { getStorage } = await import("../../lib/storage");
       const filename = `competitions/${comp.id}_mobile_banner_${randomUUID().slice(0, 8)}.${ext}`;
@@ -645,19 +660,20 @@ export async function registerAdminRoutes(
     }
 
     const regs = await repo.registrations.findByCompetition(source.id);
-    const paidRegs = regs.filter(
-      (r) => r.paymentStatus === "paid" || source.type === "free" || source.type === "practice",
-    );
-    const regEventsByReg = await repo.registrations.findEventsForAll(paidRegs.map((r) => r.id));
+    // Only people actually in the source competition come across — a withdrawn
+    // or removed registration should not reappear in the practice copy.
+    const activeRegs = regs.filter(isActiveRegistration);
+    const regEventsByReg = await repo.registrations.findEventsForAll(activeRegs.map((r) => r.id));
 
     let copiedCount = 0;
-    for (const reg of paidRegs) {
+    for (const reg of activeRegs) {
       const newRegId = randomUUID();
       await repo.registrations.create({
         id: newRegId,
         userId: reg.userId,
         competitionId: newCompId,
         paymentStatus: "paid",
+        status: "active",
         createdAt: now,
       });
 
@@ -1691,6 +1707,7 @@ export async function registerAdminRoutes(
         const regEvents = (eventsByReg.get(reg.id) ?? []).map((e) => e.eventType);
         const payment = paymentsByReg.get(reg.id);
         return {
+          registrationId: reg.id,
           userId: reg.userId,
           clId: u?.clId ?? reg.userId,
           name: u?.name ?? "Unknown",
@@ -1699,13 +1716,63 @@ export async function registerAdminRoutes(
           city: u?.city ?? null,
           country: u?.country ?? null,
           eventTypes: regEvents,
+          // Whether the registration still stands, which is a different question
+          // from whether money arrived.
+          status: reg.status,
           paymentStatus: payment?.status ?? reg.paymentStatus,
           paymentAmount: payment?.amount ?? 0,
+          // Enough detail for an organiser to find and refund the payment by
+          // hand — refunds are not automated.
+          paymentId: payment?.id ?? null,
+          paymentCurrency: payment?.currency ?? null,
+          razorpayOrderId: payment?.razorpayOrderId ?? null,
+          razorpayPaymentId: payment?.razorpayPaymentId ?? null,
+          paymentCreatedAt: payment?.createdAt ?? null,
           registeredAt: reg.createdAt,
         };
       });
 
       return { count: participants.length, participants };
+    },
+  );
+
+  // Admin: remove a participant from a competition.
+  //
+  // Nothing could undo a registration before this — the competitor's own
+  // withdraw endpoint rejected everyone, and there was no admin equivalent at
+  // all. The row is kept and marked, so the removal stays on the record.
+  app.delete<{
+    Params: { id: string; regId: string };
+    Body: { reason?: string };
+  }>(
+    "/api/v1/admin/competitions/:id/registrations/:regId",
+    adminOrMod,
+    async (req, reply) => {
+      const comp = await ownedComp(req, reply, req.params.id);
+      if (!comp) return;
+
+      const reg = await repo.registrations.findById(req.params.regId);
+      if (!reg || reg.competitionId !== comp.id)
+        return reply.code(404).send({ error: "registration_not_found" });
+
+      if (!isActiveRegistration(reg))
+        return reply.code(409).send({ error: "registration_not_active" });
+
+      if (await hasResultsInCompetition(repo, reg.userId, comp.id))
+        return reply.code(409).send({ error: "registration_has_results" });
+
+      await repo.registrations.update(reg.id, { status: "removed" });
+
+      await repo.auditLog.create({
+        id: randomUUID(),
+        adminId: req.authClaims!.sub,
+        action: "registration_remove",
+        target: reg.id,
+        reason: req.body?.reason?.trim(),
+        createdAt: new Date().toISOString(),
+      });
+
+      return { ok: true, status: "removed" };
     },
   );
 
@@ -1787,6 +1854,7 @@ export async function registerAdminRoutes(
         userId: payment.userId,
         competitionId: payment.competitionId,
         paymentStatus: "paid",
+        status: "active",
         createdAt: new Date().toISOString(),
       });
       for (const eid of eventIds) {
@@ -2285,6 +2353,179 @@ export async function registerAdminRoutes(
     },
   );
 
+  // ── Withdrawal requests ─────────────────────────────────────────────────
+  //
+  // A competitor on a paid competition cannot simply leave — money changed
+  // hands. The API used to say "contact the organiser" and provide no way to do
+  // so. This is the appeals flow applied to registrations, and deliberately
+  // mirrors it route for route.
+
+  app.post<{
+    Body: { registrationId?: string; reason?: string };
+  }>(
+    "/api/v1/withdrawal-requests",
+    { preHandler: requireRole(repo, "user", "admin", "moderator", "judge") },
+    async (req, reply) => {
+      const { registrationId, reason } = req.body ?? {};
+      if (!registrationId || !reason?.trim())
+        return reply.code(400).send({ error: "registration_id_and_reason_required" });
+
+      const reg = await repo.registrations.findById(registrationId);
+      if (!reg) return reply.code(404).send({ error: "registration_not_found" });
+      if (reg.userId !== req.authClaims!.sub)
+        return reply.code(403).send({ error: "can_only_withdraw_own_registration" });
+      if (!isActiveRegistration(reg))
+        return reply.code(409).send({ error: "registration_not_active" });
+
+      const comp = await repo.competitions.findById(reg.competitionId);
+      if (!comp) return reply.code(404).send({ error: "competition_not_found" });
+      // Free competitions leave directly; a request would be a detour with no
+      // decision to make.
+      if (!isPaidCompetition(comp))
+        return reply.code(409).send({ error: "withdraw_directly" });
+
+      if (await hasResultsInCompetition(repo, reg.userId, comp.id))
+        return reply.code(409).send({ error: "registration_has_results" });
+
+      const open = await repo.withdrawalRequests.findPendingByRegistration(reg.id);
+      if (open) return reply.code(409).send({ error: "request_already_submitted" });
+
+      const request = {
+        id: randomUUID(),
+        registrationId: reg.id,
+        userId: reg.userId,
+        reason: reason.trim(),
+        status: "pending" as const,
+        createdAt: new Date().toISOString(),
+      };
+      await repo.withdrawalRequests.create(request);
+      return reply.code(201).send(request);
+    },
+  );
+
+  app.get(
+    "/api/v1/me/withdrawal-requests",
+    { preHandler: requireRole(repo, "user", "admin", "moderator", "judge") },
+    async (req) => {
+      const requests = await repo.withdrawalRequests.findByUser(req.authClaims!.sub);
+      return Promise.all(
+        requests.map(async (w) => {
+          const reg = await repo.registrations.findById(w.registrationId);
+          const comp = reg ? await repo.competitions.findById(reg.competitionId) : null;
+          return {
+            ...w,
+            competitionId: comp?.id ?? null,
+            competitionTitle: comp?.title ?? "Unknown",
+            registrationStatus: reg?.status ?? null,
+          };
+        }),
+      );
+    },
+  );
+
+  // Admin: every request, with the payment detail needed to settle a refund by
+  // hand. Moderators see only their own competitions, as with appeals.
+  app.get<{ Querystring: { status?: string } }>(
+    "/api/v1/admin/withdrawal-requests",
+    adminOrMod,
+    async (req) => {
+      const caller = await repo.users.findById(req.authClaims!.sub);
+      let all = await repo.withdrawalRequests.findAll();
+      if (req.query.status) all = all.filter((w) => w.status === req.query.status);
+
+      // `findByRegistration` returns only a *pending* payment despite its name,
+      // so a settled one would come back empty — this is the same lookup the
+      // participants list uses, which is the latest payment per registration.
+      const paymentsByReg = await repo.payments.findByRegistrationIds(
+        all.map((w) => w.registrationId),
+      );
+
+      const enriched = await Promise.all(
+        all.map(async (w) => {
+          const reg = await repo.registrations.findById(w.registrationId);
+          const payment = paymentsByReg.get(w.registrationId) ?? null;
+          const [user, comp, events] = await Promise.all([
+            repo.users.findById(w.userId),
+            reg ? repo.competitions.findById(reg.competitionId) : Promise.resolve(null),
+            reg ? repo.registrations.findEvents(reg.id) : Promise.resolve([]),
+          ]);
+          const resolver = w.resolvedBy ? await repo.users.findById(w.resolvedBy) : null;
+          return {
+            ...w,
+            userName: user?.name,
+            userClId: user?.clId,
+            userEmail: user?.email,
+            competitionId: comp?.id ?? null,
+            competitionTitle: comp?.title ?? "Unknown",
+            competitionType: comp?.type ?? null,
+            registrationStatus: reg?.status ?? null,
+            registeredAt: reg?.createdAt ?? null,
+            eventTypes: events.map((e) => e.eventType),
+            paymentId: payment?.id ?? null,
+            paymentStatus: payment?.status ?? reg?.paymentStatus ?? null,
+            paymentAmount: payment?.amount ?? 0,
+            paymentCurrency: payment?.currency ?? null,
+            razorpayOrderId: payment?.razorpayOrderId ?? null,
+            razorpayPaymentId: payment?.razorpayPaymentId ?? null,
+            paymentCreatedAt: payment?.createdAt ?? null,
+            resolvedByName: resolver?.name,
+            _compCreatedBy: comp?.createdBy,
+          };
+        }),
+      );
+
+      const visible = caller?.role === "moderator"
+        ? enriched.filter((w) => w._compCreatedBy === caller.id)
+        : enriched;
+
+      return { data: visible.map(({ _compCreatedBy, ...rest }) => rest), total: visible.length };
+    },
+  );
+
+  app.post<{
+    Params: { id: string };
+    Body: { action?: "approved" | "rejected"; adminResponse?: string };
+  }>("/api/v1/admin/withdrawal-requests/:id/resolve", adminOrMod, async (req, reply) => {
+    const { action, adminResponse } = req.body ?? {};
+    if (!action || !["approved", "rejected"].includes(action))
+      return reply.code(400).send({ error: "action_required" });
+
+    const request = await repo.withdrawalRequests.findById(req.params.id);
+    if (!request) return reply.code(404).send({ error: "request_not_found" });
+    if (request.status !== "pending")
+      return reply.code(409).send({ error: "request_already_resolved" });
+
+    const reg = await repo.registrations.findById(request.registrationId);
+    if (!reg) return reply.code(404).send({ error: "registration_not_found" });
+    // Same ownership rule as every other competition-scoped admin action.
+    if (!(await ownedComp(req, reply, reg.competitionId))) return;
+
+    // Approving is what actually removes them; rejecting leaves them in.
+    if (action === "approved") {
+      if (await hasResultsInCompetition(repo, reg.userId, reg.competitionId))
+        return reply.code(409).send({ error: "registration_has_results" });
+      await repo.registrations.update(reg.id, { status: "withdrawn" });
+    }
+
+    const updated = await repo.withdrawalRequests.update(request.id, {
+      status: action,
+      adminResponse: adminResponse?.trim(),
+      resolvedBy: req.authClaims!.sub,
+      resolvedAt: new Date().toISOString(),
+    });
+
+    await repo.auditLog.create({
+      id: randomUUID(),
+      adminId: req.authClaims!.sub,
+      action: `withdrawal_${action}`,
+      target: reg.id,
+      reason: adminResponse?.trim(),
+      createdAt: new Date().toISOString(),
+    });
+
+    return updated;
+  });
+
   // ── Appeals (user-facing) ───────────────────────────────────────────────
 
   app.post<{
@@ -2777,8 +3018,13 @@ export async function registerAdminRoutes(
       for await (const chunk of data.file) chunks.push(chunk as Buffer);
       const buffer = Buffer.concat(chunks);
 
-      if (buffer.length > 5 * 1024 * 1024)
-        return reply.code(400).send({ error: "file_too_large_max_5mb" });
+      // @fastify/multipart enforces its 5 MB limit by *truncating* the stream,
+      // not by throwing. Checking `buffer.length` therefore never fires — the
+      // buffer is capped at the limit — and an oversized photo used to be stored
+      // as a corrupt, half-written image with a 200 response. `truncated` is the
+      // only signal that the file was cut short.
+      if (data.file.truncated)
+        return reply.code(413).send({ error: "file_too_large_max_5mb" });
 
       const { getStorage } = await import("../../lib/storage");
       const filename = `banners/${banner.id}_${randomUUID().slice(0, 8)}.${ext}`;
@@ -2808,8 +3054,13 @@ export async function registerAdminRoutes(
       for await (const chunk of data.file) chunks.push(chunk as Buffer);
       const buffer = Buffer.concat(chunks);
 
-      if (buffer.length > 5 * 1024 * 1024)
-        return reply.code(400).send({ error: "file_too_large_max_5mb" });
+      // @fastify/multipart enforces its 5 MB limit by *truncating* the stream,
+      // not by throwing. Checking `buffer.length` therefore never fires — the
+      // buffer is capped at the limit — and an oversized photo used to be stored
+      // as a corrupt, half-written image with a 200 response. `truncated` is the
+      // only signal that the file was cut short.
+      if (data.file.truncated)
+        return reply.code(413).send({ error: "file_too_large_max_5mb" });
 
       const { getStorage } = await import("../../lib/storage");
       const filename = `banners/${banner.id}_mobile_${randomUUID().slice(0, 8)}.${ext}`;

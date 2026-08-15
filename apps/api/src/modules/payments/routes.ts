@@ -8,6 +8,7 @@ import { env } from "../../config/env";
 import { generateInvoicePDF, type InvoiceData } from "../../lib/invoice";
 import { submitLimiter } from "../../lib/rateLimiter";
 import { effectiveCompStatus } from "../../lib/statusUtils";
+import { isActiveRegistration } from "../../lib/registrationStatus";
 
 async function getRazorpay() {
   if (!env.RAZORPAY_KEY_ID || !env.RAZORPAY_KEY_SECRET) return null;
@@ -38,36 +39,41 @@ async function fulfillRegistration(
 
   const eventIds = eventIdsCsv.split(",").filter(Boolean);
 
-  // Check for an existing paid registration (idempotent — webhook + verify may race)
+  // Already fulfilled and still standing (idempotent — webhook + verify may race).
+  // The test is `status`, not `paymentStatus`: every row is marked paid, so the
+  // old check also matched a registration the competitor had withdrawn from and
+  // handed it back without reactivating it.
   const existingReg = await repo.registrations.findByUserAndComp(payment.userId, competitionId);
-  if (existingReg && existingReg.paymentStatus === "paid") {
-    // Link payment to existing registration if not already linked
+  if (isActiveRegistration(existingReg)) {
     if (!payment.registrationId) {
-      await repo.payments.update(payment.id, { registrationId: existingReg.id } as Partial<Payment>);
+      await repo.payments.update(payment.id, { registrationId: existingReg!.id } as Partial<Payment>);
     }
-    return existingReg;
+    return existingReg!;
   }
 
-  // Clean up any non-paid leftover registration
+  // Someone who withdrew and paid again reuses their row — unique
+  // (user_id, competition_id) leaves no other option.
+  let registration: Registration;
   if (existingReg) {
+    await repo.registrations.update(existingReg.id, { status: "active", paymentStatus: "paid" });
     await repo.registrations.removeEvents(existingReg.id);
-    await repo.registrations.delete(existingReg.id);
+    registration = { ...existingReg, status: "active", paymentStatus: "paid" };
+  } else {
+    registration = {
+      id: randomUUID(),
+      userId: payment.userId,
+      competitionId,
+      paymentStatus: "paid",
+      status: "active",
+      createdAt: new Date().toISOString(),
+    };
+    await repo.registrations.create(registration);
   }
 
-  // Create registration
-  const registration: Registration = {
-    id: randomUUID(),
-    userId: payment.userId,
-    competitionId,
-    paymentStatus: "paid",
-    createdAt: new Date().toISOString(),
-  };
-  await repo.registrations.create(registration);
   for (const eid of eventIds) {
     await repo.registrations.addEvent(registration.id, eid);
   }
 
-  // Link payment to new registration
   await repo.payments.update(payment.id, { registrationId: registration.id } as Partial<Payment>);
 
   return registration;
@@ -102,7 +108,7 @@ export async function registerPaymentRoutes(
 
       // Already registered and paid?
       const existingReg = await repo.registrations.findByUserAndComp(user.id, comp.id);
-      if (existingReg && existingReg.paymentStatus === "paid") {
+      if (isActiveRegistration(existingReg)) {
         return reply.code(409).send({ error: "already_paid" });
       }
 
@@ -156,7 +162,11 @@ export async function registerPaymentRoutes(
           }
         }
         if (promo.type === "welcome") {
-          const hasPaid = await repo.registrations.hasPaidRegistration(user.id);
+          // Asked of payments, not registrations: free competitions write
+          // `payment_status = 'paid'` on their registrations, so the old check
+          // treated joining a free competition as a first purchase and burned
+          // the welcome promo the user had never used.
+          const hasPaid = await repo.payments.hasCompletedPayment(user.id);
           if (hasPaid) {
             return reply.code(400).send({ error: "promo_welcome_only" });
           }

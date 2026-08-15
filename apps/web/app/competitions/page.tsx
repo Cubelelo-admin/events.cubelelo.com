@@ -40,7 +40,13 @@ export default function CompetitionsPage() {
     if (tab === "my" && user && !myRegIds) {
       setMyLoading(true);
       fetchMyRegistrations()
-        .then((regs) => setMyRegIds(new Set(regs.map((r) => r.competitionId))))
+        .then((regs) =>
+          // Withdrawn and removed registrations are kept on record, so they must
+          // be filtered out here or a competition you left still shows as yours.
+          setMyRegIds(
+            new Set(regs.filter((r) => r.status === "active").map((r) => r.competitionId)),
+          ),
+        )
         .catch(() => setMyRegIds(new Set()))
         .finally(() => setMyLoading(false));
     }

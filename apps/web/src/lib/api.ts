@@ -13,10 +13,25 @@ const FRIENDLY_ERRORS: Record<string, string> = {
   invalid_event_id: "One of the selected events is invalid.",
   event_not_available: "One of the selected events is not available.",
   registration_closed_cannot_withdraw: "Registration is closed — you can no longer withdraw.",
-  paid_registration_contact_admin: "You have a paid registration. Please contact the organiser to withdraw.",
+  paid_registration_contact_admin:
+    "This competition was paid for — send the organiser a withdrawal request and they'll settle the refund.",
   competition_not_found: "Competition not found.",
   event_has_results:
     "This event already has results, so it can't be deleted. Leave it archived instead.",
+  // Image upload
+  banner_required: "A desktop banner is required before this competition can be published.",
+  // Leaving a competition
+  registration_not_active: "This registration is no longer active.",
+  registration_has_results:
+    "You have already submitted results in this competition, so it can't be withdrawn.",
+  request_already_submitted: "You already have a withdrawal request awaiting review.",
+  request_already_resolved: "This request has already been resolved.",
+  can_only_withdraw_own_registration: "You can only withdraw your own registration.",
+  registration_id_and_reason_required: "Please give a reason for withdrawing.",
+  withdraw_directly: "This competition is free — you can withdraw without asking.",
+  invalid_file_type: "That file type isn't supported. Use a PNG, JPG, GIF, or WebP image.",
+  file_too_large_max_5mb: "That image is larger than 5 MB. Please upload a smaller file.",
+  no_file: "No file was received. Please pick an image and try again.",
   // Payments
   missing_registration_id: "Registration not found. Please try again.",
   registration_not_found: "Registration not found.",
@@ -246,6 +261,8 @@ export interface RegistrationDto {
   competitionId: string;
   competitionTitle: string;
   paymentStatus: string;
+  /** Whether the registration still stands. Withdrawn rows are kept on record. */
+  status: "active" | "withdrawn" | "removed";
   events: { id: string; eventType: string }[];
   createdAt: string;
 }
@@ -741,6 +758,7 @@ export function createPracticeEvent(
 }
 
 export interface AdminParticipantEntry {
+  registrationId: string;
   userId: string;
   clId: string;
   name: string;
@@ -749,8 +767,15 @@ export interface AdminParticipantEntry {
   city: string | null;
   country: string | null;
   eventTypes: string[];
+  /** Whether the registration still stands — separate from whether money arrived. */
+  status: "active" | "withdrawn" | "removed";
   paymentStatus: string;
   paymentAmount: number;
+  paymentId: string | null;
+  paymentCurrency: string | null;
+  razorpayOrderId: string | null;
+  razorpayPaymentId: string | null;
+  paymentCreatedAt: string | null;
   registeredAt: string;
 }
 
@@ -792,28 +817,40 @@ export async function regenerateRoundScrambles(roundId: string): Promise<{ round
   return sendJson("POST", `/api/v1/admin/rounds/${roundId}/regenerate-scrambles`, {});
 }
 
-export async function uploadCompetitionBanner(id: string, file: File): Promise<{ bannerUrl: string }> {
+/**
+ * Upload an image, surfacing the server's error code rather than a bare status.
+ *
+ * These used to throw `Upload failed: 413`, discarding the reason the server had
+ * already given — an admin picking a 6 MB photo was told nothing about size. The
+ * code is rethrown so `friendlyError` can turn it into a sentence.
+ */
+async function uploadImage<T>(path: string, file: File): Promise<T> {
   const form = new FormData();
   form.append("image", file);
-  const res = await fetch(`${BASE_URL}/api/v1/admin/competitions/${id}/upload-banner`, {
+  const res = await fetch(`${BASE_URL}${path}`, {
     method: "POST",
     headers: authHeaders(),
     body: form,
   });
-  if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+  if (!res.ok) {
+    let code = `${res.status}`;
+    try {
+      const body = await res.json();
+      if (typeof body?.error === "string") code = body.error;
+    } catch {
+      // Non-JSON body (a proxy error page, say) — the status is all we have.
+    }
+    throw new Error(code);
+  }
   return res.json();
 }
 
-export async function uploadCompetitionMobileBanner(id: string, file: File): Promise<{ mobileBannerUrl: string }> {
-  const form = new FormData();
-  form.append("image", file);
-  const res = await fetch(`${BASE_URL}/api/v1/admin/competitions/${id}/upload-mobile-banner`, {
-    method: "POST",
-    headers: authHeaders(),
-    body: form,
-  });
-  if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
-  return res.json();
+export function uploadCompetitionBanner(id: string, file: File): Promise<{ bannerUrl: string }> {
+  return uploadImage(`/api/v1/admin/competitions/${id}/upload-banner`, file);
+}
+
+export function uploadCompetitionMobileBanner(id: string, file: File): Promise<{ mobileBannerUrl: string }> {
+  return uploadImage(`/api/v1/admin/competitions/${id}/upload-mobile-banner`, file);
 }
 
 export function cancelRound(roundId: string): Promise<{ id: string; status: string }> {
@@ -1246,6 +1283,88 @@ export async function resolveAppeal(
   });
   if (!res.ok) throw new Error(`Resolve failed: ${res.status}`);
   return res.json();
+}
+
+// ── Withdrawal requests ─────────────────────────────────────────────────
+//
+// Deliberately the same shape as appeals: a competitor asks, an admin decides.
+
+export interface WithdrawalRequestDto {
+  id: string;
+  registrationId: string;
+  userId: string;
+  reason: string;
+  status: "pending" | "approved" | "rejected";
+  adminResponse?: string;
+  resolvedByName?: string;
+  createdAt: string;
+  resolvedAt?: string;
+
+  competitionId: string | null;
+  competitionTitle: string;
+  registrationStatus: string | null;
+
+  // Admin listing only.
+  userName?: string;
+  userClId?: string;
+  userEmail?: string;
+  competitionType?: string | null;
+  registeredAt?: string | null;
+  eventTypes?: string[];
+  paymentId?: string | null;
+  paymentStatus?: string | null;
+  paymentAmount?: number;
+  paymentCurrency?: string | null;
+  razorpayOrderId?: string | null;
+  razorpayPaymentId?: string | null;
+  paymentCreatedAt?: string | null;
+}
+
+/** Leave a free competition outright. Paid ones go through a request. */
+export function withdrawRegistration(regId: string): Promise<{ ok: boolean; status: string }> {
+  return sendJson("DELETE", `/api/v1/registrations/${regId}`);
+}
+
+export function requestWithdrawal(
+  registrationId: string,
+  reason: string,
+): Promise<WithdrawalRequestDto> {
+  return sendJson("POST", "/api/v1/withdrawal-requests", { registrationId, reason });
+}
+
+export function fetchMyWithdrawalRequests(): Promise<WithdrawalRequestDto[]> {
+  return getJson("/api/v1/me/withdrawal-requests");
+}
+
+export async function fetchAllWithdrawalRequests(): Promise<WithdrawalRequestDto[]> {
+  const json = await getJson<WithdrawalRequestDto[] | { data: WithdrawalRequestDto[] }>(
+    "/api/v1/admin/withdrawal-requests",
+  );
+  return Array.isArray(json) ? json : json.data;
+}
+
+export function resolveWithdrawalRequest(
+  id: string,
+  action: "approved" | "rejected",
+  adminResponse?: string,
+): Promise<WithdrawalRequestDto> {
+  return sendJson("POST", `/api/v1/admin/withdrawal-requests/${id}/resolve`, {
+    action,
+    adminResponse,
+  });
+}
+
+/** Organiser removing someone from a competition. */
+export function removeParticipant(
+  competitionId: string,
+  regId: string,
+  reason?: string,
+): Promise<{ ok: boolean; status: string }> {
+  return sendJson(
+    "DELETE",
+    `/api/v1/admin/competitions/${competitionId}/registrations/${regId}`,
+    { reason },
+  );
 }
 
 // ── WCA verification queue ──────────────────────────────────────────────

@@ -95,3 +95,34 @@ describe("live leaderboard over Socket.io", () => {
     b.disconnect();
   });
 });
+
+/**
+ * The competition page renders every round at once, but a socket may join only
+ * MAX_ROOMS_PER_SOCKET rooms — one room per round silently stops working past
+ * the tenth. Round status is therefore fanned out to the competition room too,
+ * so that page can watch all of them with a single join.
+ */
+describe("round status reaches the competition room", () => {
+  it("delivers round:status to a socket joined only to comp:<id>", async () => {
+    const socket = await new Promise<Socket>((resolve) => {
+      const s = ioClient(baseUrl, { transports: ["websocket"] });
+      s.on("connect", () => {
+        s.emit("join", { compId: SEED_DEMO_COMP_ID });
+        setTimeout(() => resolve(s), 50);
+      });
+    });
+
+    const received = new Promise<{ roundId: string; status: string }>((resolve, reject) => {
+      socket.once("round:status", resolve);
+      setTimeout(() => reject(new Error("no round:status on the competition room")), 2000);
+    });
+
+    realtime.emitRoundStatus(roundId, "open", new Date().toISOString());
+
+    const payload = await received;
+    expect(payload.roundId).toBe(roundId);
+    expect(payload.status).toBe("open");
+
+    socket.disconnect();
+  });
+});

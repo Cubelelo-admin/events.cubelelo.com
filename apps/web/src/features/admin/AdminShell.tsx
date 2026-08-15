@@ -45,6 +45,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { label: "Verification Hub", href: "/admin/verification-hub" },
       { label: "Appeals", href: "/admin/appeals" },
+      { label: "Withdrawals", href: "/admin/withdrawal-requests" },
     ],
   },
   {

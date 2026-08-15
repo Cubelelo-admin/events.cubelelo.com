@@ -4,6 +4,11 @@ import type { Repository } from "../../db/repo";
 import type { Registration } from "../../db/types";
 import { requireAuth } from "../../auth/plugin";
 import { effectiveCompStatus } from "../../lib/statusUtils";
+import {
+  isActiveRegistration,
+  isPaidCompetition,
+  hasResultsInCompetition,
+} from "../../lib/registrationStatus";
 
 export async function registerRegistrationRoutes(
   app: FastifyInstance,
@@ -39,20 +44,15 @@ export async function registerRegistrationRoutes(
       // Check registration capacity
       if (comp.registrationLimit != null && comp.registrationLimit > 0) {
         const currentRegs = await repo.registrations.findByCompetition(comp.id);
-        const activeCount = currentRegs.filter((r) => r.paymentStatus === "paid").length;
+        const activeCount = currentRegs.filter(isActiveRegistration).length;
         if (activeCount >= comp.registrationLimit) {
           return reply.code(409).send({ error: "registration_full" });
         }
       }
 
       const existing = await repo.registrations.findByUserAndComp(user.id, comp.id);
-      if (existing && existing.paymentStatus === "paid") {
+      if (isActiveRegistration(existing)) {
         return reply.code(409).send({ error: "already_registered" });
-      }
-      // Clean up any non-paid registration (failed or legacy pending)
-      if (existing) {
-        await repo.registrations.removeEvents(existing.id);
-        await repo.registrations.delete(existing.id);
       }
 
       // Validate event IDs belong to this competition and have at least one non-cancelled round
@@ -92,21 +92,35 @@ export async function registerRegistrationRoutes(
         });
       }
 
-      // Free competition: register immediately
-      const registration: Registration = {
-        id: randomUUID(),
-        userId: user.id,
-        competitionId: comp.id,
-        paymentStatus: "paid",
-        createdAt: new Date().toISOString(),
-      };
-      await repo.registrations.create(registration);
+      // Free competition: register immediately.
+      //
+      // Someone who withdrew earlier already has a row, and the unique
+      // (user_id, competition_id) constraint means it has to be reused rather
+      // than replaced. Reactivating keeps the history and the original join date.
+      let registrationId: string;
+      if (existing) {
+        registrationId = existing.id;
+        await repo.registrations.update(existing.id, { status: "active" });
+        await repo.registrations.removeEvents(existing.id);
+      } else {
+        const registration: Registration = {
+          id: randomUUID(),
+          userId: user.id,
+          competitionId: comp.id,
+          paymentStatus: "paid",
+          status: "active",
+          createdAt: new Date().toISOString(),
+        };
+        await repo.registrations.create(registration);
+        registrationId = registration.id;
+      }
+
       for (const eid of eventIds) {
-        await repo.registrations.addEvent(registration.id, eid);
+        await repo.registrations.addEvent(registrationId, eid);
       }
 
       return reply.code(201).send({
-        registrationId: registration.id,
+        registrationId,
         totalFee: 0,
         paymentStatus: "paid",
       });
@@ -127,19 +141,32 @@ export async function registerRegistrationRoutes(
       const comp = await repo.competitions.findById(reg.competitionId);
       if (!comp) return reply.code(404).send({ error: "competition_not_found" });
 
+      if (!isActiveRegistration(reg)) {
+        return reply.code(409).send({ error: "registration_not_active" });
+      }
+
       const status = effectiveCompStatus(comp);
       if (status !== "registration_open" && status !== "published") {
         return reply.code(409).send({ error: "registration_closed_cannot_withdraw" });
       }
 
-      if (reg.paymentStatus === "paid") {
+      // Money changed hands, so a human settles it — through a withdrawal
+      // request, not this endpoint. This used to test the registration's payment
+      // status, which is `paid` on free competitions too, so it rejected
+      // everyone and left no way out of any competition at all.
+      if (isPaidCompetition(comp)) {
         return reply.code(409).send({ error: "paid_registration_contact_admin" });
       }
 
-      await repo.registrations.removeEvents(reg.id);
-      await repo.registrations.delete(reg.id);
+      if (await hasResultsInCompetition(repo, reg.userId, comp.id)) {
+        return reply.code(409).send({ error: "registration_has_results" });
+      }
 
-      return { ok: true };
+      // Soft: `unique (user_id, competition_id)` means deleting is the only way
+      // to let someone register again, and the row is worth keeping.
+      await repo.registrations.update(reg.id, { status: "withdrawn" });
+
+      return { ok: true, status: "withdrawn" };
     },
   );
 
@@ -163,6 +190,7 @@ export async function registerRegistrationRoutes(
             competitionId: r.competitionId,
             competitionTitle: comp?.title ?? "Unknown",
             paymentStatus: r.paymentStatus,
+            status: r.status,
             events: events.map((e) => ({ id: e.id, eventType: e.eventType })),
             createdAt: r.createdAt,
           };

@@ -22,6 +22,7 @@ import type {
   RoundAdvancement,
   PromoCode,
   Appeal,
+  WithdrawalRequest,
   RankTier,
   Banner,
   FaqEntry,
@@ -222,7 +223,23 @@ function toRegistration(r: Row): Registration {
     userId: r.user_id as string,
     competitionId: r.competition_id as string,
     paymentStatus: r.payment_status as Registration["paymentStatus"],
+    // Pre-045 rows read as undefined; they are all active by definition.
+    status: (r.status as Registration["status"]) ?? "active",
     createdAt: ts(r.created_at),
+  };
+}
+
+function toWithdrawalRequest(r: Row): WithdrawalRequest {
+  return {
+    id: r.id as string,
+    registrationId: r.registration_id as string,
+    userId: r.user_id as string,
+    reason: r.reason as string,
+    status: r.status as WithdrawalRequest["status"],
+    adminResponse: (r.admin_response as string) ?? undefined,
+    resolvedBy: (r.resolved_by as string) ?? undefined,
+    createdAt: ts(r.created_at),
+    resolvedAt: r.resolved_at ? ts(r.resolved_at) : undefined,
   };
 }
 
@@ -905,13 +922,13 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
       },
       async create(reg) {
         await pool.query(
-          `INSERT INTO registrations (id, user_id, competition_id, payment_status, created_at)
-           VALUES ($1,$2,$3,$4,$5)`,
-          [reg.id, reg.userId, reg.competitionId, reg.paymentStatus, reg.createdAt],
+          `INSERT INTO registrations (id, user_id, competition_id, payment_status, status, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [reg.id, reg.userId, reg.competitionId, reg.paymentStatus, reg.status ?? "active", reg.createdAt],
         );
       },
       async update(id, fields) {
-        const COL: Record<string, string> = { paymentStatus: "payment_status", userId: "user_id" };
+        const COL: Record<string, string> = { paymentStatus: "payment_status", userId: "user_id", status: "status" };
         const { sets, vals, next } = buildSet(COL, fields as Record<string, unknown>);
         if (sets.length === 0) return;
         vals.push(id);
@@ -963,19 +980,15 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
         }
         return map;
       },
-      async hasPaidRegistration(userId: string) {
-        const { rows } = await pool.query(
-          "SELECT 1 FROM registrations WHERE user_id = $1 AND payment_status = 'paid' LIMIT 1",
-          [userId],
-        );
-        return rows.length > 0;
-      },
+      // The `status = 'active'` filter below is `isActiveRegistration`
+      // (lib/registrationStatus.ts) expressed in SQL, so the check can run inside
+      // the query. Keep the two in step — mem-repo carries the same note.
       async isRegisteredForEvent(userId: string, competitionEventId: string) {
         const { rows } = await pool.query(
           `SELECT 1 FROM registrations r
            JOIN registration_events re ON re.registration_id = r.id
            WHERE r.user_id = $1 AND re.competition_event_id = $2
-             AND r.payment_status = 'paid'
+             AND r.status = 'active'
            LIMIT 1`,
           [userId, competitionEventId],
         );
@@ -985,6 +998,13 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
 
     // ── payments ───────────────────────────────────────────────────────────
     payments: {
+      async hasCompletedPayment(userId: string) {
+        const { rows } = await pool.query(
+          "SELECT 1 FROM payments WHERE user_id = $1 AND status = 'paid' LIMIT 1",
+          [userId],
+        );
+        return rows.length > 0;
+      },
       async findAll() {
         const { rows } = await pool.query("SELECT * FROM payments ORDER BY created_at DESC");
         return rows.map(toPayment);
@@ -1611,6 +1631,58 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
     },
 
     // ── rank tiers ────────────────────────────────────────────────────────
+    withdrawalRequests: {
+      async findAll() {
+        const { rows } = await pool.query(
+          "SELECT * FROM withdrawal_requests ORDER BY created_at DESC",
+        );
+        return rows.map(toWithdrawalRequest);
+      },
+      async findById(id: string) {
+        const { rows } = await pool.query("SELECT * FROM withdrawal_requests WHERE id = $1", [id]);
+        return rows[0] ? toWithdrawalRequest(rows[0]) : null;
+      },
+      async findPendingByRegistration(registrationId: string) {
+        const { rows } = await pool.query(
+          "SELECT * FROM withdrawal_requests WHERE registration_id = $1 AND status = 'pending' LIMIT 1",
+          [registrationId],
+        );
+        return rows[0] ? toWithdrawalRequest(rows[0]) : null;
+      },
+      async findByUser(userId: string) {
+        const { rows } = await pool.query(
+          "SELECT * FROM withdrawal_requests WHERE user_id = $1 ORDER BY created_at DESC",
+          [userId],
+        );
+        return rows.map(toWithdrawalRequest);
+      },
+      async create(request: WithdrawalRequest) {
+        await pool.query(
+          `INSERT INTO withdrawal_requests (id, registration_id, user_id, reason, status, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [request.id, request.registrationId, request.userId, request.reason, request.status, request.createdAt],
+        );
+      },
+      async update(id: string, fields: Partial<WithdrawalRequest>) {
+        const COL: Record<string, string> = {
+          status: "status", adminResponse: "admin_response", resolvedBy: "resolved_by",
+        };
+        const { sets, vals, next } = buildSet(COL, fields as Record<string, unknown>);
+        if (sets.length === 0) return this.findById(id);
+        let idx = next;
+        if (fields.status === "approved" || fields.status === "rejected") {
+          sets.push(`resolved_at = $${idx}`);
+          vals.push(new Date().toISOString());
+          idx++;
+        }
+        vals.push(id);
+        const { rows } = await pool.query(
+          `UPDATE withdrawal_requests SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`, vals,
+        );
+        return rows[0] ? toWithdrawalRequest(rows[0]) : null;
+      },
+    },
+
     rankTiers: {
       async findAll() {
         const { rows } = await pool.query("SELECT * FROM rank_tiers ORDER BY event_type, max_ao5_ms");

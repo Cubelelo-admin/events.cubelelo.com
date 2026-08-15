@@ -169,11 +169,22 @@ export interface ResultSlim {
   flagStatus: FlagStatus;
 }
 
+/**
+ * Whether a registration still stands.
+ *
+ * Kept separate from `paymentStatus`, which answers a different question — "did
+ * money arrive" — and is meaningless on a free competition.
+ */
+export type RegistrationStatus = "active" | "withdrawn" | "removed";
+
 export interface Registration {
   id: string;
   userId: string;
   competitionId: string;
+  /** Did money arrive? Only meaningful on paid competitions. */
   paymentStatus: PaymentStatus;
+  /** Does this registration still stand? The authority for every validity check. */
+  status: RegistrationStatus;
   createdAt: string;
 }
 
@@ -283,6 +294,25 @@ export interface Appeal {
   userId: string;
   reason: string;
   status: "pending" | "accepted" | "rejected";
+  adminResponse?: string;
+  resolvedBy?: string;
+  createdAt: string;
+  resolvedAt?: string;
+}
+
+/**
+ * A competitor asking to leave a paid competition.
+ *
+ * Deliberately the same shape as `Appeal`: someone asks with a reason, an admin
+ * approves or rejects with a response, and both sides can see the outcome.
+ * Approving is what marks the registration withdrawn.
+ */
+export interface WithdrawalRequest {
+  id: string;
+  registrationId: string;
+  userId: string;
+  reason: string;
+  status: "pending" | "approved" | "rejected";
   adminResponse?: string;
   resolvedBy?: string;
   createdAt: string;

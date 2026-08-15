@@ -14,6 +14,7 @@ import {
   type RoundSlot,
 } from "@/features/admin/competition/schedule";
 import { ArchivedEventsList } from "@/features/admin/competition/ArchivedEventsList";
+import { ImageField } from "@/features/admin/competition/ImageField";
 import {
   RoundScheduleList,
   type CriteriaMethod,
@@ -21,7 +22,6 @@ import {
 } from "@/features/admin/competition/RoundScheduleList";
 import {
   FIELD_LABELS,
-  IMAGE_ACCEPT,
   IMAGE_HINTS,
   MAX_ROUND_COUNT,
   MIN_ROUND_COUNT,
@@ -102,40 +102,6 @@ function buildCriteria(method: CriteriaMethod, raw: string): AdvancementCriteria
 }
 
 /** Green "Choose file" button, shared by both admin screens. */
-const FILE_BUTTON =
-  "file:mr-3 file:rounded file:border-0 file:bg-emerald-600 file:px-3 file:py-1 file:text-xs file:font-semibold file:text-white hover:file:bg-emerald-500";
-
-const INPUT =
-  "w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none";
-
-/** File input for an image that is uploaded once the competition exists. */
-function ImagePicker({
-  label,
-  hint,
-  file,
-  onPick,
-}: {
-  label: string;
-  hint: string;
-  file: File | null;
-  onPick: (f: File | null) => void;
-}) {
-  return (
-    <div>
-      <label className="mb-1 block text-xs font-medium text-zinc-500">
-        {label} <span className="text-zinc-400">({hint})</span>
-      </label>
-      {file && <p className="mb-1 text-xs text-emerald-500">Selected: {file.name}</p>}
-      <input
-        type="file"
-        accept={IMAGE_ACCEPT}
-        onChange={(e) => onPick(e.target.files?.[0] ?? null)}
-        className={`${INPUT} ${FILE_BUTTON}`}
-      />
-    </div>
-  );
-}
-
 export default function CreateCompetitionPage() {
   const router = useRouter();
   const [title, setTitle] = useState("");
@@ -660,16 +626,17 @@ export default function CreateCompetitionPage() {
           ruleSets={ruleSets}
           imageSlot={
             <div className="grid gap-4 md:grid-cols-2">
-              <ImagePicker
+              <ImageField
                 label={FIELD_LABELS.desktopBanner}
                 hint={IMAGE_HINTS.desktopBanner}
-                file={bannerFile}
+                pendingFile={bannerFile}
+                required
                 onPick={setBannerFile}
               />
-              <ImagePicker
+              <ImageField
                 label={FIELD_LABELS.mobileBanner}
                 hint={IMAGE_HINTS.mobileBanner}
-                file={mobileBannerFile}
+                pendingFile={mobileBannerFile}
                 onPick={setMobileBannerFile}
               />
             </div>

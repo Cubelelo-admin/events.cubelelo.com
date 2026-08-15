@@ -59,6 +59,13 @@ export async function buildApp(
     if (error.validation) {
       return reply.code(400).send({ error: "invalid_request" });
     }
+    // Safety net: @fastify/multipart normally enforces the size limit by
+    // truncating (each upload route checks `truncated`), but it throws this code
+    // when configured to. Its message is prose and would otherwise be flattened
+    // to `invalid_request`, leaving the admin with no idea the file was too big.
+    if (error.code === "FST_REQ_FILE_TOO_LARGE") {
+      return reply.code(413).send({ error: "file_too_large_max_5mb" });
+    }
     if (status >= 500) {
       app.log.error(error);
       return reply.code(status).send({ error: "internal_error" });

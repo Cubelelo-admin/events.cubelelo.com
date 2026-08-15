@@ -5,6 +5,7 @@ import { isAdmin as isAdminRole, isAdminOrMod } from "../../auth/ownership";
 import { effectiveCompStatus, effectiveRoundStatus } from "../../lib/statusUtils";
 import { FORMAT_ATTEMPTS } from "@cubers/types";
 import { formatForRound, cutoffForRound, timeLimitForRound } from "../../lib/roundFormat";
+import { isActiveRegistration } from "../../lib/registrationStatus";
 
 export async function registerCompetitionRoutes(
   app: FastifyInstance,
@@ -234,7 +235,9 @@ export async function registerCompetitionRoutes(
       if (!user) return reply.code(403).send({ error: "not_synced" });
 
       const reg = await repo.registrations.findByUserAndComp(user.id, competition.id);
-      if (!reg) return { registered: false, rounds: [] };
+      // The same predicate the scramble and submit gates use — a registration the
+      // gates would reject must not be reported as registered here.
+      if (!isActiveRegistration(reg)) return { registered: false, rounds: [] };
 
       const events = await repo.competitionEvents.findByCompetition(competition.id);
       const rounds = await repo.rounds.findByCompetition(competition.id);
@@ -494,9 +497,9 @@ export async function registerCompetitionRoutes(
         repo.registrations.findByCompetition(competition.id),
       ]);
 
-      const paidRegs = regs.filter((r) => r.paymentStatus === "paid" || competition.type === "free" || competition.type === "practice");
-      const eventsByReg = await repo.registrations.findEventsForAll(paidRegs.map((r) => r.id));
-      const r1Participants = paidRegs.filter((r) =>
+      const activeRegs = regs.filter(isActiveRegistration);
+      const eventsByReg = await repo.registrations.findEventsForAll(activeRegs.map((r) => r.id));
+      const r1Participants = activeRegs.filter((r) =>
         (eventsByReg.get(r.id) ?? []).some((e) => e.id === event.id),
       ).length;
 
@@ -529,7 +532,7 @@ export async function registerCompetitionRoutes(
         const user = await repo.users.findById(req.authClaims.sub);
         if (user) {
           const reg = await repo.registrations.findByUserAndComp(user.id, competition.id);
-          if (reg) {
+          if (isActiveRegistration(reg)) {
             const userResults = await repo.results.findByUser(user.id);
             const roundProgress = eventRounds.map((r) => {
               const status = effectiveRoundStatus(r);
@@ -631,7 +634,7 @@ export async function registerCompetitionRoutes(
         (caller?.role === "moderator" && competition.createdBy === caller.id);
 
       const regs = (await repo.registrations.findByCompetition(competition.id))
-        .filter((r) => r.paymentStatus === "paid" || competition.type === "free" || competition.type === "practice");
+        .filter(isActiveRegistration);
 
       const [usersMap, eventsByReg] = await Promise.all([
         repo.users.findByIds([...new Set(regs.map((r) => r.userId))]),
