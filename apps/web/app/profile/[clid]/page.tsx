@@ -3,7 +3,12 @@
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { fetchUserProfile, type UserProfile } from "@/lib/api";
+import {
+  fetchUserProfile,
+  fetchPracticeStats,
+  type UserProfile,
+  type PracticeStatsDto,
+} from "@/lib/api";
 import { formatTime, formatSolve } from "@cubers/timer-core";
 import { useAuth } from "@/features/auth/AuthProvider";
 import { StatusBadge } from "@/features/competitions/StatusBadge";
@@ -19,6 +24,17 @@ export default function ProfilePage() {
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [practiceStats, setPracticeStats] = useState<PracticeStatsDto | null>(null);
+
+  // Only fetched for your own profile: the endpoint is scoped to the caller and
+  // cannot report anyone else's numbers.
+  useEffect(() => {
+    if (!me?.clId || me.clId !== params.clid) {
+      setPracticeStats(null);
+      return;
+    }
+    fetchPracticeStats().then(setPracticeStats).catch(() => {});
+  }, [me?.clId, params.clid]);
 
   useEffect(() => {
     if (!params.clid) return;
@@ -174,9 +190,31 @@ export default function ProfilePage() {
               timeline={profile.stats?.solveTimeline ?? {}}
               eventStats={profile.stats?.eventStats ?? {}}
             />
-            <div className="mt-4 rounded-lg border border-dashed border-zinc-300 p-3 text-center text-xs text-zinc-500 dark:border-zinc-800 dark:text-zinc-600">
-              Practice stats coming soon
-            </div>
+            {/* Practice stats are only ever the signed-in user's own — the
+                endpoint is scoped to the caller — so on someone else's profile
+                nothing is shown rather than a promise that cannot be kept. */}
+            {isOwnProfile && practiceStats && (
+              <div className="mt-4 grid grid-cols-3 gap-3 rounded-lg border border-zinc-200 p-3 text-center dark:border-zinc-800">
+                <div>
+                  <div className="font-mono text-base font-bold text-zinc-900 dark:text-zinc-100">
+                    {practiceStats.totalSolves}
+                  </div>
+                  <div className="text-[11px] text-zinc-500">Practice solves</div>
+                </div>
+                <div>
+                  <div className="font-mono text-base font-bold text-zinc-900 dark:text-zinc-100">
+                    {practiceStats.totalSessions}
+                  </div>
+                  <div className="text-[11px] text-zinc-500">Sessions</div>
+                </div>
+                <div>
+                  <div className="font-mono text-base font-bold text-zinc-900 dark:text-zinc-100">
+                    {Math.round(practiceStats.totalTimeMs / 60000)}m
+                  </div>
+                  <div className="text-[11px] text-zinc-500">Time practising</div>
+                </div>
+              </div>
+            )}
           </section>
 
           {/* Personal Bests */}

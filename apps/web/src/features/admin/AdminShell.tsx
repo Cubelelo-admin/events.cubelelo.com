@@ -44,6 +44,7 @@ const NAV_GROUPS: NavGroup[] = [
     label: "Review",
     items: [
       { label: "Verification Hub", href: "/admin/verification-hub" },
+      { label: "WCA Queue", href: "/admin/wca-queue" },
       { label: "Appeals", href: "/admin/appeals" },
       { label: "Withdrawals", href: "/admin/withdrawal-requests" },
     ],
@@ -64,6 +65,7 @@ const NAV_GROUPS: NavGroup[] = [
       { label: "Rank Tiers", href: "/admin/rank-tiers" },
       { label: "Merge Accounts", href: "/admin/merge" },
       { label: "Migration", href: "/admin/migration" },
+      { label: "System Health", href: "/health" },
     ],
   },
 ];

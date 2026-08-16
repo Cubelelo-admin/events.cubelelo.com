@@ -7,7 +7,6 @@ import { compareForRanking, isTied, type RankableResult } from "./resultStats";
 import type { Repository } from "../db/repo";
 import type { Round, RoundAdvancement, AdvancementCriteria } from "../db/types";
 import type { Realtime } from "../sockets/realtime";
-import { withTransaction } from "../db/pool";
 import { recomputeRanks } from "./resultStats";
 import { getRedis } from "./redis";
 
@@ -96,24 +95,24 @@ export async function shortlistRound(
     rank: i + 1,
   }));
 
-  // CAS + save in a single transaction — if save fails, the status rolls back
-  const claimed = await withTransaction(async (client) => {
-    const { rowCount } = await client.query(
-      "UPDATE rounds SET status = $1 WHERE id = $2 AND status = $3",
-      ["advanced", round.id, "closed"],
-    );
-    if ((rowCount ?? 0) === 0) return false;
-
-    await client.query("DELETE FROM round_advancements WHERE round_id = $1", [round.id]);
-    for (const e of advanced) {
-      await client.query(
-        "INSERT INTO round_advancements (round_id, user_id, rank) VALUES ($1,$2,$3)",
-        [e.roundId, e.userId, e.rank],
-      );
-    }
-    return true;
-  });
+  // Claim the round, then save. Both go through the repository: this used to be
+  // raw SQL behind `withTransaction`, which needs a live Postgres pool, so
+  // shortlisting threw on the in-memory backend and the whole persistence path
+  // was untestable — only the pure `computeShortlist` had coverage.
+  //
+  // The claim is a compare-and-set, so two callers cannot advance the same round
+  // twice. Saving is no longer in the same transaction as the claim, so a failed
+  // save is compensated by handing the round back to `closed` rather than
+  // leaving it `advanced` with no advancement list.
+  const claimed = await repo.rounds.compareAndUpdateStatus(round.id, "closed", "advanced");
   if (!claimed) return;
+
+  try {
+    await repo.advancements.save(round.id, advanced);
+  } catch (err) {
+    await repo.rounds.compareAndUpdateStatus(round.id, "advanced", "closed");
+    throw err;
+  }
 
   // Cache advancement set in Redis keyed by the DESTINATION round ID
   const redis = await getRedis();
@@ -139,7 +138,12 @@ export async function shortlistRound(
   await checkCompetitionCompletion(repo, realtime, round);
 }
 
-async function checkCompetitionCompletion(
+/**
+ * Mark the competition completed once every event's final round has been
+ * resolved. Exported so the publish route can use it rather than keeping a
+ * fourth copy of the rule.
+ */
+export async function checkCompetitionCompletion(
   repo: Repository,
   realtime: Realtime,
   round: Round,
@@ -149,7 +153,12 @@ async function checkCompetitionCompletion(
   const comp = await repo.competitions.findById(event.competitionId);
   if (!comp || comp.status === "completed" || comp.status === "cancelled" || comp.status === "draft") return;
 
-  const events = await repo.competitionEvents.findByCompetition(comp.id);
+  // Archived events are not run — archiving only flips a flag on the event and
+  // never touches its rounds, so they stay `pending` forever. Counting them here
+  // meant any competition containing an archived event could never complete.
+  const events = (await repo.competitionEvents.findByCompetition(comp.id)).filter(
+    (e) => !e.archived,
+  );
   const rounds = await repo.rounds.findByCompetition(comp.id);
 
   for (const ev of events) {
@@ -304,15 +313,8 @@ export async function reshortlistAdvancedRound(
     rank: i + 1,
   }));
 
-  await withTransaction(async (client) => {
-    await client.query("DELETE FROM round_advancements WHERE round_id = $1", [round.id]);
-    for (const e of advanced) {
-      await client.query(
-        "INSERT INTO round_advancements (round_id, user_id, rank) VALUES ($1,$2,$3)",
-        [e.roundId, e.userId, e.rank],
-      );
-    }
-  });
+  // Replaces the round's advancement list wholesale, same as the initial save.
+  await repo.advancements.save(round.id, advanced);
 
   // If the DQ'd user submitted results in the next round, disqualify them
   if (event) {
@@ -333,19 +335,5 @@ export async function reshortlistAdvancedRound(
         realtime.emitLeaderboard(nextRound.id, await repo.results.findByRound(nextRound.id));
       }
     }
-  }
-}
-
-// Legacy wrapper for backward compatibility during transition
-export async function closeAndShortlist(
-  repo: Repository,
-  realtime: Realtime,
-  round: Round,
-): Promise<void> {
-  await closeRound(repo, realtime, round);
-
-  if (!round.advancementCriteria && round.advancementCount && round.advancementCount > 0) {
-    const freshRound = await repo.rounds.findById(round.id);
-    if (freshRound) await shortlistRound(repo, realtime, freshRound);
   }
 }

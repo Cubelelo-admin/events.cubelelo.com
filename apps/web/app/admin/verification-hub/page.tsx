@@ -9,6 +9,7 @@ import {
   assignJudge,
   unassignJudge,
   updateVideoRequired,
+  publishRoundResults,
   type HubOverviewComp,
   type VerificationHubDto,
   type HubEvent,
@@ -79,6 +80,8 @@ export default function VerificationHubPage() {
   const [assigningRoundId, setAssigningRoundId] = useState<string | null>(null);
   const [availableJudges, setAvailableJudges] = useState<AvailableJudgeDto[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
+  /** Outcome of the last publish, so the organiser sees what it did. */
+  const [published, setPublished] = useState<string | null>(null);
 
   const PER_PAGE = 10;
 
@@ -222,6 +225,39 @@ export default function VerificationHubPage() {
     }
   };
 
+  /**
+   * Publishing finalises the round: the standings freeze, the shortlist is
+   * computed from them, and the shortlisted competitors are the ones admitted
+   * to the next round. It cannot be undone, so it asks first.
+   */
+  const handlePublish = async (round: HubRound) => {
+    if (!expandedCompId) return;
+    const ok = window.confirm(
+      `Publish Round ${round.roundNumber}?
+
+` +
+        `The results become final, the shortlist for the next round is computed ` +
+        `from them, and every competitor is emailed. This cannot be undone.`,
+    );
+    if (!ok) return;
+
+    setBusy(`publish-${round.id}`);
+    setError(null);
+    try {
+      const res = await publishRoundResults(round.id);
+      setPublished(
+        `Round ${res.roundNumber} published — ${res.advancedCount} advanced` +
+          (res.competitionCompleted ? ", competition complete" : "") +
+          `. ${res.sentCount}/${res.recipientCount} emails sent.`,
+      );
+      await loadHub(expandedCompId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <div className="mx-auto max-w-[1400px] px-8 py-10">
       <h1 className="mb-1 text-xl font-bold text-zinc-900 dark:text-zinc-100">
@@ -235,6 +271,13 @@ export default function VerificationHubPage() {
         <div className="mb-4 rounded-lg bg-red-100 px-4 py-2 text-sm text-red-700 dark:bg-red-900/30 dark:text-red-300">
           {error}
           <button onClick={() => setError(null)} className="ml-2 font-bold">×</button>
+        </div>
+      )}
+
+      {published && (
+        <div className="mb-4 rounded-lg bg-emerald-100 px-4 py-2 text-sm text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300">
+          {published}
+          <button onClick={() => setPublished(null)} className="ml-2 font-bold">×</button>
         </div>
       )}
 
@@ -362,6 +405,7 @@ export default function VerificationHubPage() {
                     onAssign={handleAssign}
                     onUnassign={handleUnassign}
                     onToggleVideo={handleToggleVideo}
+                    onPublish={handlePublish}
                   />
                 ))}
                 {paginated.length === 0 && (
@@ -455,6 +499,7 @@ function CompetitionRow({
   onAssign,
   onUnassign,
   onToggleVideo,
+  onPublish,
 }: {
   comp: HubOverviewComp;
   isExpanded: boolean;
@@ -468,6 +513,7 @@ function CompetitionRow({
   onAssign: (judgeId: string, roundId: string) => void;
   onUnassign: (roundId: string, judgeId: string) => void;
   onToggleVideo: (roundId: string, current: boolean) => void;
+  onPublish: (round: HubRound) => void;
 }) {
   const { stats } = comp;
   const pct = stats.total > 0 ? Math.round((stats.verified / stats.total) * 100) : 0;
@@ -575,6 +621,7 @@ function CompetitionRow({
                       onAssign={onAssign}
                       onUnassign={onUnassign}
                       onToggleVideo={onToggleVideo}
+                      onPublish={onPublish}
                     />
                   ))
                 )}
@@ -599,6 +646,7 @@ function EventSection({
   onAssign,
   onUnassign,
   onToggleVideo,
+  onPublish,
 }: {
   event: HubEvent;
   compTitle: string;
@@ -609,6 +657,7 @@ function EventSection({
   onAssign: (judgeId: string, roundId: string) => void;
   onUnassign: (roundId: string, judgeId: string) => void;
   onToggleVideo: (roundId: string, current: boolean) => void;
+  onPublish: (round: HubRound) => void;
 }) {
   return (
     <div className="rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
@@ -635,6 +684,7 @@ function EventSection({
             onAssign={(judgeId) => onAssign(judgeId, round.id)}
             onUnassign={(judgeId) => onUnassign(round.id, judgeId)}
             onToggleVideo={() => onToggleVideo(round.id, round.videoRequired)}
+            onPublish={() => onPublish(round)}
           />
         ))}
       </div>
@@ -654,6 +704,7 @@ function RoundRow({
   onAssign,
   onUnassign,
   onToggleVideo,
+  onPublish,
 }: {
   round: HubRound;
   compTitle: string;
@@ -664,10 +715,22 @@ function RoundRow({
   onAssign: (judgeId: string) => void;
   onUnassign: (judgeId: string) => void;
   onToggleVideo: () => void;
+  onPublish: () => void;
 }) {
   const { stats } = round;
   const pctVerified = stats.total > 0 ? Math.round((stats.verified / stats.total) * 100) : 0;
   const assignedJudgeIds = new Set(round.judges.map((j) => j.judgeId));
+
+  // Mirrors the server's guards, so the button is only offered when it works.
+  const publishBlockedReason =
+    round.status !== "closed"
+      ? "Round is still running"
+      : stats.total === 0
+        ? "No results to publish"
+        : stats.flagged > 0
+          ? `${stats.flagged} result${stats.flagged === 1 ? "" : "s"} still flagged`
+          : null;
+  const publishable = publishBlockedReason === null;
 
   return (
     <div className="px-5 py-4">
@@ -785,10 +848,26 @@ function RoundRow({
         </div>
       )}
 
-      {round.resultsPublishedAt && (
+      {round.resultsPublishedAt ? (
         <div className="mt-2 inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M5 13l4 4L19 7" /></svg>
           Published {new Date(round.resultsPublishedAt).toLocaleDateString()}
+        </div>
+      ) : (
+        // Publishing is what advances competitors, so the reason it is
+        // unavailable has to be visible rather than a dead button.
+        <div className="mt-2 flex items-center gap-2">
+          <button
+            type="button"
+            disabled={!publishable || busy === `publish-${round.id}`}
+            onClick={onPublish}
+            className="rounded bg-emerald-700 px-3 py-1 text-xs font-semibold text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {busy === `publish-${round.id}` ? "Publishing…" : "Publish Results"}
+          </button>
+          {!publishable && (
+            <span className="text-[11px] text-zinc-500">{publishBlockedReason}</span>
+          )}
         </div>
       )}
     </div>

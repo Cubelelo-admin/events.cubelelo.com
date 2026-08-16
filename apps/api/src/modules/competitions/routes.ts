@@ -340,6 +340,9 @@ export async function registerCompetitionRoutes(
         roundId: activeRound.id,
         roundNumber: activeRound.roundNumber,
         eventType: targetEvent.eventType,
+        // Once set, these standings are final — the shortlist for the next round
+        // was computed from exactly these numbers.
+        resultsPublishedAt: activeRound.resultsPublishedAt ?? null,
         ranking,
       };
     },
@@ -523,6 +526,9 @@ export async function registerCompetitionRoutes(
           advancementCriteria: r.advancementCriteria ?? null,
           resultCount: results.length,
           participantCount: r.roundNumber === 1 ? r1Participants : advancements.length,
+          // Set once the organiser publishes: the standings are final from here,
+          // and the shortlist has been computed from them.
+          resultsPublishedAt: r.resultsPublishedAt ?? null,
         };
       });
 

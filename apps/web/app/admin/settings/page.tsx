@@ -37,6 +37,8 @@ export default function AdminSettingsPage() {
   const [defaultDuration, setDefaultDuration] = useState(20);
   // Held as the typed string in hours; converted at load and save.
   const [videoDeadlineHours, setVideoDeadlineHours] = useState("24");
+  const [autoPublishLead, setAutoPublishLead] = useState("30");
+  const [warningLead, setWarningLead] = useState("5");
 
   const load = useCallback(() => {
     setLoading(true);
@@ -48,6 +50,8 @@ export default function AdminSettingsPage() {
         setGapMinutes(s.gapBetweenEventsMinutes);
         setDefaultDuration(s.defaultRoundDurationMinutes);
         setVideoDeadlineHours(minutesToHours(s.videoDeadlineMinutes));
+        setAutoPublishLead(String(s.autoPublishLeadMinutes ?? 30));
+        setWarningLead(String(s.publishWarningLeadHours ?? 5));
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
@@ -66,6 +70,8 @@ export default function AdminSettingsPage() {
         gapBetweenEventsMinutes: gapMinutes,
         defaultRoundDurationMinutes: defaultDuration,
         videoDeadlineMinutes: hoursToMinutes(videoDeadlineHours) ?? 1440,
+        autoPublishLeadMinutes: Math.max(0, Number(autoPublishLead) || 0),
+        publishWarningLeadHours: Math.max(0, Number(warningLead) || 0),
       });
       setSettings(updated);
       setSaved(true);
@@ -233,6 +239,53 @@ export default function AdminSettingsPage() {
               <span className="text-xs text-zinc-400">hours</span>
               <span className="text-xs text-zinc-500">
                 after each round closes
+              </span>
+            </div>
+          </div>
+
+          <div className="mt-5">
+            <label className="mb-1 block text-xs text-zinc-500">
+              Auto-publish Results
+            </label>
+            {/* Rounds open on the clock whether or not anyone published, and a
+                round with no shortlist admits nobody. This is the backstop. */}
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min={0}
+                value={autoPublishLead}
+                onChange={(e) => setAutoPublishLead(e.target.value)}
+                className={`w-24 ${INPUT}`}
+              />
+              <span className="text-xs text-zinc-400">minutes</span>
+              <span className="text-xs text-zinc-500">
+                before the next round opens
+              </span>
+            </div>
+            <p className="mt-1 text-[11px] text-zinc-500">
+              {Number(autoPublishLead) > 0
+                ? "Whatever is verified by then is published, and the shortlist is computed from it. Flagged results are not advanced."
+                : "Off — rounds are published by hand only. A round that opens before the previous one is published will admit nobody."}
+            </p>
+          </div>
+
+          <div className="mt-5">
+            <label className="mb-1 block text-xs text-zinc-500">
+              Publish Reminder
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min={0}
+                step="0.5"
+                value={warningLead}
+                onChange={(e) => setWarningLead(e.target.value)}
+                disabled={Number(autoPublishLead) <= 0}
+                className={`w-24 ${INPUT} disabled:opacity-40`}
+              />
+              <span className="text-xs text-zinc-400">hours</span>
+              <span className="text-xs text-zinc-500">
+                before auto-publish, email the organiser and judges
               </span>
             </div>
           </div>

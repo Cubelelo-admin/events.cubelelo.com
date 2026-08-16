@@ -1,6 +1,14 @@
 import { registerWorker } from "./jobQueue";
 import { emailService, bulkEmail, migrationEmail } from "./email";
 
+/**
+ * Background workers.
+ *
+ * A `generate-certificates` worker used to be registered here that logged a line
+ * and did nothing — nothing ever enqueued it, and certificates are generated
+ * synchronously in the admin route. It is gone rather than left implying that
+ * asynchronous generation exists.
+ */
 export function registerJobs(): void {
   registerWorker("bulk-email", async (data) => {
     const { recipients, subject, bodyHtml } = data as {
@@ -28,10 +36,5 @@ export function registerJobs(): void {
       if (ok) sent++;
     }
     console.log(`📧 migration-email: sent ${sent}/${stubs.length}`);
-  });
-
-  registerWorker("generate-certificates", async (data) => {
-    const { competitionId } = data as { competitionId: string };
-    console.log(`📜 certificate generation queued for competition: ${competitionId}`);
   });
 }

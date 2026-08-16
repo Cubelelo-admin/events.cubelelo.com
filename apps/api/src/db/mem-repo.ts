@@ -57,6 +57,8 @@ export function createMemRepo(): Repository {
   const withdrawalRequests = new Map<string, WithdrawalRequest>();
   const rankTiers = new Map<string, RankTier>();
   const promoCodes = new Map<string, PromoCode>();
+  /** One entry per redemption — counting them is the whole point. */
+  const promoCodeUsages: { promoCodeId: string; userId: string }[] = [];
   const bannerStore = new Map<string, Banner>();
   const faqStore = new Map<string, FaqEntry>();
   const contentPageStore = new Map<string, ContentPage>();
@@ -690,8 +692,17 @@ export function createMemRepo(): Repository {
         promoCodes.set(id, { ...existing, usedCount: existing.usedCount + 1 });
         return true;
       },
-      async recordUsage() {},
-      async userUsageCount() { return 0; },
+      // These were stubs returning nothing and zero, which meant per-user promo
+      // limits were silently unenforced in memory and untestable. pg-repo counts
+      // rows in promo_code_usages; this mirrors it.
+      async recordUsage(promoCodeId, userId) {
+        promoCodeUsages.push({ promoCodeId, userId });
+      },
+      async userUsageCount(promoCodeId, userId) {
+        return promoCodeUsages.filter(
+          (u) => u.promoCodeId === promoCodeId && u.userId === userId,
+        ).length;
+      },
     },
 
     banners: {
@@ -816,6 +827,8 @@ export function createMemRepo(): Repository {
         gapBetweenEventsMinutes: 0,
         defaultRoundDurationMinutes: 20,
         videoDeadlineMinutes: 1440,
+        autoPublishLeadMinutes: 30,
+        publishWarningLeadHours: 5,
         flagRuleDefaults: {
           nearRecordPct: 5,
           personalDeviationPct: 30,

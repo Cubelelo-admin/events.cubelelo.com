@@ -1224,8 +1224,11 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
 
     // ── advancements ───────────────────────────────────────────────────────
     advancements: {
+      // Replaces the round's list wholesale, including with nothing: an empty
+      // save clears it. Returning early on empty left the stale list in place
+      // here while mem-repo cleared it, so a re-shortlist that disqualified
+      // everyone left the old advancers still admitted to the next round.
       async save(roundId, entries) {
-        if (entries.length === 0) return;
         const client = await pool.connect();
         try {
           await client.query("BEGIN");
@@ -1773,8 +1776,13 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
         return (rowCount ?? 0) > 0;
       },
       async recordUsage(promoCodeId: string, userId: string) {
+        // No ON CONFLICT: every redemption needs its own row, because
+        // `userUsageCount` counts rows to enforce max_uses_per_user. Swallowing
+        // the conflict pinned that count at 1, so a code allowing more than one
+        // use per person could be redeemed without limit. Migration 047 drops
+        // the unique constraint that made the clause necessary.
         await pool.query(
-          `INSERT INTO promo_code_usages (id, promo_code_id, user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+          `INSERT INTO promo_code_usages (id, promo_code_id, user_id) VALUES ($1, $2, $3)`,
           [randomUUID(), promoCodeId, userId],
         );
       },
@@ -2038,6 +2046,8 @@ export function createPgRepo(pool: InstanceType<typeof import("pg").Pool>): Repo
           gapBetweenEventsMinutes: 0,
           defaultRoundDurationMinutes: 20,
           videoDeadlineMinutes: 1440,
+          autoPublishLeadMinutes: 30,
+          publishWarningLeadHours: 5,
           flagRuleDefaults: {
             nearRecordPct: 5,
             personalDeviationPct: 30,

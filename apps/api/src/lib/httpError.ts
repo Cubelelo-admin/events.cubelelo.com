@@ -1,7 +1,12 @@
-import type { FastifyReply } from "fastify";
-
 /**
- * The API's error contract.
+ * The API's error contract — documentation, not machinery.
+ *
+ * `fail()` and `httpError()` helpers once lived here and were never adopted by a
+ * single route; every handler writes `reply.code(n).send({ error: "..." })` by
+ * hand and follows the convention below. Rewriting ~200 call sites to route
+ * through a helper would be a large mechanical diff with no behaviour change, so
+ * the helpers are gone and the written rules stay — they are the part that has
+ * actually been useful.
  *
  * Every error response is `{ error: "<snake_case_code>" }`, optionally with extra
  * structured fields. The code is a machine-readable identifier the client
@@ -27,27 +32,4 @@ export interface ErrorDetails {
   errors?: string[];
   /** Seconds until the caller may retry, for 429s. */
   retryAfter?: number;
-}
-
-/**
- * Send an error response in the standard shape.
- *
- * Returns the reply so handlers can `return fail(reply, 404, "round_not_found")`.
- */
-export function fail(
-  reply: FastifyReply,
-  status: number,
-  code: string,
-  details?: ErrorDetails,
-): FastifyReply {
-  return reply.code(status).send({ error: code, ...details });
-}
-
-/**
- * Throw a coded error for the central handler to render — for use in helpers
- * that have no `reply` in scope. The message is the error code, which
- * `setErrorHandler` emits verbatim for 4xx.
- */
-export function httpError(status: number, code: string): Error & { statusCode: number } {
-  return Object.assign(new Error(code), { statusCode: status });
 }

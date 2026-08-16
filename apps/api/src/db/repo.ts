@@ -181,7 +181,11 @@ export interface Repository {
   };
 
   advancements: {
-    /** Store shortlisted participants after a round closes. */
+    /**
+     * Replace the round's shortlist wholesale. An empty list clears it — both
+     * backends must behave the same way here, because a re-shortlist that
+     * disqualifies everyone depends on it.
+     */
     save(roundId: string, entries: RoundAdvancement[]): Promise<void>;
     /** Check if a user was shortlisted for a given round (used to gate round 2+ entry). */
     isAdvanced(roundId: string, userId: string): Promise<boolean>;

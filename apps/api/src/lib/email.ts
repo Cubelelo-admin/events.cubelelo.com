@@ -168,6 +168,52 @@ export function passwordResetEmail(name: string, token: string): { subject: stri
   };
 }
 
+/**
+ * Reminder that a round's results will publish themselves shortly.
+ *
+ * Rounds open on the clock whether or not anyone published, and a round with no
+ * shortlist admits nobody — so results publish automatically before the next
+ * round starts. This gives the organiser and the round's judges a stated
+ * deadline to finish verification, rather than discovering it after the fact.
+ */
+export function publishReminderEmail(
+  name: string,
+  competitionTitle: string,
+  roundNumber: number,
+  autoPublishAt: Date,
+): { subject: string; html: string } {
+  const time = autoPublishAt.toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  });
+  const day = autoPublishAt.toLocaleDateString("en-US", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+  });
+
+  return {
+    subject: `Verify Round ${roundNumber} before ${time} — ${competitionTitle}`,
+    html: `
+      <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+        <h2>Hi ${name},</h2>
+        <p>
+          Round ${roundNumber} of <strong>${competitionTitle}</strong> has not been
+          published yet.
+        </p>
+        <p>
+          Results will publish automatically at <strong>${time}</strong> on ${day},
+          before the next round opens. Whatever is verified by then is what gets
+          published, and the shortlist for the next round is computed from it —
+          results still flagged at that point will not advance.
+        </p>
+        <p>Publish it yourself from the Verification Hub any time before then.</p>
+      </div>
+    `,
+  };
+}
+
 export function roundNotificationEmail(
   name: string,
   competitionTitle: string,

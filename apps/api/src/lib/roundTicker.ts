@@ -2,10 +2,26 @@ import type { RoundStatus } from "@cubers/types";
 import type { Repository } from "../db/repo";
 import type { Realtime } from "../sockets/realtime";
 import { effectiveRoundStatus } from "./statusUtils";
-import { closeRound, shortlistRound } from "./roundLifecycle";
+import { closeRound } from "./roundLifecycle";
+import { publishRound, autoPublishAt } from "./roundPublish";
 import { scheduleRoundJobs } from "./roundScheduler";
 
 const TICK_INTERVAL_MS = 60_000;
+
+/**
+ * Recovery for round transitions, not the primary mechanism.
+ *
+ * Opening and closing are driven by delayed jobs (`roundScheduler`). This poll
+ * exists so a round still opens and closes if a job is lost — a Redis restart,
+ * a deploy mid-delay — by re-deriving status from the clock and reconciling.
+ * The two are deliberately redundant; the jobs also fire side effects a derived
+ * status cannot, such as generating scrambles.
+ *
+ * It does not shortlist on its own. Advancement happens when a round is
+ * published — by the verifier, or by the deadline before the next round opens.
+ * The one thing this recovers is a *missed* deadline, which is the same
+ * lost-job case it recovers open and close for.
+ */
 
 export function startRoundTicker(repo: Repository, realtime: Realtime): () => void {
   let running = false;
@@ -34,7 +50,7 @@ export function startRoundTicker(repo: Repository, realtime: Realtime): () => vo
         }
       }
 
-      await checkVerificationComplete(repo, realtime, rounds);
+      await recoverMissedAutoPublish(repo, realtime, rounds);
     } catch (err) {
       console.error("Round ticker error:", err);
     } finally {
@@ -47,20 +63,36 @@ export function startRoundTicker(repo: Repository, realtime: Realtime): () => vo
   return () => clearInterval(handle);
 }
 
-async function checkVerificationComplete(
+
+/**
+ * Publish a round whose deadline passed while nothing was listening.
+ *
+ * The deadline is a delayed job, and a Redis restart or a deploy across the
+ * moment would otherwise mean the round never publishes and the next one opens
+ * admitting nobody. Late is better than never.
+ */
+async function recoverMissedAutoPublish(
   repo: Repository,
   realtime: Realtime,
   rounds: Awaited<ReturnType<typeof repo.rounds.findActive>>,
 ): Promise<void> {
+  const now = Date.now();
+
   for (const round of rounds) {
-    if (round.status !== "closed") continue;
-    if (!round.advancementCriteria && !round.advancementCount) continue;
+    if (round.resultsPublishedAt) continue;
+    if (effectiveRoundStatus(round) !== "closed") continue;
 
-    const results = await repo.results.findByRound(round.id);
-    if (results.length === 0) continue;
-    if (results.some((r) => r.flagStatus === "flagged")) continue;
+    const at = await autoPublishAt(repo, round);
+    if (!at || at.getTime() > now) continue;
 
-    await shortlistRound(repo, realtime, round);
-    console.log(`⏱ Round ${round.id} auto-shortlisted (all results verified)`);
+    const outcome = await publishRound(repo, realtime, round, {
+      actorId: "system:auto-publish",
+      auto: true,
+    });
+    if (outcome.ok) {
+      console.log(
+        `⏱ Round ${round.id} auto-published on recovery — ${outcome.result.advancedCount} advanced`,
+      );
+    }
   }
 }

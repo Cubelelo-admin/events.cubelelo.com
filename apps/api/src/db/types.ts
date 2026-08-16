@@ -414,6 +414,20 @@ export interface SystemSettings {
   gapBetweenEventsMinutes: number;
   defaultRoundDurationMinutes: number;
   videoDeadlineMinutes: number;
+  /**
+   * Publish a round's results automatically this long before the next round of
+   * the same event opens, so the shortlist exists before competitors arrive.
+   *
+   * Rounds open on the clock regardless of whether anyone published, and a round
+   * with no advancement list admits nobody. `0` turns the deadline off and leaves
+   * publishing entirely manual.
+   */
+  autoPublishLeadMinutes: number;
+  /**
+   * Warn the organiser and the round's judges this long before that deadline,
+   * naming the exact time results will be published if verification is not done.
+   */
+  publishWarningLeadHours: number;
   /** Global flag-rule thresholds for verification. */
   flagRuleDefaults: FlagRuleDefaults;
   /** Reference record times per event type (e.g. "333": { singleMs: 3470 }). */

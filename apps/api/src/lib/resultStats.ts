@@ -3,7 +3,7 @@ import { computeStats, effectiveTime } from "@cubers/timer-core";
 import type { FlagStatus, Solve, SolvePenalty, WcaFormat } from "@cubers/types";
 import { FORMAT_AVERAGE_STAT } from "@cubers/types";
 import { formatForRound } from "./roundFormat";
-import { clearLeaderboardCache } from "./leaderboardCache";
+import { setLeaderboardCache, type CachedLeaderboardEntry } from "./leaderboardCache";
 import type { Repository } from "../db/repo";
 import type { Result } from "../db/types";
 import type { Realtime } from "../sockets/realtime";
@@ -59,6 +59,62 @@ export function isTied(a: RankableResult, b: RankableResult, format: WcaFormat):
  * sorted *above* rank 1 in every consumer that orders ascending, which put
  * disqualified entries at the top of the leaderboard.
  */
+/**
+ * Publish a round's standings: cache them and broadcast them.
+ *
+ * There used to be two ways this happened. Submitting a result built an enriched
+ * board — competitor names joined in — cached it and emitted it. Every judge
+ * verdict, appeal and re-shortlist went through `applyResultOverride`, which
+ * emitted the raw results with no names and *cleared* the cache instead of
+ * refilling it. Since the client replaces the board wholesale, a single +2 wiped
+ * every name off the live leaderboard until the next refetch.
+ *
+ * One shape, one cache policy, both paths.
+ */
+export async function publishLeaderboard(
+  repo: Repository,
+  realtime: Realtime,
+  roundId: string,
+  board: Result[],
+): Promise<CachedLeaderboardEntry[]> {
+  const enriched = await buildLeaderboard(repo, board);
+  await setLeaderboardCache(roundId, enriched);
+  realtime.emitLeaderboard(roundId, enriched);
+  return enriched;
+}
+
+/**
+ * The board in rank order with competitor names joined in.
+ *
+ * Separate from publishing so a plain read can build the same shape without
+ * broadcasting to everyone watching the round. This was written out by hand in
+ * three places, each free to drift from the others.
+ */
+export async function buildLeaderboard(
+  repo: Repository,
+  board: Result[],
+): Promise<CachedLeaderboardEntry[]> {
+  const ordered = [...board].sort(
+    (a, b) => (a.rank ?? Number.MAX_SAFE_INTEGER) - (b.rank ?? Number.MAX_SAFE_INTEGER),
+  );
+
+  const usersMap = await repo.users.findByIds([...new Set(ordered.map((r) => r.userId))]);
+  return ordered.map((r) => {
+    const u = usersMap.get(r.userId);
+    return {
+      id: r.id,
+      userId: r.userId,
+      userName: u?.name ?? r.userId,
+      userClId: u?.clId ?? r.userId,
+      ao5Ms: r.ao5Ms,
+      meanMs: r.meanMs,
+      bestSingleMs: r.bestSingleMs,
+      rank: r.rank,
+      flagStatus: r.flagStatus,
+    };
+  });
+}
+
 export async function recomputeRanks(repo: Repository, roundId: string, prefetched?: Result[]): Promise<Result[]> {
   const all = prefetched ?? await repo.results.findByRound(roundId);
   const [round, event] = await Promise.all([
@@ -206,13 +262,16 @@ export async function recomputePersonalBest(
   eventType: string,
 ): Promise<void> {
   const all = await repo.results.findByUser(userId);
-  const eventByRound = new Map<string, string | undefined>();
-  for (const roundId of new Set(all.map((r) => r.roundId))) {
-    const event = await repo.competitionEvents.findByRound(roundId);
-    eventByRound.set(roundId, event?.eventType);
-  }
+
+  // One batched lookup, not one query per round. This runs on every result
+  // submission and every judge verdict, and a competitor with results in twenty
+  // rounds was costing twenty round-trips to resolve their event types.
+  const eventByRound = await repo.competitionEvents.findByRounds([
+    ...new Set(all.map((r) => r.roundId)),
+  ]);
+
   const eligible = all.filter(
-    (r) => eventByRound.get(r.roundId) === eventType && r.flagStatus !== "disqualified",
+    (r) => eventByRound.get(r.roundId)?.eventType === eventType && r.flagStatus !== "disqualified",
   );
 
   const min = (pick: (r: Result) => number | null): number | null => {
@@ -255,15 +314,11 @@ export async function applyResultOverride(
     judgeOverrides: overrides,
   });
   const board = await recomputeRanks(repo, result.roundId);
-  board.sort(
-    (a, b) => (a.rank ?? Number.MAX_SAFE_INTEGER) - (b.rank ?? Number.MAX_SAFE_INTEGER),
-  );
-
-  // Standings changed outside the submit path, so the cached board is stale.
-  await clearLeaderboardCache(result.roundId);
 
   const event = await repo.competitionEvents.findByRound(result.roundId);
   if (event) await recomputePersonalBest(repo, result.userId, event.eventType);
 
-  realtime.emitLeaderboard(result.roundId, board);
+  // Replaces the cached board rather than dropping it, so the next reader does
+  // not fall back to a rebuild — and carries the names the client needs.
+  await publishLeaderboard(repo, realtime, result.roundId, board);
 }

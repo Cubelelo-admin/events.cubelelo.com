@@ -343,7 +343,9 @@ function SelectedRoundView({
             }`}
           >
             {t === "live"
-              ? "Live Rankings"
+              ? round.resultsPublishedAt
+                ? "Final Standings"
+                : "Live Rankings"
               : t === "verified"
                 ? "Verified Results"
                 : "Participants"}
@@ -353,7 +355,13 @@ function SelectedRoundView({
 
       {/* Tab content */}
       <div className="p-5">
-        {roundTab === "live" && <LiveRankingsPanel roundId={round.id} roundStatus={liveStatus} />}
+        {roundTab === "live" && (
+          <LiveRankingsPanel
+            roundId={round.id}
+            roundStatus={liveStatus}
+            publishedAt={round.resultsPublishedAt}
+          />
+        )}
         {roundTab === "verified" && <VerifiedResultsPanel roundId={round.id} />}
         {roundTab === "participants" && (
           <RoundParticipantsPanel roundId={round.id} roundStatus={liveStatus} />

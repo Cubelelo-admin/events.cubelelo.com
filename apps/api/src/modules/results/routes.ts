@@ -9,7 +9,12 @@ import { requireAuth } from "../../auth/plugin";
 import { effectiveRoundStatus } from "../../lib/statusUtils";
 import { getScrambleFetchTime } from "../../lib/scrambleTiming";
 import { submitLimiter } from "../../lib/rateLimiter";
-import { recomputeRanks, recomputePersonalBest } from "../../lib/resultStats";
+import {
+  recomputeRanks,
+  recomputePersonalBest,
+  publishLeaderboard,
+  buildLeaderboard,
+} from "../../lib/resultStats";
 import { ANTICHEAT_THRESHOLDS, DEFAULT_ANTICHEAT_THRESHOLD } from "../../lib/eventConfig";
 import {
   attemptsForRound,
@@ -18,7 +23,7 @@ import {
   timeLimitForRound,
 } from "../../lib/roundFormat";
 import { computeFlags } from "../../lib/flagEngine";
-import { setLeaderboardCache, getLeaderboardCache, type CachedLeaderboardEntry } from "../../lib/leaderboardCache";
+import { setLeaderboardCache, getLeaderboardCache } from "../../lib/leaderboardCache";
 
 const PENALTIES: SolvePenalty[] = ["none", "plus2", "dnf"];
 
@@ -229,22 +234,7 @@ export async function registerResultRoutes(
       }
 
       const board = await recomputeRanks(repo, round.id);
-      board.sort(
-        (a, b) =>
-          (a.rank ?? Number.MAX_SAFE_INTEGER) - (b.rank ?? Number.MAX_SAFE_INTEGER),
-      );
-
-      const userIds = [...new Set(board.map((r) => r.userId))];
-      const usersMap = await repo.users.findByIds(userIds);
-      const enriched: CachedLeaderboardEntry[] = board.map((r) => {
-        const u = usersMap.get(r.userId);
-        return {
-          id: r.id, userId: r.userId, userName: u?.name ?? r.userId, userClId: u?.clId ?? r.userId,
-          ao5Ms: r.ao5Ms, meanMs: r.meanMs, bestSingleMs: r.bestSingleMs, rank: r.rank, flagStatus: r.flagStatus,
-        };
-      });
-      await setLeaderboardCache(round.id, enriched);
-      realtime.emitLeaderboard(round.id, enriched);
+      await publishLeaderboard(repo, realtime, round.id, board);
 
       // Compute personal bests after result submission
       if (event) {
@@ -303,20 +293,10 @@ export async function registerResultRoutes(
       const cached = await getLeaderboardCache(req.params.id);
       if (cached) return cached;
 
-      const board = await repo.results.findByRound(req.params.id);
-      board.sort(
-        (a, b) =>
-          (a.rank ?? Number.MAX_SAFE_INTEGER) - (b.rank ?? Number.MAX_SAFE_INTEGER),
+      const enriched = await buildLeaderboard(
+        repo,
+        await repo.results.findByRound(req.params.id),
       );
-      const userIds = [...new Set(board.map((r) => r.userId))];
-      const usersMap = await repo.users.findByIds(userIds);
-      const enriched: CachedLeaderboardEntry[] = board.map((r) => {
-        const u = usersMap.get(r.userId);
-        return {
-          id: r.id, userId: r.userId, userName: u?.name ?? r.userId, userClId: u?.clId ?? r.userId,
-          ao5Ms: r.ao5Ms, meanMs: r.meanMs, bestSingleMs: r.bestSingleMs, rank: r.rank, flagStatus: r.flagStatus,
-        };
-      });
       await setLeaderboardCache(req.params.id, enriched);
       return enriched;
     },

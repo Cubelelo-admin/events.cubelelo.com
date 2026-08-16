@@ -20,6 +20,10 @@ const FRIENDLY_ERRORS: Record<string, string> = {
     "This event already has results, so it can't be deleted. Leave it archived instead.",
   // Image upload
   banner_required: "A desktop banner is required before this competition can be published.",
+  // Publishing a round
+  round_not_closed: "This round is still running — results can only be published once it closes.",
+  results_not_verified: "Some results are still flagged. Finish verification before publishing.",
+  already_published: "These results have already been published.",
   // Leaving a competition
   registration_not_active: "This registration is no longer active.",
   registration_has_results:
@@ -392,6 +396,8 @@ export interface LiveRankingEntry {
 }
 
 export function fetchLiveRanking(compId: string, event?: string): Promise<{
+  /** Set once the round's results are published and final. */
+  resultsPublishedAt: string | null;
   roundId: string | null;
   roundNumber: number | null;
   eventType?: string;
@@ -461,6 +467,8 @@ export interface EventRoundInfo {
   advancementCriteria: AdvancementCriteria | null;
   resultCount: number;
   participantCount: number;
+  /** Set once published — the standings are final and the shortlist is decided. */
+  resultsPublishedAt: string | null;
 }
 
 export interface EventUserRound {
@@ -1489,15 +1497,26 @@ export function updateResultVideo(
   return sendJson("PATCH", `/api/v1/results/${resultId}/video`, { videoUrl });
 }
 
-export async function publishRoundResults(
-  roundId: string,
-): Promise<{ sent: boolean; recipientCount: number; sentCount: number; eventCompleted: boolean; competitionCompleted: boolean }> {
-  const res = await fetch(`${BASE_URL}/api/v1/admin/rounds/${roundId}/publish`, {
-    method: "POST",
-    headers: authHeaders(),
-  });
-  if (!res.ok) throw new Error(`Publish failed: ${res.status}`);
-  return res.json();
+export interface PublishRoundResult {
+  roundNumber: number;
+  eventType: string;
+  recipientCount: number;
+  sentCount: number;
+  sent: boolean;
+  /** How many competitors the shortlist advanced to the next round. */
+  advancedCount: number;
+  advanced: { userId: string; rank: number; name: string; clId: string }[];
+  competitionCompleted: boolean;
+}
+
+/**
+ * Finalise a round: freeze the standings, shortlist from them, notify everyone.
+ *
+ * This is the only thing that advances competitors — verification no longer
+ * does it on its own.
+ */
+export function publishRoundResults(roundId: string): Promise<PublishRoundResult> {
+  return sendJson("POST", `/api/v1/admin/rounds/${roundId}/publish`);
 }
 
 // ── Avatar upload ───────────────────────────────────────────────────────
@@ -2062,6 +2081,10 @@ export interface SystemSettingsDto {
   gapBetweenEventsMinutes: number;
   defaultRoundDurationMinutes: number;
   videoDeadlineMinutes: number;
+  /** Publish this long before the next round opens. 0 disables auto-publish. */
+  autoPublishLeadMinutes: number;
+  /** Warn the organiser and judges this long before that deadline. */
+  publishWarningLeadHours: number;
 }
 
 export interface SchedulingDefaults {

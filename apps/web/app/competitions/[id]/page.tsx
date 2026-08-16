@@ -1372,6 +1372,8 @@ function RankingsTab({ comp, showResultsLink, userId }: { comp: CompetitionDetai
   const [ranking, setRanking] = useState<LiveRankingEntry[]>([]);
   const [roundInfo, setRoundInfo] = useState<{ roundNumber: number | null }>({ roundNumber: null });
   const [activeRoundId, setActiveRoundId] = useState<string | null>(null);
+  /** Set once the organiser publishes: the standings are final from then on. */
+  const [publishedAt, setPublishedAt] = useState<string | null>(null);
   const [visible, setVisible] = useState(false);
   const sectionRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(true);
@@ -1403,6 +1405,7 @@ function RankingsTab({ comp, showResultsLink, userId }: { comp: CompetitionDetai
         setRanking(d.ranking);
         setRoundInfo({ roundNumber: d.roundNumber });
         setActiveRoundId(d.roundId);
+        setPublishedAt(d.resultsPublishedAt);
       })
       .catch(() => setRanking([]))
       .finally(() => setLoading(false));
@@ -1459,14 +1462,25 @@ function RankingsTab({ comp, showResultsLink, userId }: { comp: CompetitionDetai
           onRoundChange={setSelectedRound}
         />
         <div className="ml-auto flex items-center gap-2">
-          {activeRoundId && visible && (
-            <span className="flex items-center gap-1.5 text-xs font-medium text-emerald-500">
-              <span className="relative flex h-2 w-2">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-                <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
-              </span>
-              LIVE
+          {/* Published results are frozen — the shortlist was taken from these
+              exact numbers — so they stop being presented as a live feed. */}
+          {publishedAt ? (
+            <span
+              className="rounded-full bg-emerald-100 px-2.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400"
+              title={`Published ${new Date(publishedAt).toLocaleString()}`}
+            >
+              Final Standings
             </span>
+          ) : (
+            activeRoundId && visible && (
+              <span className="flex items-center gap-1.5 text-xs font-medium text-emerald-500">
+                <span className="relative flex h-2 w-2">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                  <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+                </span>
+                LIVE
+              </span>
+            )
           )}
           {showResultsLink && (
             <Link

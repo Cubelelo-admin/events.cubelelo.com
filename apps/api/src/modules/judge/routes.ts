@@ -1,15 +1,11 @@
-import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import type { FlagStatus, SolvePenalty } from "@cubers/types";
 import type { Repository } from "../../db/repo";
-import type { AuditLogEntry } from "../../db/types";
 import { requireRole } from "../../auth/plugin";
-import { shortlistRound, reshortlistAdvancedRound } from "../../lib/roundLifecycle";
-import { applyResultOverride, parseSolvePenalties, requiresAttemptPenalties } from "../../lib/resultStats";
+import { verifyResult, FLAG_ACTIONS } from "../../lib/resultVerification";
 import { computePriority } from "../../lib/flagEngine";
 import type { Realtime } from "../../sockets/realtime";
 
-const FLAG_ACTIONS: FlagStatus[] = ["verified", "plus2", "dnf", "disqualified"];
 
 export async function registerJudgeRoutes(
   app: FastifyInstance,
@@ -124,9 +120,9 @@ export async function registerJudgeRoutes(
     const result = await repo.results.findById(req.params.id);
     if (!result) return reply.code(404).send({ error: "result_not_found" });
 
+    // The judge route's own door: judges are confined to the rounds they are
+    // assigned to. Everything after this is shared with the admin route.
     const judge = await repo.users.findById(judgeId);
-
-    // Judges can only verify results in their assigned rounds
     if (judge?.role === "judge") {
       const assignments = await repo.judgeAssignments.findByJudge(judgeId);
       const isAssigned = assignments.some((a) => a.roundId === result.roundId);
@@ -134,73 +130,20 @@ export async function registerJudgeRoutes(
         return reply.code(403).send({ error: "not_assigned_to_round" });
     }
 
-    const action = req.body?.action;
-    if (!action || !FLAG_ACTIONS.includes(action))
-      return reply.code(400).send({ error: "invalid_action" });
-
-    if (["plus2", "dnf", "disqualified"].includes(action) && !req.body?.reason)
-      return reply.code(400).send({ error: "reason_required" });
-
-    const solvePenalties = parseSolvePenalties(req.body?.solvePenalties, result.solves.length);
-    if (solvePenalties === "invalid")
-      return reply.code(400).send({ error: "invalid_solve_penalties" });
-    // A +2 or DNF belongs to a specific attempt; refuse to guess which.
-    if (requiresAttemptPenalties(action) && !solvePenalties)
-      return reply.code(400).send({ error: "attempt_penalties_required" });
-
-    const now = new Date().toISOString();
-
-    await repo.results.update(result.id, {
-      flagStatus: action,
-      verifiedBy: judgeId,
-      verifiedAt: now,
-      verificationComment: req.body?.comment || undefined,
-    });
-
-    // §10 — Audit log with old/new values
-    const entry: AuditLogEntry = {
-      id: randomUUID(),
-      adminId: judgeId,
-      action: `judge_result_${action}`,
-      target: result.id,
+    const outcome = await verifyResult(repo, realtime, {
+      result,
+      action: req.body?.action,
       reason: req.body?.reason,
-      oldValue: JSON.stringify({
-        flagStatus: result.flagStatus,
-        flagReasons: result.flagReasons,
-        judgeOverrides: result.judgeOverrides ?? null,
-      }),
-      newValue: JSON.stringify({
-        flagStatus: action,
-        comment: req.body?.comment || null,
-        solvePenalties: solvePenalties ?? null,
-      }),
-      createdAt: now,
-    };
-    await repo.auditLog.create(entry);
+      comment: req.body?.comment,
+      solvePenalties: req.body?.solvePenalties,
+      actorId: judgeId,
+      auditPrefix: "judge_result",
+    });
+    if (!outcome.ok) return reply.code(outcome.status).send({ error: outcome.error });
 
-    // Re-derive stats under the action, re-rank, rebuild the user's PB,
-    // and broadcast the corrected leaderboard (HIGH-009).
-    await applyResultOverride(repo, realtime, result, action, solvePenalties);
-
-    // Auto-shortlist if no more flagged results
-    const round = await repo.rounds.findById(result.roundId);
-    if (round && round.status === "closed" && (round.advancementCriteria || round.advancementCount)) {
-      const allResults = await repo.results.findByRound(round.id);
-      const hasFlagged = allResults.some((r) => r.flagStatus === "flagged");
-      if (!hasFlagged) {
-        await shortlistRound(repo, realtime, round);
-      }
-    }
-
-    // If the round is already advanced and a result was DQ'd, re-derive the advancement list
-    if (round && round.status === "advanced" && action === "disqualified") {
-      await reshortlistAdvancedRound(repo, realtime, round, result.userId);
-    }
-
-    return { id: result.id, flagStatus: action };
+    return { id: result.id, flagStatus: outcome.flagStatus };
   });
 
-  // Scrambles for an assigned round (judges need these for verification)
   app.get<{ Params: { roundId: string } }>(
     "/api/v1/judge/rounds/:roundId/scrambles",
     judgeOrAbove,

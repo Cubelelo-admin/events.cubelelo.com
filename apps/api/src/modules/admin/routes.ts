@@ -20,7 +20,13 @@ import {
   isPaidCompetition,
   hasResultsInCompetition,
 } from "../../lib/registrationStatus";
-import { shortlistRound, reshortlistAdvancedRound, ensureScramblesGenerated } from "../../lib/roundLifecycle";
+import { publishRound } from "../../lib/roundPublish";
+import {
+  shortlistRound,
+  reshortlistAdvancedRound,
+  ensureScramblesGenerated,
+  checkCompetitionCompletion,
+} from "../../lib/roundLifecycle";
 import { validateCompetitionSchedule, validateScheduleFields, validateForPublish } from "../../lib/scheduleValidation";
 import {
   applyCompetitionFields,
@@ -36,6 +42,7 @@ import {
 import { collectCertificateData, generateCertificatePDF } from "../../lib/certificate";
 import { emailService, sendBulk, roundNotificationEmail, bulkEmail, migrationEmail, staffWelcomeEmail } from "../../lib/email";
 import { applyResultOverride, parseSolvePenalties, requiresAttemptPenalties } from "../../lib/resultStats";
+import { verifyResult, FLAG_ACTIONS } from "../../lib/resultVerification";
 import { scheduleRoundJobs } from "../../lib/roundScheduler";
 import { transferUserData } from "../../lib/accountTransfer";
 import { ZipArchive } from "archiver";
@@ -50,7 +57,6 @@ const COMP_STATUSES: CompStatus[] = [
   "draft", "published", "registration_open", "registration_closed",
   "cancelled", "live", "results_pending", "completed",
 ];
-const FLAG_ACTIONS: FlagStatus[] = ["verified", "plus2", "dnf", "disqualified"];
 
 export async function registerAdminRoutes(
   app: FastifyInstance,
@@ -843,78 +849,24 @@ export async function registerAdminRoutes(
       solvePenalties?: (SolvePenalty | null)[];
     };
   }>("/api/v1/admin/results/:id/verify", adminOrMod, async (req, reply) => {
+    // Authorization is the admin route's own — everything after it is shared
+    // with the judge route, which lets people in a different way.
     if (!(await ownedCompByResult(req, reply, req.params.id))) return;
     const result = await repo.results.findById(req.params.id);
     if (!result) return reply.code(404).send({ error: "result_not_found" });
 
-    const action = req.body?.action;
-    if (!action || !FLAG_ACTIONS.includes(action))
-      return reply.code(400).send({ error: "invalid_action" });
-
-    // Require a reason for destructive actions
-    if (["plus2", "dnf", "disqualified"].includes(action) && !req.body?.reason) {
-      return reply.code(400).send({ error: "reason_required" });
-    }
-
-    const solvePenalties = parseSolvePenalties(req.body?.solvePenalties, result.solves.length);
-    if (solvePenalties === "invalid")
-      return reply.code(400).send({ error: "invalid_solve_penalties" });
-    // A +2 or DNF belongs to a specific attempt; refuse to guess which.
-    if (requiresAttemptPenalties(action) && !solvePenalties)
-      return reply.code(400).send({ error: "attempt_penalties_required" });
-
-    const admin = await repo.users.findById(req.authClaims!.sub);
-    const now = new Date().toISOString();
-
-    await repo.results.update(result.id, {
-      flagStatus: action,
-      verifiedBy: admin?.id ?? req.authClaims!.sub,
-      verifiedAt: now,
-      verificationComment: req.body?.comment || undefined,
-    });
-
-    // §10 — Audit log with old/new values
-    const entry: AuditLogEntry = {
-      id: randomUUID(),
-      adminId: admin?.id ?? req.authClaims!.sub,
-      action: `result_${action}`,
-      target: result.id,
+    const outcome = await verifyResult(repo, realtime, {
+      result,
+      action: req.body?.action,
       reason: req.body?.reason,
-      oldValue: JSON.stringify({
-        flagStatus: result.flagStatus,
-        flagReasons: result.flagReasons,
-        judgeOverrides: result.judgeOverrides ?? null,
-      }),
-      newValue: JSON.stringify({
-        flagStatus: action,
-        comment: req.body?.comment || null,
-        solvePenalties: solvePenalties ?? null,
-      }),
-      createdAt: now,
-    };
-    await repo.auditLog.create(entry);
+      comment: req.body?.comment,
+      solvePenalties: req.body?.solvePenalties,
+      actorId: req.authClaims!.sub,
+      auditPrefix: "result",
+    });
+    if (!outcome.ok) return reply.code(outcome.status).send({ error: outcome.error });
 
-    // Re-derive stats under the action, re-rank, rebuild the user's PB,
-    // and broadcast the corrected leaderboard. Runs for every action so a
-    // "verified" verdict also restores stats from a previous penalty.
-    await applyResultOverride(repo, realtime, result, action, solvePenalties);
-
-    // Check if shortlisting should trigger (no more flagged results in this round)
-    const round = await repo.rounds.findById(result.roundId);
-    if (round && round.status === "closed" && (round.advancementCriteria || round.advancementCount)) {
-      const allResults = await repo.results.findByRound(round.id);
-      const hasFlagged = allResults.some((r) => r.flagStatus === "flagged");
-      if (!hasFlagged) {
-        await shortlistRound(repo, realtime, round);
-      }
-    }
-
-    // If the round is already advanced and a result was DQ'd, re-derive the advancement list
-    if (round && round.status === "advanced" && action === "disqualified") {
-      await reshortlistAdvancedRound(repo, realtime, round, result.userId);
-    }
-
-    return { id: result.id, flagStatus: action };
+    return { id: result.id, flagStatus: outcome.flagStatus };
   });
 
   // §8 — Bulk verify multiple results at once
@@ -941,35 +893,32 @@ export async function registerAdminRoutes(
     if (!(await ownedCompByResult(req, reply, firstResultId))) return;
 
     const adminId = req.authClaims!.sub;
-    const now = new Date().toISOString();
     const previousStates: { id: string; flagStatus: string }[] = [];
 
+    // Through the same function the single-result routes use. Bulk used to be a
+    // fourth copy that skipped two of its guards: it never required the attempt
+    // a +2 or DNF belongs to — so `overridesForAction` returned nothing and the
+    // times were never actually penalised, leaving a result marked +2 that still
+    // ranked as clean — and it never re-derived the shortlist after a
+    // disqualification on an already-advanced round.
     for (const rid of resultIds) {
       const result = await repo.results.findById(rid);
       if (!result) continue;
 
+      // Captured before the verdict, so undo has something to restore.
       previousStates.push({ id: result.id, flagStatus: result.flagStatus });
 
-      await repo.results.update(result.id, {
-        flagStatus: action,
-        verifiedBy: adminId,
-        verifiedAt: now,
-        verificationComment: comment || undefined,
+      const outcome = await verifyResult(repo, realtime, {
+        result,
+        action,
+        reason,
+        comment,
+        actorId: adminId,
+        auditPrefix: "bulk_result",
       });
-
-      // §10 — Audit with old/new
-      await repo.auditLog.create({
-        id: randomUUID(),
-        adminId,
-        action: `bulk_result_${action}`,
-        target: result.id,
-        reason: reason || undefined,
-        oldValue: JSON.stringify({ flagStatus: result.flagStatus }),
-        newValue: JSON.stringify({ flagStatus: action }),
-        createdAt: now,
-      });
-
-      await applyResultOverride(repo, realtime, result, action);
+      if (!outcome.ok) {
+        return reply.code(outcome.status).send({ error: outcome.error });
+      }
     }
 
     return { updated: previousStates.length, previousStates };
@@ -2668,6 +2617,29 @@ export async function registerAdminRoutes(
     });
     if (!updated) return reply.code(404).send({ error: "appeal_not_found" });
 
+    // Accepting an appeal has to actually change the result.
+    //
+    // This used to update the appeal row and stop there, so the competitor was
+    // told "accepted" while their result stayed flagged or disqualified, and an
+    // admin had to remember to go and fix it by hand in the verification
+    // workspace. `applyResultOverride` is the same call the judge verify route
+    // makes: it clears the judge's per-attempt overrides, recomputes the stats
+    // from the competitor's own solves, re-ranks the round and broadcasts.
+    if (action === "accepted") {
+      const result = await repo.results.findById(appeal.resultId);
+      if (result) {
+        // Order matters: `applyResultOverride` re-ranks the round and skips
+        // disqualified results, so the verdict has to land first or the
+        // restored result would come back with no rank.
+        await repo.results.update(result.id, {
+          flagStatus: "verified",
+          verifiedBy: req.authClaims!.sub,
+          verifiedAt: new Date().toISOString(),
+        });
+        await applyResultOverride(repo, realtime, { ...result, flagStatus: "verified" }, "verified");
+      }
+    }
+
     const admin = await repo.users.findById(req.authClaims!.sub);
     await repo.auditLog.create({
       id: randomUUID(),
@@ -2887,67 +2859,15 @@ export async function registerAdminRoutes(
       if (!(await ownedCompByRound(req, reply, req.params.id))) return;
       const round = await repo.rounds.findById(req.params.id);
       if (!round) return reply.code(404).send({ error: "round_not_found" });
-      if (round.resultsPublishedAt) return reply.code(409).send({ error: "already_published" });
 
-      const event = await repo.competitionEvents.findById(round.competitionEventId);
-      if (!event) return reply.code(404).send({ error: "event_not_found" });
-
-      const comp = await repo.competitions.findById(event.competitionId);
-      const regs = await repo.registrations.findByCompetition(event.competitionId);
-      const userIds = [...new Set(regs.map((r) => r.userId))];
-      const usersMap = await repo.users.findByIds(userIds);
-      const recipients: { email: string; name: string }[] = [];
-      for (const reg of regs) {
-        const user = usersMap.get(reg.userId);
-        if (user?.email) recipients.push({ email: user.email, name: user.name });
-      }
-
-      const compTitle = comp?.title ?? "Competition";
-      const messages = recipients.map((r) => {
-        const msg = roundNotificationEmail(r.name, compTitle, round.roundNumber, "results_published");
-        return { to: r.email, subject: msg.subject, html: msg.html };
+      // The deadline job publishes through the same function; only the door and
+      // the `auto` flag differ.
+      const outcome = await publishRound(repo, realtime, round, {
+        actorId: req.authClaims!.sub,
       });
-      const sentCount = await sendBulk(messages);
-      await repo.rounds.update(round.id, { resultsPublishedAt: new Date().toISOString() });
+      if (!outcome.ok) return reply.code(outcome.status).send({ error: outcome.error });
 
-      // Auto-complete: if this is the last round of the event, check completion
-      const allRounds = await repo.rounds.findByCompetition(event.competitionId);
-      const eventRounds = allRounds.filter((r) => r.competitionEventId === event.id);
-      const isLastRound = round.roundNumber === eventRounds.length;
-
-      let eventCompleted = false;
-      let competitionCompleted = false;
-
-      if (isLastRound) {
-        eventCompleted = true;
-
-        // Check if all events of this competition are now complete
-        const allEvents = await repo.competitionEvents.findByCompetition(event.competitionId);
-        const allComplete = await Promise.all(allEvents.map(async (ev) => {
-          const evRounds = allRounds.filter((r) => r.competitionEventId === ev.id);
-          if (evRounds.length === 0) return false;
-          const lastRound = evRounds.reduce((max, r) => r.roundNumber > max.roundNumber ? r : max);
-          if (lastRound.status !== "closed" && lastRound.status !== "advanced") return false;
-          const results = await repo.results.findByRound(lastRound.id);
-          if (results.some((r) => r.flagStatus === "flagged")) return false;
-          return true;
-        }));
-
-        if (allComplete.every(Boolean) && comp) {
-          await repo.competitions.update(comp.id, { status: "completed" });
-          competitionCompleted = true;
-        }
-      }
-
-      return {
-        sent: sentCount > 0,
-        recipientCount: recipients.length,
-        sentCount,
-        roundNumber: round.roundNumber,
-        eventType: event.eventType,
-        eventCompleted,
-        competitionCompleted,
-      };
+      return outcome.result;
     },
   );
 
@@ -3274,6 +3194,13 @@ export async function registerAdminRoutes(
     }
     if (typeof body.videoDeadlineMinutes === "number" && body.videoDeadlineMinutes > 0) {
       patch.videoDeadlineMinutes = body.videoDeadlineMinutes;
+    }
+    // 0 is meaningful for both: it turns the deadline, and the warning, off.
+    if (typeof body.autoPublishLeadMinutes === "number" && body.autoPublishLeadMinutes >= 0) {
+      patch.autoPublishLeadMinutes = body.autoPublishLeadMinutes;
+    }
+    if (typeof body.publishWarningLeadHours === "number" && body.publishWarningLeadHours >= 0) {
+      patch.publishWarningLeadHours = body.publishWarningLeadHours;
     }
     if (body.flagRuleDefaults && typeof body.flagRuleDefaults === "object") {
       patch.flagRuleDefaults = body.flagRuleDefaults;
