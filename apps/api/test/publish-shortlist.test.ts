@@ -271,3 +271,72 @@ describe("verification no longer advances anyone", () => {
     expect((await repo.advancements.findByRound(f.round1)).length).toBe(2);
   });
 });
+
+describe("auto-completion judges the round by effective status", () => {
+  it("completes a single-round competition even when the stored status still says open", async () => {
+    // Reproduces the pre-ticker window: the round's close time has passed (so
+    // publishing is allowed and effectiveRoundStatus === 'closed'), but the
+    // stored `status` column is still 'open' because the 60s ticker has not yet
+    // persisted the close. Reading the stored column here used to skip
+    // completion and never retry it.
+    const compId = randomUUID();
+    const eventId = randomUUID();
+    const roundId = randomUUID();
+    const now = new Date().toISOString();
+    const past = new Date(Date.now() - 3_600_000).toISOString();
+    const morePast = new Date(Date.now() - 7_200_000).toISOString();
+
+    await repo.competitions.create({
+      id: compId,
+      title: `Complete Test ${randomUUID().slice(0, 8)}`,
+      type: "free",
+      status: "live",
+      baseFee: 0,
+      perEventFee: 0,
+      featured: false,
+      videoDeadlineMinutes: 1440,
+      createdAt: now,
+    });
+    await repo.competitionEvents.create({
+      id: eventId,
+      competitionId: compId,
+      eventType: "333",
+      roundCount: 1,
+    });
+    // Stored status stays "open"; the past closesAt makes it effectively closed.
+    await repo.rounds.create({
+      id: roundId,
+      competitionEventId: eventId,
+      roundNumber: 1,
+      status: "open",
+      opensAt: morePast,
+      closesAt: past,
+    });
+
+    const token = await devToken(app, `complete-${compId.slice(0, 6)}@test.com`, "Finisher");
+    const { id: userId } = await syncVerifiedUser(app, repo, token);
+    const regId = randomUUID();
+    await repo.registrations.create({
+      id: regId, userId, competitionId: compId, paymentStatus: "paid", status: "active", createdAt: now,
+    });
+    await repo.registrations.addEvent(regId, eventId);
+    await repo.results.create({
+      id: randomUUID(),
+      roundId,
+      userId,
+      solves: [8000, 8000, 8000, 8000, 8000].map((ms) => ({
+        time_ms: ms, penalty: "none" as const, inspectionPenalty: "none" as const,
+      })),
+      bestSingleMs: 8000, ao5Ms: 8000, meanMs: 8000, medianMs: 8000, stdMs: 0,
+      rank: 1, videoUrl: null, flagStatus: "clean", flagReasons: [], submittedAt: now,
+    });
+
+    // Sanity: stored status is still "open" going into publish.
+    expect((await repo.rounds.findById(roundId))!.status).toBe("open");
+
+    const res = await publish(roundId);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().competitionCompleted).toBe(true);
+    expect((await repo.competitions.findById(compId))!.status).toBe("completed");
+  });
+});

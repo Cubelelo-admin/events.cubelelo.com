@@ -9,6 +9,7 @@ import type { Round, RoundAdvancement, AdvancementCriteria } from "../db/types";
 import type { Realtime } from "../sockets/realtime";
 import { recomputeRanks } from "./resultStats";
 import { getRedis } from "./redis";
+import { effectiveRoundStatus } from "./statusUtils";
 
 /**
  * Scrambles per round = one per attempt of the round's format, plus the WCA
@@ -168,7 +169,12 @@ export async function checkCompetitionCompletion(
     const finalRound = eventRounds[eventRounds.length - 1];
     if (!finalRound) return;
 
-    if (finalRound.status !== "advanced" && finalRound.status !== "closed") return;
+    // Judge the round the way the rest of the system does — by its effective,
+    // time-derived status — not the stored column, which the ticker only writes
+    // ~60s after close. Reading the stored value meant a publish landing in that
+    // window saw "open" and skipped completion, and nothing ever retried it.
+    const finalStatus = effectiveRoundStatus(finalRound);
+    if (finalStatus !== "advanced" && finalStatus !== "closed") return;
     const results = await repo.results.findByRound(finalRound.id);
     if (results.length === 0) return;
     if (results.some((r) => r.flagStatus === "flagged")) return;
