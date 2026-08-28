@@ -169,6 +169,13 @@ export async function checkCompetitionCompletion(
     const finalRound = eventRounds[eventRounds.length - 1];
     if (!finalRound) return;
 
+    // A competition is done only when every event has actually been PUBLISHED —
+    // not merely when its rounds happen to be closed with clean results. Without
+    // this, publishing one event of several completed the whole competition,
+    // because the other events' rounds were already closed-with-results (just
+    // not published yet) and satisfied every other check.
+    if (!finalRound.resultsPublishedAt) return;
+
     // Judge the round the way the rest of the system does — by its effective,
     // time-derived status — not the stored column, which the ticker only writes
     // ~60s after close. Reading the stored value meant a publish landing in that

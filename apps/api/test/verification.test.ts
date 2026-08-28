@@ -110,6 +110,7 @@ describe("admin verification queue", () => {
 describe("judge override recalculates stats and personal bests (HIGH-009)", () => {
   let resultId: string;
   let userId: string;
+  let roundId: string;
 
   async function override(action: string, solvePenalties?: (string | null)[]) {
     const res = await app.inject({
@@ -137,7 +138,7 @@ describe("judge override recalculates stats and personal bests (HIGH-009)", () =
       method: "GET",
       url: `/api/v1/competitions/${SEED_DEMO_COMP_ID}`,
     });
-    const roundId = detail.json().events[0].rounds[0].id;
+    roundId = detail.json().events[0].rounds[0].id;
 
     const res = await app.inject({
       method: "POST",
@@ -231,5 +232,24 @@ describe("judge override recalculates stats and personal bests (HIGH-009)", () =
     const pb = await currentPb();
     expect(pb?.bestAo5Ms).toBeNull();
     expect(pb?.bestSingleMs).toBeNull();
+  });
+
+  it("exposes applied per-attempt penalties in the results feed", async () => {
+    // The raw solves are never rewritten, so judgeOverrides is the only record of
+    // an applied +2/DNF. The verification workspace reloads from this feed after a
+    // verdict — if the feed omits the overrides, the applied penalty is invisible
+    // and the verdict looks like it "did nothing".
+    await override("plus2", ["plus2", null, null, null, null]);
+
+    const feed = await app.inject({
+      method: "GET",
+      url: `/api/v1/admin/verification/rounds/${roundId}/results`,
+      headers: bearer(admin),
+    });
+    expect(feed.statusCode).toBe(200);
+    const dto = (feed.json() as { id: string; judgeOverrides: (string | null)[] | null }[])
+      .find((r) => r.id === resultId);
+    expect(dto).toBeDefined();
+    expect(dto!.judgeOverrides).toEqual(["plus2", null, null, null, null]);
   });
 });

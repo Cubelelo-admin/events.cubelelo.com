@@ -21,7 +21,7 @@ import {
   type RoundProgress,
 } from "@/lib/api";
 import { useAuth } from "@/features/auth/AuthProvider";
-import { acquireSocket, releaseSocket } from "@/features/realtime/socket";
+import { acquireSocket, releaseSocket, trackCompJoin, trackCompLeave } from "@/features/realtime/socket";
 import { UserStatusBadge } from "@/features/competitions/UserStatusBadge";
 import { StatusBadge } from "@/features/competitions/StatusBadge";
 import { formatTime } from "@cubers/timer-core";
@@ -94,37 +94,69 @@ export default function CompetitionDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState("overview");
 
-  // Wait for auth to finish loading before fetching — the auth token must be
-  // set so the API knows whether this user is an admin (required to view drafts).
-  useEffect(() => {
-    if (!params.id || authLoading) return;
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    fetchCompetition(params.id)
-      .then((data) => { if (!cancelled) setComp(data); })
-      .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
-      })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
-  }, [params.id, authLoading]);
+  // Reload the competition. `silent` skips the full-page spinner + error banner
+  // so a realtime refresh (a round opening, say) updates in place quietly.
+  const loadComp = useCallback(async (silent = false) => {
+    if (!params.id) return;
+    if (!silent) { setLoading(true); setError(null); }
+    try {
+      const data = await fetchCompetition(params.id);
+      setComp(data);
+    } catch (e) {
+      if (!silent) setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [params.id]);
 
-  useEffect(() => {
+  const loadMine = useCallback(async () => {
     if (!user || !params.id) return;
-    fetchMyRegistrations()
-      .then((regs) => {
-        // Only an active registration means "you are in this competition" —
-        // a withdrawn one is history, not membership.
-        const reg =
-          regs.find((r) => r.competitionId === params.id && r.status === "active") ?? null;
-        setMyReg(reg);
-      })
-      .catch(() => { });
-    fetchMyProgress(params.id)
-      .then((p) => setMyProgress(p.rounds))
-      .catch(() => { });
+    try {
+      const regs = await fetchMyRegistrations();
+      // Only an active registration means "you are in this competition".
+      setMyReg(regs.find((r) => r.competitionId === params.id && r.status === "active") ?? null);
+    } catch { /* ignore */ }
+    try {
+      const p = await fetchMyProgress(params.id);
+      setMyProgress(p.rounds);
+    } catch { /* ignore */ }
   }, [user, params.id]);
+
+  // Wait for auth to finish loading before fetching — the token must be set so
+  // the API knows whether this user is an admin (required to view drafts).
+  useEffect(() => {
+    if (authLoading) return;
+    loadComp(false);
+  }, [authLoading, loadComp]);
+
+  useEffect(() => { loadMine(); }, [loadMine]);
+
+  // React to live state instead of forcing a refresh: when a round opens/closes
+  // or the competition status changes, the server broadcasts to the competition
+  // room. Refetch quietly so the enter-round buttons, statuses and standings
+  // update on their own. Bursts (a transition emits several events) are coalesced.
+  useEffect(() => {
+    if (!params.id) return;
+    const socket = acquireSocket();
+    socket.emit("join", { compId: params.id });
+    trackCompJoin(params.id);
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const refresh = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => { loadComp(true); loadMine(); }, 400);
+    };
+    socket.on("round:status", refresh);
+    socket.on("comp:status", refresh);
+
+    return () => {
+      if (timer) clearTimeout(timer);
+      socket.off("round:status", refresh);
+      socket.off("comp:status", refresh);
+      trackCompLeave(params.id);
+      releaseSocket();
+    };
+  }, [params.id, loadComp, loadMine]);
 
   const navItems = useMemo(
     () => (comp ? getNavItems(comp, !!myReg, user) : []),
@@ -389,7 +421,7 @@ export default function CompetitionDetailPage() {
             {showUsersRankings && (
               <section id="section-users-rankings" className="scroll-mt-20">
                 <SectionHeading>Users &amp; Rankings</SectionHeading>
-                <UsersAndRankingsSection comp={comp} user={user} isCompleted={isCompleted} myProgress={myProgress} />
+                <UsersAndRankingsSection comp={comp} user={user} isCompleted={isCompleted} myProgress={myProgress} registeredEventTypes={myReg?.events.map((e) => e.eventType) ?? []} />
               </section>
             )}
 
@@ -1366,8 +1398,24 @@ function ParticipantsTab({ comp, onCountChange }: { comp: CompetitionDetail; onC
 
 /* ── Rankings Tab ── */
 
+/**
+ * Which event the rankings view should open on.
+ *
+ * The event that is live right now, so competitors land on the standings that
+ * are actually moving. If nothing is live, the most recently published event —
+ * the last one that finished — rather than always snapping back to the first.
+ */
+function pickDefaultEvent(events: CompetitionDetail["events"]): string {
+  const active = events.filter((e) => !e.archived);
+  const live = active.find((e) => e.rounds.some((r) => r.status === "open"));
+  if (live) return live.eventType;
+  const lastDone = [...active].reverse().find((e) => e.rounds.some((r) => r.resultsPublishedAt));
+  if (lastDone) return lastDone.eventType;
+  return active[0]?.eventType ?? events[0]?.eventType ?? "";
+}
+
 function RankingsTab({ comp, showResultsLink, userId }: { comp: CompetitionDetail; showResultsLink: boolean; userId?: string }) {
-  const [selectedEvent, setSelectedEvent] = useState(comp.events[0]?.eventType ?? "");
+  const [selectedEvent, setSelectedEvent] = useState(() => pickDefaultEvent(comp.events));
   const [selectedRound, setSelectedRound] = useState(1);
   const [ranking, setRanking] = useState<LiveRankingEntry[]>([]);
   const [roundInfo, setRoundInfo] = useState<{ roundNumber: number | null }>({ roundNumber: null });
@@ -1611,11 +1659,13 @@ function UsersAndRankingsSection({
   user,
   isCompleted,
   myProgress,
+  registeredEventTypes,
 }: {
   comp: CompetitionDetail;
   user: { id: string; clId: string; name: string } | null;
   isCompleted: boolean;
   myProgress: RoundProgress[];
+  registeredEventTypes: string[];
 }) {
   const [tab, setTab] = useState<URTab>("rankings");
   const [participantCount, setParticipantCount] = useState<number | null>(null);
@@ -1662,7 +1712,7 @@ function UsersAndRankingsSection({
       )}
 
       {tab === "glance" && user && (
-        <GlanceTab comp={comp} myProgress={myProgress} />
+        <GlanceTab comp={comp} myProgress={myProgress} registeredEventTypes={registeredEventTypes} />
       )}
     </div>
   );
@@ -1678,17 +1728,38 @@ function glanceSolveLabel(s: { time_ms: number; penalty: string; inspectionPenal
   return extra > 0 ? `${formatted}+` : formatted;
 }
 
-function GlanceTab({ comp, myProgress }: { comp: CompetitionDetail; myProgress: RoundProgress[] }) {
+function GlanceTab({
+  comp,
+  myProgress,
+  registeredEventTypes,
+}: {
+  comp: CompetitionDetail;
+  myProgress: RoundProgress[];
+  registeredEventTypes: string[];
+}) {
   const eventGroups = useMemo(() => {
+    // Only the events this competitor actually registered for — the glance is
+    // "my schedule", not the whole competition. Events they are not in used to
+    // show here as empty "no-data" rows.
+    const mine = new Set(registeredEventTypes);
     const groups: { eventType: string; eventName: string; rounds: RoundProgress[] }[] = [];
     for (const ev of comp.events) {
+      if (!mine.has(ev.eventType)) continue;
       const rounds = myProgress
         .filter((p) => p.eventType === ev.eventType)
         .sort((a, b) => a.roundNumber - b.roundNumber);
       groups.push({ eventType: ev.eventType, eventName: eventDisplayName(ev.eventType), rounds });
     }
     return groups;
-  }, [comp.events, myProgress]);
+  }, [comp.events, myProgress, registeredEventTypes]);
+
+  if (eventGroups.length === 0) {
+    return (
+      <p className="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500 dark:border-zinc-700">
+        You are not registered for any events in this competition.
+      </p>
+    );
+  }
 
   // Build flat rows: one per round, grouped under event headers
   const rows: Array<

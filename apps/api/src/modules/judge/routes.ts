@@ -88,6 +88,7 @@ export async function registerJudgeRoutes(
           eventType: event?.eventType ?? "unknown",
           roundNumber: round.roundNumber,
           solves: r.solves,
+          judgeOverrides: r.judgeOverrides ?? null,
           bestSingleMs: r.bestSingleMs,
           ao5Ms: r.ao5Ms,
           videoUrl: r.videoUrl,

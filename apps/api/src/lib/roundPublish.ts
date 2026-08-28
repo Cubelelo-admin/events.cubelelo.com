@@ -74,6 +74,18 @@ export async function publishRound(
   const event = await repo.competitionEvents.findById(round.competitionEventId);
   if (!event) return { ok: false, status: 404, error: "event_not_found" };
 
+  // A round with a following round must say how competitors advance, or
+  // publishing it shortlists nobody and the next round opens to an empty field.
+  // Block a person from publishing until criteria are set (auto-publish assumes
+  // a validly-configured round — blocking it would strand the next round anyway).
+  if (!opts.auto) {
+    const next = await nextRoundOf(repo, round);
+    const hasCriteria = Boolean(round.advancementCriteria) || Boolean(round.advancementCount);
+    if (next && !hasCriteria) {
+      return { ok: false, status: 409, error: "advancement_criteria_required" };
+    }
+  }
+
   // Shortlist first, stamp second. Stamping first meant a failed shortlist left
   // `resultsPublishedAt` set while the compensating revert put the status back
   // to `closed` — so every retry hit `already_published` and the round could

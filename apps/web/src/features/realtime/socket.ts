@@ -1,6 +1,11 @@
 import { io, type Socket } from "socket.io-client";
 
-const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
+// `||` not `??`: NEXT_PUBLIC_API_URL is set to "" in local dev (HTTP goes through
+// the Next rewrite proxy), but a socket cannot be proxied that way — Next only
+// rewrites /api, not /socket.io. So an empty value must fall back to the API's
+// own origin, or the socket connects to the web origin and silently never
+// reaches the server. In production NEXT_PUBLIC_API_URL is the real API URL.
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
 const TOKEN_KEY = "cubers_token";
 
 let instance: Socket | null = null;

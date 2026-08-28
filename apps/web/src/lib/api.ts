@@ -24,6 +24,8 @@ const FRIENDLY_ERRORS: Record<string, string> = {
   round_not_closed: "This round is still running — results can only be published once it closes.",
   results_not_verified: "Some results are still flagged. Finish verification before publishing.",
   already_published: "These results have already been published.",
+  advancement_criteria_required:
+    "Set the shortlisting criteria for this round before publishing — otherwise no one advances to the next round.",
   // Leaving a competition
   registration_not_active: "This registration is no longer active.",
   registration_has_results:
@@ -1875,6 +1877,12 @@ export interface VerificationResultDto {
   eventType: string;
   roundNumber: number;
   solves: Solve[];
+  /**
+   * Per-attempt penalties a judge applied, parallel to `solves`. The raw `solves`
+   * are never rewritten, so this is the only record of an applied +2/DNF — the
+   * workspace needs it to render a previously-verified result's penalties.
+   */
+  judgeOverrides?: (SolvePenalty | null)[] | null;
   bestSingleMs: number | null;
   ao5Ms: number | null;
   videoUrl: string | null;

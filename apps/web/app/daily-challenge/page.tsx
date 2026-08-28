@@ -10,6 +10,7 @@ import {
 } from "@/lib/api";
 import { formatTime } from "@cubers/timer-core";
 import { useTimer } from "@/features/timer/useTimer";
+import { useTimerControls } from "@/features/timer/useTimerControls";
 import { TimerDisplay } from "@/features/timer/TimerDisplay";
 import { TwistyPlayer } from "@/features/scramble/TwistyPlayer";
 import { eventDisplayName } from "@/lib/eventNames";
@@ -140,31 +141,14 @@ export default function DailyChallengePage() {
   }, [data]);
 
   // Pointer handlers for touch/mobile support
-  const onPointerDown = useCallback(() => {
-    if (snapshot.phase === "stopped") return;
-    down();
-  }, [snapshot.phase, down]);
-  const onPointerUp = useCallback(() => {
-    if (snapshot.phase === "stopped") return;
-    up();
-  }, [snapshot.phase, up]);
-
-  // Keyboard controls
-  useEffect(() => {
-    if (!data || data.userResult) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.repeat) return;
-      if (snapshot.phase === "solving") { e.preventDefault(); down(); return; }
-      if (e.code === "Space") { e.preventDefault(); down(); }
-      if (e.key === "Escape") reset();
-    };
-    const onKeyUp = (e: KeyboardEvent) => {
-      if (e.code === "Space") { e.preventDefault(); up(); }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-    return () => { window.removeEventListener("keydown", onKeyDown); window.removeEventListener("keyup", onKeyUp); };
-  }, [snapshot.phase, down, up, reset, data]);
+  // Shared timer wiring (keyboard + touch), identical to every other surface.
+  const { onPointerDown, onPointerUp } = useTimerControls({
+    down,
+    up,
+    reset,
+    phase: snapshot.phase,
+    enabled: !!data && !data.userResult,
+  });
 
   if (loading) return <main className="mx-auto max-w-3xl px-4 py-16 text-center text-zinc-500">Loading...</main>;
   if (error && !data) return <main className="mx-auto max-w-3xl px-4 py-16 text-center text-red-500">{error}</main>;

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import type { Solve } from "@cubers/types";
-import { formatTime, formatSolve } from "@cubers/timer-core";
+import { formatTime, formatSolve, ao5, bestSingle } from "@cubers/timer-core";
 import {
   fetchRoundResults,
   fetchRoundJudges,
@@ -52,38 +52,40 @@ function extractYoutubeId(url: string): string | null {
   try {
     const u = new URL(url);
     if (u.hostname.includes("youtu.be")) return u.pathname.slice(1).split("/")[0];
-    if (u.hostname.includes("youtube.com")) return u.searchParams.get("v");
+    if (u.hostname.includes("youtube.com")) {
+      if (u.searchParams.get("v")) return u.searchParams.get("v");
+      // /embed/<id> and /shorts/<id>
+      const m = u.pathname.match(/\/(?:embed|shorts)\/([^/?]+)/);
+      if (m) return m[1] ?? null;
+    }
   } catch { /* not a URL */ }
   return null;
 }
 
-/* ── Score recalculation helpers ──────────────────────────────────────────── */
-
-/** Compute ao5 from solves (trim best + worst, average middle 3). */
-function computeAo5(solves: Solve[]): number | null {
-  if (solves.length < 5) return null;
-  const times = solves.slice(0, 5).map((s) => {
-    if (s.penalty === "dnf") return Infinity;
-    const base = s.time_ms;
-    return s.penalty === "plus2" ? base + 2000 : base;
-  });
-  const dnfCount = times.filter((t) => t === Infinity).length;
-  if (dnfCount >= 2) return null; // DNF average
-  const sorted = [...times].sort((a, b) => a - b);
-  // trim best and worst
-  const middle = sorted.slice(1, 4);
-  return Math.round(middle.reduce((a, b) => a + b, 0) / 3);
+/** A Google Drive file id from a share link, if the url is one. */
+function extractDriveId(url: string): string | null {
+  try {
+    const u = new URL(url);
+    if (!u.hostname.includes("drive.google.com")) return null;
+    // .../file/d/<ID>/view  or  ...?id=<ID>
+    const m = u.pathname.match(/\/file\/d\/([^/]+)/);
+    if (m) return m[1] ?? null;
+    return u.searchParams.get("id");
+  } catch { /* not a URL */ }
+  return null;
 }
 
-/** Find best single from solves. */
-function computeBest(solves: Solve[]): number | null {
-  let best: number | null = null;
-  for (const s of solves) {
-    if (s.penalty === "dnf") continue;
-    const t = s.penalty === "plus2" ? s.time_ms + 2000 : s.time_ms;
-    if (best === null || t < best) best = t;
-  }
-  return best;
+/**
+ * An embeddable player src for a competitor's video, or null if the host is not
+ * one we can embed (the caller then shows an "open in new tab" link). Verifiers
+ * need to watch the evidence in place; Drive is as common as YouTube here.
+ */
+function videoEmbedSrc(url: string): string | null {
+  const yt = extractYoutubeId(url);
+  if (yt) return `https://www.youtube-nocookie.com/embed/${yt}?rel=0`;
+  const drive = extractDriveId(url);
+  if (drive) return `https://drive.google.com/file/d/${drive}/preview`;
+  return null;
 }
 
 /* ── Main Page ───────────────────────────────────────────────────────────── */
@@ -170,7 +172,10 @@ export default function VerificationWorkspacePage() {
 
   // Get solves with local overrides applied
   const getOverriddenSolves = useCallback((result: VerificationResultDto): Solve[] => {
-    const overrides = solveOverrides.get(result.id);
+    // Local edits win; otherwise fall back to penalties a judge already applied
+    // (stored in judgeOverrides, since the raw solves are never rewritten) so a
+    // verified result shows its +2/DNF instead of reverting to raw times.
+    const overrides = solveOverrides.get(result.id) ?? result.judgeOverrides ?? undefined;
     if (!overrides) return result.solves;
     return result.solves.map((s, i) => {
       const override = overrides[i];
@@ -184,7 +189,9 @@ export default function VerificationWorkspacePage() {
       const next = new Map(prev);
       const result = results.find((r) => r.id === resultId);
       if (!result) return prev;
-      const current = next.get(resultId) ?? result.solves.map(() => null);
+      // Start from any already-applied penalties so editing one attempt does not
+      // wipe the others the judge set on a previous pass.
+      const current = next.get(resultId) ?? result.judgeOverrides ?? result.solves.map(() => null);
       const arr = [...current];
       const currentPenalty = arr[solveIndex] ?? result.solves[solveIndex]?.penalty ?? null;
       // Toggle: if already this penalty, remove it; otherwise set it
@@ -214,18 +221,37 @@ export default function VerificationWorkspacePage() {
 
   const handleVerify = async (action: string) => {
     if (!selected) return;
+
+    // The per-attempt toggles ARE the verdict. The single Verify button used to
+    // always send "verified", but the server only keeps per-attempt penalties for
+    // a `plus2`/`dnf` action (overridesForAction) — so a judge who toggled a +2
+    // and clicked Verify had it silently discarded and the result verified with
+    // raw times. Derive the action from the penalties: a clean verify when none
+    // are set, otherwise the penalty verdict that makes the server keep them.
+    const penalties = solveOverrides.get(selected.id);
+    const hasPenalty = penalties?.some((p) => p === "plus2" || p === "dnf") ?? false;
+    const effectiveAction = hasPenalty
+      ? (penalties!.some((p) => p === "dnf") ? "dnf" : "plus2")
+      : action;
+
+    // The backend requires a stated reason for every destructive verdict, and it
+    // is the remark box the verifier already types into.
+    const remark = comment.trim();
+    const isDestructive = ["plus2", "dnf", "disqualified"].includes(effectiveAction);
+    if (isDestructive && !remark) {
+      setError("Add a remark — a reason is required to +2, DNF, or disqualify a result.");
+      return;
+    }
+
     setBusy(`verify-${selected.id}`);
+    setError(null);
     try {
       const verifyFn = isJudgeOnly ? judgeVerifyResult : verifyResult;
-      // The per-attempt toggles are the judge's actual verdict — send them so the
-      // penalty lands on the attempt they picked. Previously they were local-only
-      // preview state, and the server applied a flat +2 to every stat instead.
-      const penalties = solveOverrides.get(selected.id);
       await verifyFn(
         selected.id,
-        action,
-        undefined,
-        comment.trim() || undefined,
+        effectiveAction,
+        remark || undefined,
+        remark || undefined,
         penalties ?? undefined,
       );
       setComment("");
@@ -692,11 +718,15 @@ function ResultDetail({
     result.flagStatus === "dnf" ||
     result.flagStatus === "disqualified";
 
-  const ytId = result.videoUrl ? extractYoutubeId(result.videoUrl) : null;
+  const embedSrc = result.videoUrl ? videoEmbedSrc(result.videoUrl) : null;
 
   // Recalculated scores based on overridden penalties
-  const recalcAo5 = useMemo(() => computeAo5(overriddenSolves), [overriddenSolves]);
-  const recalcBest = useMemo(() => computeBest(overriddenSolves), [overriddenSolves]);
+  // Use the canonical WCA stats (inspection + manual penalties, centisecond
+  // rounding) so this preview matches what the server stores exactly — a local
+  // copy that ms-rounded and ignored inspection made every result read as
+  // "changed" against its own stored value.
+  const recalcAo5 = useMemo(() => ao5(overriddenSolves), [overriddenSolves]);
+  const recalcBest = useMemo(() => bestSingle(overriddenSolves), [overriddenSolves]);
 
   // Check if scores changed from original
   const ao5Changed = recalcAo5 !== result.ao5Ms;
@@ -743,10 +773,10 @@ function ResultDetail({
             </div>
             <div className="flex-1">
               {result.videoUrl ? (
-                ytId ? (
+                embedSrc ? (
                   <div className="h-full min-h-[160px] w-full overflow-hidden rounded-lg bg-black">
                     <iframe
-                      src={`https://www.youtube-nocookie.com/embed/${ytId}?rel=0`}
+                      src={embedSrc}
                       className="h-full w-full"
                       allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
                       allowFullScreen

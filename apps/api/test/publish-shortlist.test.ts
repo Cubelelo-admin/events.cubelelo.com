@@ -340,3 +340,149 @@ describe("auto-completion judges the round by effective status", () => {
     expect((await repo.competitions.findById(compId))!.status).toBe("completed");
   });
 });
+
+describe("multi-event completion waits for every event to be published", () => {
+  it("does not complete the competition after publishing only one of several events", async () => {
+    // Two events. Both rounds already ran (closed, clean results), so the ONLY
+    // thing separating "done" from "not done" is publication. Publishing event A
+    // must not complete the competition while event B is unpublished.
+    const compId = randomUUID();
+    const eventA = randomUUID();
+    const eventB = randomUUID();
+    const roundA = randomUUID();
+    const roundB = randomUUID();
+    const now = new Date().toISOString();
+    const past = new Date(Date.now() - 3_600_000).toISOString();
+    const morePast = new Date(Date.now() - 7_200_000).toISOString();
+
+    await repo.competitions.create({
+      id: compId, title: `Multi ${randomUUID().slice(0, 8)}`, type: "free",
+      status: "live", baseFee: 0, perEventFee: 0, featured: false,
+      videoDeadlineMinutes: 1440, createdAt: now,
+    });
+
+    for (const [eventId, roundId, ev] of [[eventA, roundA, "333"], [eventB, roundB, "222"]] as const) {
+      await repo.competitionEvents.create({
+        id: eventId, competitionId: compId, eventType: ev, roundCount: 1,
+      });
+      // Effectively closed (past closesAt) with a clean result — but NOT published.
+      await repo.rounds.create({
+        id: roundId, competitionEventId: eventId, roundNumber: 1,
+        status: "open", opensAt: morePast, closesAt: past,
+      });
+      const token = await devToken(app, `${ev}-${compId.slice(0, 6)}@test.com`, `Cuber ${ev}`);
+      const { id: userId } = await syncVerifiedUser(app, repo, token);
+      const regId = randomUUID();
+      await repo.registrations.create({
+        id: regId, userId, competitionId: compId, paymentStatus: "paid", status: "active", createdAt: now,
+      });
+      await repo.registrations.addEvent(regId, eventId);
+      await repo.results.create({
+        id: randomUUID(), roundId, userId,
+        solves: [8000, 8000, 8000, 8000, 8000].map((ms) => ({
+          time_ms: ms, penalty: "none" as const, inspectionPenalty: "none" as const,
+        })),
+        bestSingleMs: 8000, ao5Ms: 8000, meanMs: 8000, medianMs: 8000, stdMs: 0,
+        rank: 1, videoUrl: null, flagStatus: "clean", flagReasons: [], submittedAt: now,
+      });
+    }
+
+    // Publish only event A.
+    const res = await publish(roundA);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().competitionCompleted).toBe(false);
+    expect((await repo.competitions.findById(compId))!.status).not.toBe("completed");
+
+    // Now publish event B — the competition completes.
+    const res2 = await publish(roundB);
+    expect(res2.statusCode).toBe(200);
+    expect(res2.json().competitionCompleted).toBe(true);
+    expect((await repo.competitions.findById(compId))!.status).toBe("completed");
+  });
+});
+
+describe("publishing requires shortlisting criteria when a next round exists", () => {
+  it("refuses to publish a non-final round that has no advancement criteria", async () => {
+    const compId = randomUUID();
+    const eventId = randomUUID();
+    const round1 = randomUUID();
+    const round2 = randomUUID();
+    const now = new Date().toISOString();
+
+    await repo.competitions.create({
+      id: compId, title: `NoCrit ${randomUUID().slice(0, 8)}`, type: "free",
+      status: "live", baseFee: 0, perEventFee: 0, featured: false,
+      videoDeadlineMinutes: 1440, createdAt: now,
+    });
+    await repo.competitionEvents.create({
+      id: eventId, competitionId: compId, eventType: "333", roundCount: 2,
+    });
+    // Round 1 is closed with a clean result but has NO advancementCriteria.
+    await repo.rounds.create({
+      id: round1, competitionEventId: eventId, roundNumber: 1, status: "closed",
+    });
+    await repo.rounds.create({
+      id: round2, competitionEventId: eventId, roundNumber: 2, status: "pending",
+    });
+    const token = await devToken(app, `nocrit-${compId.slice(0, 6)}@test.com`, "Cuber");
+    const { id: userId } = await syncVerifiedUser(app, repo, token);
+    const regId = randomUUID();
+    await repo.registrations.create({
+      id: regId, userId, competitionId: compId, paymentStatus: "paid", status: "active", createdAt: now,
+    });
+    await repo.registrations.addEvent(regId, eventId);
+    await repo.results.create({
+      id: randomUUID(), roundId: round1, userId,
+      solves: [8000, 8000, 8000, 8000, 8000].map((ms) => ({
+        time_ms: ms, penalty: "none" as const, inspectionPenalty: "none" as const,
+      })),
+      bestSingleMs: 8000, ao5Ms: 8000, meanMs: 8000, medianMs: 8000, stdMs: 0,
+      rank: 1, videoUrl: null, flagStatus: "clean", flagReasons: [], submittedAt: now,
+    });
+
+    const res = await publish(round1);
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toBe("advancement_criteria_required");
+    // Nothing was published or advanced.
+    expect((await repo.rounds.findById(round1))!.resultsPublishedAt).toBeFalsy();
+    expect(await repo.advancements.findByRound(round1)).toEqual([]);
+  });
+
+  it("allows publishing a FINAL round with no criteria", async () => {
+    // The existing single-round completion test already covers this, but assert
+    // it directly: a round with no next round needs no criteria.
+    const compId = randomUUID();
+    const eventId = randomUUID();
+    const roundId = randomUUID();
+    const now = new Date().toISOString();
+    await repo.competitions.create({
+      id: compId, title: `Final ${randomUUID().slice(0, 8)}`, type: "free",
+      status: "live", baseFee: 0, perEventFee: 0, featured: false,
+      videoDeadlineMinutes: 1440, createdAt: now,
+    });
+    await repo.competitionEvents.create({
+      id: eventId, competitionId: compId, eventType: "333", roundCount: 1,
+    });
+    await repo.rounds.create({
+      id: roundId, competitionEventId: eventId, roundNumber: 1, status: "closed",
+    });
+    const token = await devToken(app, `final-${compId.slice(0, 6)}@test.com`, "Cuber");
+    const { id: userId } = await syncVerifiedUser(app, repo, token);
+    const regId = randomUUID();
+    await repo.registrations.create({
+      id: regId, userId, competitionId: compId, paymentStatus: "paid", status: "active", createdAt: now,
+    });
+    await repo.registrations.addEvent(regId, eventId);
+    await repo.results.create({
+      id: randomUUID(), roundId, userId,
+      solves: [8000, 8000, 8000, 8000, 8000].map((ms) => ({
+        time_ms: ms, penalty: "none" as const, inspectionPenalty: "none" as const,
+      })),
+      bestSingleMs: 8000, ao5Ms: 8000, meanMs: 8000, medianMs: 8000, stdMs: 0,
+      rank: 1, videoUrl: null, flagStatus: "clean", flagReasons: [], submittedAt: now,
+    });
+
+    const res = await publish(roundId);
+    expect(res.statusCode).toBe(200);
+  });
+});

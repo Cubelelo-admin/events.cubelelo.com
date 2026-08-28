@@ -13,6 +13,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useTimer } from "@/features/timer/useTimer";
 import { TimerDisplay } from "@/features/timer/TimerDisplay";
+import { useTimerControls } from "@/features/timer/useTimerControls";
 import { TwistyPlayer } from "@/features/scramble/TwistyPlayer";
 import { useLeaderboard } from "@/features/realtime/useLeaderboard";
 import { ErrorCard } from "@/components/ui/ErrorCard";
@@ -246,35 +247,14 @@ export function CompetitionTerminal({
     [scrambleMoves, scrambleStep],
   );
 
-  useEffect(() => {
-    if (load.kind !== "ready" || roundComplete) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.repeat) return;
-      if (snapshot.phase === "solving") {
-        e.preventDefault();
-        down();
-        return;
-      }
-      if (e.code === "Space") {
-        e.preventDefault();
-        down();
-      } else if (e.key === "Escape") {
-        reset();
-      }
-    };
-    const onKeyUp = (e: KeyboardEvent) => {
-      if (e.code === "Space") {
-        e.preventDefault();
-        up();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
-    };
-  }, [load.kind, roundComplete, snapshot.phase, down, up, reset]);
+  // Keyboard + touch wiring is shared with every other timer surface.
+  const { onPointerDown, onPointerUp } = useTimerControls({
+    down,
+    up,
+    reset,
+    phase: snapshot.phase,
+    enabled: load.kind === "ready" && !roundComplete,
+  });
 
   const confirmSolve = useCallback(() => {
     if (!snapshot.result) return;
@@ -332,14 +312,6 @@ export function CompetitionTerminal({
     }
   }, [submit.kind, router, competitionId]);
 
-  const onPointerDown = useCallback(() => {
-    if (snapshot.phase === "stopped" || roundComplete) return;
-    down();
-  }, [snapshot.phase, roundComplete, down]);
-  const onPointerUp = useCallback(() => {
-    if (snapshot.phase === "stopped" || roundComplete) return;
-    up();
-  }, [snapshot.phase, roundComplete, up]);
 
   const runningAo5 = ao5(solves);
   const focusMode = snapshot.phase === "inspection" || snapshot.phase === "ready" || snapshot.phase === "solving";

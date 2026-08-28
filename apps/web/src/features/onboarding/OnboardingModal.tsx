@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTimer } from "@/features/timer/useTimer";
+import { useTimerControls } from "@/features/timer/useTimerControls";
 import { formatTime } from "@cubers/timer-core";
 
 const STORAGE_KEY = "cubers_onboarding_done";
@@ -168,29 +169,10 @@ function TimerDemoStep({ onNext, onBack }: { onNext: () => void; onBack: () => v
   const [penalty, setPenalty] = useState<"none" | "plus2" | "dnf">("none");
   const stoppedRef = useRef(false);
 
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.repeat) return;
-      if (e.code === "Space") {
-        e.preventDefault();
-        e.stopPropagation();
-        down();
-      }
-    };
-    const onKeyUp = (e: KeyboardEvent) => {
-      if (e.code === "Space") {
-        e.preventDefault();
-        e.stopPropagation();
-        up();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown, true);
-    window.addEventListener("keyup", onKeyUp, true);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown, true);
-      window.removeEventListener("keyup", onKeyUp, true);
-    };
-  }, [down, up]);
+  // The tutorial must teach exactly the real timer — same shared wiring the
+  // competition terminal uses (hold Space to arm, release to start, any key
+  // stops), not a Space-only subset.
+  useTimerControls({ down, up, reset, phase: snapshot.phase });
 
   useEffect(() => {
     if (snapshot.phase === "stopped" && !stoppedRef.current) {
