@@ -18,6 +18,7 @@ import {
 } from "@/lib/api";
 import { eventDisplayName } from "@/lib/eventNames";
 import { EventIcon } from "@/components/EventIcon";
+import { ConfirmModal } from "@/components/ui/Modal";
 import { Skeleton } from "@/components/Skeleton";
 import { StatusBadge } from "@/features/admin/StatusBadge";
 
@@ -82,6 +83,7 @@ export default function VerificationHubPage() {
   const [busy, setBusy] = useState<string | null>(null);
   /** Outcome of the last publish, so the organiser sees what it did. */
   const [published, setPublished] = useState<string | null>(null);
+  const [publishTarget, setPublishTarget] = useState<HubRound | null>(null);
 
   const PER_PAGE = 10;
 
@@ -230,17 +232,11 @@ export default function VerificationHubPage() {
    * computed from them, and the shortlisted competitors are the ones admitted
    * to the next round. It cannot be undone, so it asks first.
    */
-  const handlePublish = async (round: HubRound) => {
-    if (!expandedCompId) return;
-    const ok = window.confirm(
-      `Publish Round ${round.roundNumber}?
+  const handlePublish = (round: HubRound) => setPublishTarget(round);
 
-` +
-        `The results become final, the shortlist for the next round is computed ` +
-        `from them, and every competitor is emailed. This cannot be undone.`,
-    );
-    if (!ok) return;
-
+  const confirmPublish = async () => {
+    const round = publishTarget;
+    if (!round || !expandedCompId) return;
     setBusy(`publish-${round.id}`);
     setError(null);
     try {
@@ -250,6 +246,7 @@ export default function VerificationHubPage() {
           (res.competitionCompleted ? ", competition complete" : "") +
           `. ${res.sentCount}/${res.recipientCount} emails sent.`,
       );
+      setPublishTarget(null);
       await loadHub(expandedCompId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -280,6 +277,17 @@ export default function VerificationHubPage() {
           <button onClick={() => setPublished(null)} className="ml-2 font-bold">×</button>
         </div>
       )}
+
+      <ConfirmModal
+        open={publishTarget !== null}
+        onClose={() => setPublishTarget(null)}
+        onConfirm={confirmPublish}
+        title={publishTarget ? `Publish Round ${publishTarget.roundNumber}?` : "Publish"}
+        description="The results become final, the shortlist for the next round is computed from them, and every competitor is emailed. This cannot be undone."
+        confirmLabel="Publish"
+        destructive={false}
+        loading={publishTarget ? busy === `publish-${publishTarget.id}` : false}
+      />
 
       {/* Aggregate stats */}
       {!loading && comps.length > 0 && (

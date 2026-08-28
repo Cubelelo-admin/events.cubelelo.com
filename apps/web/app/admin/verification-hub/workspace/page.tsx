@@ -30,10 +30,10 @@ import { EVENTS, type EventId } from "@cubers/scramble-core";
 
 /* ── Tab definitions ─────────────────────────────────────────────────────── */
 
-type TabId = "unflagged" | "flagged" | "verified";
+type TabId = "all" | "flagged" | "verified";
 
 const TABS: { id: TabId; label: string; filter: (r: VerificationResultDto) => boolean }[] = [
-  { id: "unflagged", label: "Unflagged", filter: (r) => r.flagStatus === "clean" },
+  { id: "all",       label: "All",      filter: () => true },
   { id: "flagged",   label: "Flagged",   filter: (r) => r.flagStatus === "flagged" },
   {
     id: "verified",
@@ -107,7 +107,7 @@ export default function VerificationWorkspacePage() {
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
-  const [activeTab, setActiveTab] = useState<TabId>("unflagged");
+  const [activeTab, setActiveTab] = useState<TabId>("all");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -153,11 +153,12 @@ export default function VerificationWorkspacePage() {
 
   // Filtered & sorted results for active tab
   const filteredResults = TABS.find((t) => t.id === activeTab)!.filter;
+  // Every tab is ranked order; priority only breaks ties among unranked results.
   const tabResults = results.filter(filteredResults).sort((a, b) => {
-    if (activeTab === "flagged") {
-      if (a.priority !== b.priority) return b.priority - a.priority;
-    }
-    return (a.rank ?? 9999) - (b.rank ?? 9999);
+    const ra = a.rank ?? 9999;
+    const rb = b.rank ?? 9999;
+    if (ra !== rb) return ra - rb;
+    return b.priority - a.priority;
   });
 
   // Auto-select first result when tab changes
@@ -335,7 +336,7 @@ export default function VerificationWorkspacePage() {
 
   // Tab counts
   const counts: Record<TabId, number> = {
-    unflagged: results.filter(TABS[0].filter).length,
+    all: results.filter(TABS[0].filter).length,
     flagged: results.filter(TABS[1].filter).length,
     verified: results.filter(TABS[2].filter).length,
   };
@@ -573,23 +574,27 @@ function ResultListItem({
         />
       </div>}
       <button onClick={onClick} className="flex-1 px-2 py-3 text-left">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-zinc-800 dark:text-zinc-200">
-              {result.userName}
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <span
+              className="flex h-6 w-7 shrink-0 items-center justify-center rounded-md bg-zinc-200 font-mono text-xs font-bold text-zinc-700 dark:bg-zinc-700 dark:text-zinc-200"
+              title="Rank"
+            >
+              {result.rank ? `#${result.rank}` : "—"}
             </span>
-            <span className="font-mono text-[10px] text-zinc-400">{result.userClId}</span>
+            <span className="truncate font-mono text-xs text-zinc-500 dark:text-zinc-400">
+              {result.userClId}
+            </span>
           </div>
           <StatusBadge domain="verification" status={result.flagStatus} />
         </div>
-        <div className="mt-1 flex items-center gap-3 text-xs text-zinc-500">
+        <div className="mt-1.5 flex items-center gap-3 pl-9 text-xs text-zinc-500">
           <span className="font-mono">
             ao5: {result.ao5Ms !== null ? formatTime(result.ao5Ms) : "DNF"}
           </span>
           <span className="font-mono">
             best: {result.bestSingleMs !== null ? formatTime(result.bestSingleMs) : "DNF"}
           </span>
-          {result.rank && <span>#{result.rank}</span>}
           {!result.videoUrl && <span className="text-amber-500">⚠ No video</span>}
         </div>
         {result.flagReasons.length > 0 && (

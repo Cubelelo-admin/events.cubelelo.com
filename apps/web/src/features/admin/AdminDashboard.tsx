@@ -93,7 +93,13 @@ function OldCompetitions({
 
   const PER_PAGE = 10;
 
-  const statusFiltered = filter === "all" ? comps : comps.filter((c) => c.status === filter);
+  // "All" is every published/run competition — drafts are unfinished setups kept
+  // out of the main list and reachable only through their own tab.
+  const draftCount = comps.filter((c) => c.status === "draft").length;
+  const statusFiltered =
+    filter === "all"
+      ? comps.filter((c) => c.status !== "draft")
+      : comps.filter((c) => c.status === filter);
 
   const dateFiltered = statusFiltered.filter((c) => {
     if (dateRange === "all") return true;
@@ -206,6 +212,11 @@ function OldCompetitions({
             }`}
           >
             {f === "results_pending" ? "Results Pending" : f.charAt(0).toUpperCase() + f.slice(1)}
+            {f === "draft" && draftCount > 0 && (
+              <span className="ml-1.5 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600 dark:text-amber-400">
+                {draftCount}
+              </span>
+            )}
           </button>
         ))}
       </div>
@@ -270,7 +281,17 @@ function OldCompetitions({
                 </td>
                 <td className="px-4 py-2.5 text-zinc-400">{c.type}</td>
                 <td className="px-4 py-2.5 text-zinc-400">
-                  {c.eventTypes?.map(eventDisplayName).join(", ") ?? "—"}
+                  {c.eventTypes?.length ? (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {c.eventTypes.map((et) => (
+                        <span key={et} title={eventDisplayName(et)} className="inline-flex">
+                          <EventIcon eventId={et} size={16} className="text-zinc-600 dark:text-zinc-300" />
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    "—"
+                  )}
                 </td>
                 <td className="px-4 py-2.5">
                   <StatusBadge status={c.status} />
