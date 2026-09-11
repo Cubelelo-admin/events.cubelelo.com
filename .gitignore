@@ -48,6 +48,8 @@ pnpm-debug.log*
 # ──────────────────────────────────────────────
 coverage/
 .nyc_output/
+playwright-report/
+test-results/
 
 # ──────────────────────────────────────────────
 # Claude Code (keep launch.json; ignore local/secret settings)
