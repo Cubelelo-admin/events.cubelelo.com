@@ -150,6 +150,12 @@ export function CompetitionDetailsFields({
   const set = <K extends keyof CompetitionDetailsValue>(key: K, v: CompetitionDetailsValue[K]) =>
     onChange({ [key]: v } as Partial<CompetitionDetailsValue>);
 
+  // A field's error only appears once the admin has actually left it — showing
+  // "Title is required" the instant this form mounts, before anyone has typed
+  // a character, reads as the page being broken.
+  const [touched, setTouched] = useState<Partial<Record<keyof CompetitionDetailsValue, boolean>>>({});
+  const touch = (key: keyof CompetitionDetailsValue) => setTouched((t) => (t[key] ? t : { ...t, [key]: true }));
+
   return (
     <div className="space-y-6">
       <div>
@@ -157,10 +163,11 @@ export function CompetitionDetailsFields({
         <input
           value={value.title}
           onChange={(e) => set("title", e.target.value)}
+          onBlur={() => touch("title")}
           placeholder="Midweek Madness"
           className={INPUT}
         />
-        <FieldError message={errors.title} />
+        <FieldError message={touched.title ? errors.title : undefined} />
       </div>
 
       <div>
@@ -237,11 +244,12 @@ export function CompetitionDetailsFields({
                   min={0}
                   value={value.featuredOrder}
                   onChange={(e) => set("featuredOrder", e.target.value)}
+                  onBlur={() => touch("featuredOrder")}
                   placeholder="0"
                   className={`w-28 ${INPUT}`}
                 />
                 <p className="mt-1 text-[11px] text-zinc-500">Lower shows first.</p>
-                <FieldError message={errors.featuredOrder} />
+                <FieldError message={touched.featuredOrder ? errors.featuredOrder : undefined} />
               </div>
             ) : null}
           </>
@@ -265,6 +273,7 @@ export function CompetitionDetailsFields({
               value={value.videoDeadlineHours}
               placeholder={minutesToHours(globalVideoDeadlineMinutes) || "24"}
               onChange={(e) => set("videoDeadlineHours", e.target.value)}
+              onBlur={() => touch("videoDeadlineHours")}
               className={`${INPUT} pr-8`}
             />
             <span className="pointer-events-none absolute inset-y-0 right-2 flex items-center text-xs text-zinc-400">
@@ -274,7 +283,7 @@ export function CompetitionDetailsFields({
           <p className="mt-1 text-[11px] text-zinc-500">
             {value.videoDeadlineHours.trim() === "" ? "Using the global default." : "Overrides the global default."}
           </p>
-          <FieldError message={errors.videoDeadlineHours} />
+          <FieldError message={touched.videoDeadlineHours ? errors.videoDeadlineHours : undefined} />
         </div>
 
         {value.type === "paid" ? (
@@ -286,9 +295,10 @@ export function CompetitionDetailsFields({
                 min={0}
                 value={value.baseFee}
                 onChange={(e) => set("baseFee", e.target.value)}
+                onBlur={() => touch("baseFee")}
                 className={`w-28 ${INPUT}`}
               />
-              <FieldError message={errors.baseFee} />
+              <FieldError message={touched.baseFee ? errors.baseFee : undefined} />
             </div>
             <div>
               <label className="mb-1 block text-xs font-medium text-zinc-500">{FIELD_LABELS.perEventFee}</label>
@@ -297,9 +307,10 @@ export function CompetitionDetailsFields({
                 min={0}
                 value={value.perEventFee}
                 onChange={(e) => set("perEventFee", e.target.value)}
+                onBlur={() => touch("perEventFee")}
                 className={`w-28 ${INPUT}`}
               />
-              <FieldError message={errors.perEventFee} />
+              <FieldError message={touched.perEventFee ? errors.perEventFee : undefined} />
             </div>
           </>
         ) : null}
@@ -329,6 +340,11 @@ export function CompetitionScheduleFields({
     { key: "endsAt", label: FIELD_LABELS.endsAt },
   ] as const;
 
+  // Same reasoning as CompetitionDetailsFields: don't flash an error for an
+  // empty date before the admin has had a chance to fill it in.
+  const [touched, setTouched] = useState<Partial<Record<keyof CompetitionDetailsValue, boolean>>>({});
+  const touch = (key: keyof CompetitionDetailsValue) => setTouched((t) => (t[key] ? t : { ...t, [key]: true }));
+
   return (
     <div>
       <div className="mb-2 flex items-center justify-between">
@@ -347,9 +363,10 @@ export function CompetitionScheduleFields({
               type="datetime-local"
               value={value[key]}
               onChange={(e) => onChange({ [key]: e.target.value } as Partial<CompetitionDetailsValue>)}
+              onBlur={() => touch(key)}
               className={INPUT}
             />
-            <FieldError message={errors[key]} />
+            <FieldError message={touched[key] ? errors[key] : undefined} />
           </div>
         ))}
       </div>
