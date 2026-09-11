@@ -21,9 +21,26 @@ const mono = JetBrains_Mono({
   display: "swap",
 });
 
+// Lets every route below hand generateMetadata() a relative OG image path
+// (a competition banner, a profile avatar) and have it resolve to a real
+// absolute URL — required for social previews to work at all.
+const SITE_URL = process.env.APP_URL ?? "http://localhost:3000";
+
 export const metadata: Metadata = {
-  title: "Cubelelo Events",
-  description: "Speedcubing competition platform",
+  metadataBase: new URL(SITE_URL),
+  title: {
+    default: "Cubelelo Events",
+    template: "%s · Cubelelo Events",
+  },
+  description:
+    "Online speedcubing competitions — register, solve scrambles under timed conditions, and climb the rankings.",
+  openGraph: {
+    siteName: "Cubelelo Events",
+    type: "website",
+  },
+  twitter: {
+    card: "summary_large_image",
+  },
 };
 
 export default function RootLayout({
