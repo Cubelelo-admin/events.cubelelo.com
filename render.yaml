@@ -16,6 +16,13 @@ services:
         sync: false
       - key: SUPABASE_URL
         sync: false
+      # Required at boot in production (apps/api/src/config/env.ts) — the app
+      # throws on startup without it, since the roster, job queue and rate
+      # limiter all depend on Redis once NODE_ENV=production.
+      - key: REDIS_URL
+        sync: false
+      # >= 32 chars — also required at boot in production; the default dev
+      # value is refused on purpose.
       - key: DEV_AUTH_SECRET
         sync: false
       - key: APP_URL
@@ -24,5 +31,31 @@ services:
         sync: false
       - key: RAZORPAY_KEY_SECRET
         sync: false
-      - key: RESEND_API_KEY
+      # Required at boot in production whenever RAZORPAY_KEY_ID is set — the
+      # app throws on startup without it.
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      # Email provider is Brevo (see apps/api/src/lib/email.ts / config/env.ts).
+      # Falls back to SMTP, then console logging, if unset.
+      - key: BREVO_API_KEY
+        sync: false
+
+  - type: web
+    name: cubers-web
+    runtime: node
+    region: singapore
+    plan: free
+    rootDir: .
+    buildCommand: npm install && npm run build --workspace=apps/web
+    startCommand: cd apps/web && npx next start -p $PORT
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Server-side origin the Next app proxies /api/v1 and /uploads to (see
+      # apps/web/next.config.mjs rewrites) — point this at cubers-api's URL.
+      - key: API_URL
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
         sync: false

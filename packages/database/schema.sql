@@ -1,8 +1,22 @@
 -- ────────────────────────────────────────────────────────────────
--- Cubelelo Events Platform — canonical PostgreSQL schema (Phase 1)
--- Source of truth for the data model. The in-memory dev store in
--- apps/api mirrors a subset of this until Supabase/Postgres is wired.
--- All durations are integer milliseconds. Per-solve data uses JSONB.
+-- Cubelelo Events Platform — initial PostgreSQL schema (Phase 1, pre-migration)
+--
+-- NOT the source of truth for the current data model — this is the schema as
+-- it stood before `packages/database/migrations/` existed. 48 migrations have
+-- landed since (verification tokens, judge assignments, withdrawal requests,
+-- rule sets, round formats, and more) and this file was never kept in step
+-- with them. Treat `packages/database/migrations/*.sql`, applied in order, as
+-- the actual source of truth for what a real database looks like.
+--
+-- To regenerate this file so it stops drifting: run every migration against a
+-- throwaway Postgres database, then `pg_dump --schema-only` it back into this
+-- file (no environment here had `pg_dump`/Postgres available to do that safely
+-- — a hand-edited "regeneration" risks being wrong in a way that's worse than
+-- this file's known staleness).
+--
+-- The in-memory dev store in apps/api mirrors a subset of the *migrated*
+-- schema, not this file. All durations are integer milliseconds. Per-solve
+-- data uses JSONB.
 -- ────────────────────────────────────────────────────────────────
 
 -- ─────────────────────────── ENUMS ───────────────────────────
