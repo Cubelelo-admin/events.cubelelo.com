@@ -206,6 +206,20 @@ these must be set wherever the web app is *built*, not just where it runs):
 - `REDIS_URL` is set — the roster, job queue and rate limiter all need it
 - `RAZORPAY_WEBHOOK_SECRET` is set whenever Razorpay is enabled
 
+## Deployment
+
+Split across two services — `apps/web` and `apps/api` do not deploy together:
+
+- **`apps/api`** — `render.yaml` at the repo root (Render Blueprint). Requires
+  the production env vars above plus the rest of that file's `envVars` list.
+- **`apps/web`** — `vercel.json` at the repo root. Import the repo into
+  Vercel with the Root Directory left at the repo default (not set to
+  `apps/web` — `vercel.json` already runs `npm install` and
+  `npm run build --workspace=apps/web` from there); set `API_URL` to the
+  deployed API's URL and the `NEXT_PUBLIC_*` vars from the table above as
+  Vercel project environment variables (they're baked in at build time, so
+  they must be set before the build, not just at runtime).
+
 ## Key Features
 
 - **Competition Management** — Create, configure, and run multi-round competitions, with a shared form so the Create and Manage screens cannot drift apart
