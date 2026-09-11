@@ -12,9 +12,20 @@ const KNOWN_MESSAGES: Record<string, string> = {
 };
 
 /**
- * Every auth/settings API call throws `Error("<status> <statusText> <jsonBody>")`
- * (see sendJson in lib/api.ts). This turns that raw dump into copy a user can act on,
- * instead of showing "401 Unauthorized {"error":"invalid_credentials"}" verbatim.
+ * This used to assume every auth API call threw `Error("<status> <statusText>
+ * <jsonBody>")` and parsed that raw shape itself. It no longer does: `sendJson`
+ * / `getJson` (lib/api.ts) already turn the response's error code into friendly
+ * copy via `FRIENDLY_ERRORS` before throwing — so `err.message` here is
+ * normally already something like "Incorrect email or password.", which
+ * matches neither the status-prefix nor the JSON-suffix pattern below.
+ *
+ * That mismatch meant every login/register/reset-password failure silently
+ * fell through to the generic "Something went wrong" copy, discarding the
+ * specific message `sendJson` had already computed — a wrong password looked
+ * identical to a server outage. The checks below stay as a fallback for the
+ * few callers that might still throw the raw shape (or a bare status code),
+ * but the common case now trusts the message it's given instead of
+ * overwriting it.
  */
 export function friendlyAuthError(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
@@ -37,5 +48,13 @@ export function friendlyAuthError(err: unknown): string {
   if (status === 409) return "That already exists — try signing in instead.";
   if (status === 429) return "Too many attempts. Wait a moment and try again.";
   if (status && status >= 500) return "Something went wrong on our end. Please try again in a moment.";
-  return "Something went wrong. Please try again.";
+
+  // A genuine low-level failure (offline, DNS, CORS) — not something
+  // `sendJson` produced — still deserves the generic copy rather than raw
+  // browser/JS wording like "Failed to fetch".
+  if (!raw || /failed to fetch|network\s*error|load failed/i.test(raw)) {
+    return "Something went wrong. Please try again.";
+  }
+
+  return raw;
 }

@@ -19,7 +19,13 @@ export default defineConfig({
   ],
   webServer: [
     {
-      command: "cd apps/api && DATABASE_URL=\"\" npx tsx src/server.ts",
+      // `VAR="" command` is POSIX-only shell syntax — Playwright spawns this
+      // through cmd.exe on Windows, where it fails with "'DATABASE_URL' is
+      // not recognized...", so nothing ever listens on :4000 and the whole
+      // suite errors out unless a server happens to already be running.
+      // `env` is Playwright's own cross-platform way to set it instead.
+      command: "cd apps/api && npx tsx src/server.ts",
+      env: { DATABASE_URL: "" },
       port: 4000,
       reuseExistingServer: !process.env.CI,
       timeout: 30000,

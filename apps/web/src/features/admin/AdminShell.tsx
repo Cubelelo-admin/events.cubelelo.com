@@ -55,6 +55,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { label: "Announcements", href: "/admin/announcements" },
       { label: "Content", href: "/admin/content" },
+      { label: "FAQs", href: "/admin/faq" },
     ],
   },
   {
