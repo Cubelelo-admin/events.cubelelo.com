@@ -188,6 +188,16 @@ dev-friendly defaults and logs which mode it is in at startup.
 | `WCA_API_BASE` | WCA API endpoint | Public WCA API |
 | `PORT` / `HOST` | API bind address | `4000` / `0.0.0.0` |
 
+`apps/web` reads its own `NEXT_PUBLIC_*` variables (baked in at build time, so
+these must be set wherever the web app is *built*, not just where it runs):
+
+| Variable | Purpose | Fallback |
+|----------|---------|----------|
+| `API_URL` | Server-side origin the Next app proxies `/api/v1` and `/uploads` to (`next.config.mjs`) | `http://localhost:4000` |
+| `APP_URL` | Public site origin — used for `metadataBase`, the sitemap and OG image URLs | `http://localhost:3000` |
+| `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Enables Supabase Google OAuth sign-in | Local email/password auth only |
+| `NEXT_PUBLIC_GA_MEASUREMENT_ID` | Google Analytics 4 measurement ID | Analytics disabled — no script is loaded |
+
 ### Required in production
 
 `apps/api/src/config/env.ts` refuses to boot with `NODE_ENV=production` unless:

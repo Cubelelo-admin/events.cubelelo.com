@@ -9,6 +9,7 @@ import { Footer } from "@/features/layout/Footer";
 import { PageProgressBar } from "@/features/layout/PageProgressBar";
 import { ToastProvider } from "@/components/ui/Toast";
 import { AnimatedBackground } from "@/components/AnimatedBackground";
+import { Analytics } from "@/components/Analytics";
 
 const sans = Space_Grotesk({
   subsets: ["latin"],
@@ -57,6 +58,7 @@ export default function RootLayout({
               <AnimatedBackground />
               <Suspense fallback={null}>
                 <PageProgressBar />
+                <Analytics />
               </Suspense>
               <NavBar />
               <div className="relative z-[1] flex flex-1 flex-col overflow-y-auto [will-change:scroll-position]">
